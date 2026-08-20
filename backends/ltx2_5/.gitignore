@@ -1,0 +1,15 @@
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+outputs/*
+!outputs/.gitkeep
+inputs/*
+!inputs/.gitkeep
+loras/*
+!loras/.gitkeep
+LTX-2.5-Diffusers-bnb-4bit/
+.ltx25-component-caches/
+scratch_ab/
+server.log
