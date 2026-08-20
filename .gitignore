@@ -1,0 +1,13 @@
+venv/
+.venv/
+__pycache__/
+*.pyc
+outputs/
+inputs/
+logs/
+models/
+loras/
+LTX-2.5-Diffusers-bnb-4bit
+.env
+*.sqlite3
+scratch*/
