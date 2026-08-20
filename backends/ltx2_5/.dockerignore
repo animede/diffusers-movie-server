@@ -1,0 +1,10 @@
+.git
+.venv
+.pytest_cache
+__pycache__
+*.pyc
+.env
+outputs
+inputs
+LTX-2.5-Diffusers-bnb-4bit
+.ltx25-component-caches

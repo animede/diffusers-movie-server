@@ -1,0 +1,17 @@
+services:
+  ltx25:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file: .env
+    volumes:
+      - ./outputs:/app/outputs
+      - ./inputs:/app/inputs
+      - ./LTX-2.5-Diffusers-bnb-4bit:/app/LTX-2.5-Diffusers-bnb-4bit:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

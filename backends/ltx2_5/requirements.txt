@@ -1,0 +1,19 @@
+fastapi>=0.115,<1
+uvicorn[standard]>=0.34,<1
+pydantic-settings>=2.7,<3
+python-multipart>=0.0.20,<1
+httpx>=0.28,<1
+numpy>=1.26,<3
+Pillow>=10,<12
+# torch>=2.11 required for the NATTEN diffusion-decoder path (shi-labs/natten prebuilt
+# kernel variants exist for torch 2.11-2.13; cu130 build verified on sm_120 Blackwell).
+# Older torch still works: app/generator.py falls back to compiled flex-attention.
+torch>=2.11
+kernels>=0.16
+transformers @ git+https://github.com/huggingface/transformers.git
+diffusers @ git+https://github.com/huggingface/diffusers.git
+accelerate>=1.4
+huggingface-hub>=0.30
+bitsandbytes>=0.49,<0.51
+imageio-ffmpeg>=0.6
+imageio>=2.35,<3
