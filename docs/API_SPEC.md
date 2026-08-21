@@ -179,3 +179,14 @@ delete は `{"backend","filename"}`(`/` `..` を含む名前・outputs 外への
 | 413/415 | アセットサイズ超過(400) / 未対応拡張子 |
 | 502 | prompt/enhance 対象バックエンド未起動、LLM 未接続(バックエンド由来) |
 | 500 | バックエンド起動失敗ほか内部エラー |
+
+
+## Phase 6: GPU 割当(2026-08-21)
+
+`POST /api/v1/backend/load` に `gpus`(任意、例 `"0"` / `"1"` / `"0,1"`)を追加。
+指定時はバックエンド子プロセスの `CUDA_VISIBLE_DEVICES` に設定される。
+**CUDA は可視GPUを 0 から再番号付けする**(gpus="1" のとき cuda:0 = 物理GPU1)。
+env セットの一部なので resident 切替時に gpus が変わるとプロセス再起動へフォールバック。
+`/api/v1/status` の `process.gpus` / `backends.<name>.gpus` で確認できる。
+h3 に 2GPU分担プリセット `48gb-dual`(GPU0=transformer、GPU1=text_encoder)を追加
+(詳細: docs/phase6-gpu-assignment.md)。
