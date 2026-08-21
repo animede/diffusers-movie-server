@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>diffusers-movie-server</title>
+<link rel="stylesheet" href="/static/shell.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">diffusers-movie-server</div>
+  <nav class="tabs" id="tabs">
+    <button class="tab-btn active" data-tab="h3">MiniMax-H3</button>
+    <button class="tab-btn" data-tab="ltx25">LTX-2.5</button>
+    <button class="tab-btn" data-tab="admin">バックエンド管理</button>
+  </nav>
+  <div class="topbar-status" id="topbar-status">状態取得中…</div>
+</header>
+
+<main>
+  <!-- バックエンドタブ(h3 / ltx25)。中身は shell.js が構築する -->
+  <section class="tab-panel active" id="panel-h3" data-backend="h3">
+    <div class="backend-overlay" id="overlay-h3"></div>
+    <iframe class="backend-frame" id="frame-h3" title="MiniMax-H3 UI" hidden></iframe>
+  </section>
+  <section class="tab-panel" id="panel-ltx25" data-backend="ltx25">
+    <div class="backend-overlay" id="overlay-ltx25"></div>
+    <iframe class="backend-frame" id="frame-ltx25" title="LTX-2.5 UI" hidden></iframe>
+  </section>
+
+  <!-- 管理タブ -->
+  <section class="tab-panel" id="panel-admin">
+    <div class="admin-grid">
+      <div class="card" id="card-status">
+        <h2>バックエンド状態</h2>
+        <table class="kv-table">
+          <tr><th>アクティブ</th><td id="st-active">-</td></tr>
+          <tr><th>プリセット</th><td id="st-preset">-</td></tr>
+          <tr><th>PID / 稼働時間</th><td id="st-pid">-</td></tr>
+          <tr><th>busy(生成中)</th><td id="st-busy">-</td></tr>
+        </table>
+        <h3>VRAM</h3>
+        <div id="st-vram" class="vram-list"><span class="muted">-</span></div>
+        <div id="st-error" class="error-text" hidden></div>
+      </div>
+
+      <div class="card" id="card-control">
+        <h2>起動 / 切替 / 停止</h2>
+        <div class="form-row">
+          <label for="ctl-backend">バックエンド</label>
+          <select id="ctl-backend"></select>
+        </div>
+        <div class="form-row">
+          <label for="ctl-preset">プリセット</label>
+          <select id="ctl-preset"></select>
+        </div>
+        <div class="preset-desc muted" id="ctl-preset-desc"></div>
+        <div class="btn-row">
+          <button id="ctl-load" class="btn primary">起動</button>
+          <button id="ctl-unload" class="btn danger">アンロード</button>
+        </div>
+        <div class="muted" id="ctl-note"></div>
+        <div class="error-text" id="ctl-error" hidden></div>
+        <div class="spinner-row" id="ctl-spinner" hidden>
+          <span class="spinner"></span><span id="ctl-spinner-text">処理中…</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" id="card-jobs">
+      <h2>統一ジョブ一覧 <span class="muted small">(gateway 発行分のみ・5秒更新)</span></h2>
+      <table class="jobs-table">
+        <thead>
+          <tr><th>ID</th><th>backend</th><th>mode</th><th>状態</th>
+              <th class="col-progress">進捗</th><th>経過</th><th>成果物</th></tr>
+        </thead>
+        <tbody id="jobs-body">
+          <tr class="jobs-empty"><td colspan="7" class="muted">ジョブはまだありません</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+</main>
+<script src="/static/shell.js"></script>
+</body>
+</html>
