@@ -252,3 +252,7 @@ main { flex: 1 1 auto; min-height: 0; display: flex; }
 
 /* interrupted(gateway 再起動でジョブ追跡が中断された終端状態、Phase 5b) */
 .status-badge.interrupted { color: var(--warn); border-color: var(--warn); }
+
+/* Phase 6: GPU 選択 */
+.gpu-row { display: flex; align-items: center; gap: 8px; margin: 10px 0 4px; }
+.gpu-row select { min-width: 180px; }

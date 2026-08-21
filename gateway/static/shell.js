@@ -139,6 +139,30 @@ function buildOverlay(backend) {
     box.appendChild(note);
   }
 
+  // Phase 6: 実行GPUの選択(CUDA_VISIBLE_DEVICES)。選択肢は status の vram から
+  // 遅延populate(updateGpuSelects())。
+  const gpuRow = document.createElement("div");
+  gpuRow.className = "gpu-row";
+  const gpuLabel = document.createElement("label");
+  gpuLabel.textContent = "実行GPU: ";
+  gpuLabel.htmlFor = "ov-gpus-" + backend;
+  const gpuSel = document.createElement("select");
+  gpuSel.id = "ov-gpus-" + backend;
+  gpuSel.className = "gpus-select";
+  gpuSel.dataset.backend = backend;
+  const autoOpt = document.createElement("option");
+  autoOpt.value = "";
+  autoOpt.textContent = "自動(全GPU)";
+  gpuSel.appendChild(autoOpt);
+  gpuSel.addEventListener("change", () => updateGpuWarn(backend));
+  gpuRow.append(gpuLabel, gpuSel);
+  const gpuNote = document.createElement("div");
+  gpuNote.className = "overlay-warn";
+  gpuNote.id = "ov-gpu-warn-" + backend;
+  gpuNote.hidden = true;
+  box.appendChild(gpuRow);
+  box.appendChild(gpuNote);
+
   const warn = document.createElement("div");
   warn.className = "overlay-warn";
   warn.id = "ov-warn-" + backend;
@@ -175,6 +199,71 @@ function selectedPreset(backend) {
   return checked ? checked.value : null;
 }
 
+// Phase 6: GPU 選択 -----------------------------------------------------------
+
+// status の vram 一覧から全 .gpus-select の選択肢を(未追加分だけ)populate する。
+// 選択値は保持。オプション: 自動("") / 各GPU("0","1",...) / 全GPU明示("0,1")。
+function updateGpuSelects() {
+  const vram = state.status && Array.isArray(state.status.vram)
+    ? state.status.vram : [];
+  if (!vram.length) return;
+  document.querySelectorAll("select.gpus-select").forEach((sel) => {
+    const existing = new Set(Array.from(sel.options).map((o) => o.value));
+    for (const gpu of vram) {
+      const val = String(gpu.index);
+      if (existing.has(val)) continue;
+      const opt = document.createElement("option");
+      opt.value = val;
+      opt.textContent = "GPU" + gpu.index + "("
+        + Math.round(gpu.memory_total_mb / 1024) + "GB)";
+      sel.appendChild(opt);
+    }
+    if (vram.length > 1) {
+      const allVal = vram.map((g) => g.index).join(",");
+      if (!existing.has(allVal)) {
+        const opt = document.createElement("option");
+        opt.value = allVal;
+        opt.textContent = "全GPU明示(" + allVal + ")";
+        sel.appendChild(opt);
+      }
+    }
+  });
+}
+
+function gpuWarnText(backend, gpus) {
+  if (!gpus) return null;
+  const vram = state.status && Array.isArray(state.status.vram)
+    ? state.status.vram : [];
+  const indices = gpus.split(",").map((s) => parseInt(s, 10));
+  if (backend === "ltx25" && indices.length === 1) {
+    const gpu = vram.find((g) => g.index === indices[0]);
+    if (gpu && gpu.memory_total_mb < 32768) {
+      return "注意: このGPU(" + Math.round(gpu.memory_total_mb / 1024)
+        + "GB)では長尺 t2v が溢れる可能性があります(121フレーム2段アップスケールで "
+        + "30GB 超の実測)。t2i / 短尺向けです。";
+    }
+  }
+  if (backend === "h3" && indices.length === 1) {
+    return "注意: 1GPU のみ可視のため 48gb-dual(H3_TE_DEVICE=cuda:1)は使えません"
+      + "(選択すると 400 になります)。";
+  }
+  return null;
+}
+
+function updateGpuWarn(backend) {
+  const sel = $("ov-gpus-" + backend);
+  const warn = $("ov-gpu-warn-" + backend);
+  if (!sel || !warn) return;
+  const text = gpuWarnText(backend, sel.value);
+  warn.textContent = text || "";
+  warn.hidden = !text;
+}
+
+function selectedGpus(backend) {
+  const sel = $("ov-gpus-" + backend);
+  return sel && sel.value ? sel.value : null;
+}
+
 function onStartClicked(backend) {
   const status = state.status || {};
   const active = status.active_backend;
@@ -184,7 +273,7 @@ function onStartClicked(backend) {
       + LABELS[backend] + " を起動します。よろしいですか?");
     if (!ok) return;
   }
-  startBackend(backend, selectedPreset(backend));
+  startBackend(backend, selectedPreset(backend), null, selectedGpus(backend));
 }
 
 function selectedStrategy() {
@@ -192,7 +281,7 @@ function selectedStrategy() {
   return sel ? sel.value : "resident";
 }
 
-async function startBackend(backend, preset, strategy) {
+async function startBackend(backend, preset, strategy, gpus) {
   if (state.loading) return;
   strategy = strategy || selectedStrategy();
   state.loading = { backend, preset, note: null };
@@ -205,7 +294,8 @@ async function startBackend(backend, preset, strategy) {
     await fetchJSON("/api/v1/backend/load", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ backend, preset, strategy }),
+      body: JSON.stringify(gpus ? { backend, preset, strategy, gpus }
+                                : { backend, preset, strategy }),
     });
     state.loading = null;
   } catch (e) {
@@ -418,12 +508,17 @@ function initControls() {
     opt.textContent = LABELS[name] + " (" + name + ")";
     backendSel.appendChild(opt);
   }
-  backendSel.addEventListener("change", populateCtlPresets);
+  backendSel.addEventListener("change", () => {
+    populateCtlPresets();
+    updateCtlGpuWarn();
+  });
   $("ctl-preset").addEventListener("change", updateCtlPresetDesc);
+  $("ctl-gpus").addEventListener("change", updateCtlGpuWarn);
 
   $("ctl-load").addEventListener("click", () => {
     const backend = backendSel.value;
     const preset = $("ctl-preset").value || null;
+    const gpus = $("ctl-gpus").value || null;
     const st = state.status || {};
     if (st.active_backend && st.active_backend !== backend) {
       const ok = window.confirm(
@@ -431,7 +526,7 @@ function initControls() {
         + " を停止して " + LABELS[backend] + " を起動します。よろしいですか?");
       if (!ok) return;
     }
-    startBackend(backend, preset);
+    startBackend(backend, preset, null, gpus);
   });
 
   $("ctl-unload").addEventListener("click", async () => {
@@ -467,6 +562,14 @@ function populateCtlPresets() {
     sel.appendChild(opt);
   }
   updateCtlPresetDesc();
+}
+
+function updateCtlGpuWarn() {
+  const warn = $("ctl-gpu-warn");
+  if (!warn) return;
+  const text = gpuWarnText($("ctl-backend").value, $("ctl-gpus").value);
+  warn.textContent = text || "";
+  warn.hidden = !text;
 }
 
 function updateCtlPresetDesc() {
@@ -820,6 +923,7 @@ async function refreshJobs() {
 }
 
 function renderAll() {
+  updateGpuSelects();  // Phase 6: status の vram が来たら GPU 選択肢を populate
   for (const backend of BACKEND_TABS) renderBackendTab(backend);
   renderStatusCard();
   renderControls();

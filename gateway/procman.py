@@ -240,7 +240,8 @@ class ProcessManager:
     def load(self, backend_name: str, preset: str | None,
              overrides: dict[str, str] | None,
              toggles: dict[str, bool] | None = None,
-             strategy: str = "process") -> dict:
+             strategy: str = "process",
+             gpus: str | None = None) -> dict:
         """排他切替。既に同一バックエンド・同一構成でアクティブなら no-op。
 
         strategy="process": 旧プロセス停止 → 新プロセス起動(従来どおり)。
@@ -251,7 +252,8 @@ class ProcessManager:
         if strategy not in VALID_STRATEGIES:
             raise ValidationError(
                 f"未知の strategy です: {strategy!r}(有効: {list(VALID_STRATEGIES)})")
-        env_extra, preset_used = resolve_env(backend_name, preset, overrides, toggles)
+        env_extra, preset_used = resolve_env(backend_name, preset, overrides, toggles,
+                                             gpus=gpus)
         backend = BACKENDS[backend_name]
         with self._lock:
             if backend_name in self._foreign_listeners:
@@ -385,6 +387,7 @@ class ProcessManager:
                         "preset": proc.preset,
                         "uptime_s": round(proc.uptime_s(), 1),
                         "vram_mb": _pid_vram_mb(proc.pid),
+                        "gpus": proc.env_extra.get("CUDA_VISIBLE_DEVICES"),
                     }
             info["backends"] = backends_info
             if self._foreign_listeners:
@@ -411,6 +414,7 @@ class ProcessManager:
             "uptime_s": round(proc.uptime_s(), 1),
             "adopted": proc.adopted,
             "weights_loaded": proc.weights_loaded,
+            "gpus": proc.env_extra.get("CUDA_VISIBLE_DEVICES"),  # None = 全GPU可視
         }
 
     def _deactivate_locked(self, proc: ManagedProcess) -> None:

@@ -73,6 +73,9 @@ class LoadRequest(BaseModel):
     # Phase 5a: "process"(既定・従来どおりプロセス再起動)| "resident"
     # (プロセス温存 + in-process unload/reload による高速切替)
     strategy: str = "process"
+    # Phase 6: 実行GPUの選択(例 "0" / "1" / "0,1")。指定時は子プロセスの
+    # CUDA_VISIBLE_DEVICES に設定(可視GPUは 0 から再番号付けされる点に注意)
+    gpus: str | None = None
 
 
 class UnloadRequest(BaseModel):
@@ -95,7 +98,7 @@ def api_status():
 def api_backend_load(req: LoadRequest):
     try:
         return manager.load(req.backend, req.preset, req.overrides, req.toggles,
-                            strategy=req.strategy)
+                            strategy=req.strategy, gpus=req.gpus)
     except ValidationError as exc:
         raise HTTPException(400, str(exc))
     except BusyError as exc:

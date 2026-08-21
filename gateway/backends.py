@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -73,6 +74,22 @@ H3_PRESETS = {
                     "H3_TE_DEVICE=cuda:1 と(それが前提条件の)H3_KEEP_TRANSFORMER=1 を除外"
                     "(overrides で追加可)。",
         vram_hint="t2va peak ~38.9GB",
+    ),
+    "48gb-dual": Preset(
+        name="48gb-dual",
+        # README「48GB級(推奨: 高速化フル)」そのまま(2GPU分担)。
+        # GPU0 = transformer/denoise、GPU1 = text_encoder(H3_TE_DEVICE=cuda:1)。
+        env={
+            "H3_LOWVRAM": "1",
+            "H3_TE_PRUNE": "1",
+            "H3_TE_DEVICE": "cuda:1",
+            "H3_VIDEO_VAE_FP16": "1",
+            "H3_KEEP_TRANSFORMER": "1",
+        },
+        description="2GPU分担(GPU0=transformer、GPU1=text_encoder)+ transformer常駐。"
+                    "README 48GB級推奨構成。過去実測 t2i ~10s / t2va ~44s。"
+                    "注意: 参照系(ref2va)は TE 側 GPU に約24GB 必要(24GBカードは境界)。",
+        vram_hint="GPU0 ~35GB + GPU1 ~数GB〜20GB(TE)",
     ),
     "32gb-group": Preset(
         name="32gb-group",
@@ -173,11 +190,18 @@ def override_allowed(backend: str, key: str) -> bool:
     return False
 
 
+_GPUS_RE = re.compile(r"^[0-9](,[0-9])*$")
+
+
 def resolve_env(backend_name: str, preset_name: str | None,
                 overrides: dict[str, str] | None,
-                toggles: dict[str, bool] | None = None) -> tuple[dict[str, str], str]:
-    """プリセット + トグル + overrides を合成した env dict を返す。
+                toggles: dict[str, bool] | None = None,
+                gpus: str | None = None) -> tuple[dict[str, str], str]:
+    """プリセット + トグル + overrides(+ gpus)を合成した env dict を返す。
 
+    gpus: 実行GPUの選択(例 "0" / "1" / "0,1")。指定時は子プロセスの
+    CUDA_VISIBLE_DEVICES に設定される。CUDA は可視GPUを 0 から再番号付けする
+    ため、例えば gpus="1" のとき cuda:0 = 物理GPU1 になる点に注意。
     戻り値: (env, 実際に使ったプリセット名)。不正入力は ValidationError。
     """
     backend = BACKENDS.get(backend_name)
@@ -210,6 +234,15 @@ def resolve_env(backend_name: str, preset_name: str | None,
                 f"overrides で許可されていないキーです: {key!r}(backend={backend_name})")
         env[key] = value
 
+    if gpus is not None and gpus != "":
+        if not _GPUS_RE.match(gpus):
+            raise ValidationError(
+                f"gpus の形式が不正です: {gpus!r}(例: \"0\" / \"1\" / \"0,1\")")
+        indices = gpus.split(",")
+        if len(indices) != len(set(indices)):
+            raise ValidationError(f"gpus に重複があります: {gpus!r}")
+        env["CUDA_VISIBLE_DEVICES"] = gpus
+
     _validate_combination(backend_name, env)
     return env, preset_name
 
@@ -240,6 +273,19 @@ def _validate_combination(backend_name: str, env: dict[str, str]) -> None:
                 raise ValidationError(
                     "H3_KEEP_TRANSFORMER=1 の前提条件を満たしていません: "
                     + " / ".join(problems))
+        # gpus(CUDA_VISIBLE_DEVICES)指定時、H3_TE_DEVICE=cuda:N の N は
+        # 「可視GPU内のインデックス」なので可視枚数の範囲内でなければならない
+        # (例: gpus="1" は1枚可視 → cuda:1 は存在せず起動時に落ちる)。
+        visible = env.get("CUDA_VISIBLE_DEVICES")
+        te_device = env.get("H3_TE_DEVICE", "")
+        m = re.match(r"^cuda:(\d+)$", te_device)
+        if visible is not None and m is not None:
+            if int(m.group(1)) >= len(visible.split(",")):
+                raise ValidationError(
+                    f"H3_TE_DEVICE={te_device} は gpus={visible!r}(可視 "
+                    f"{len(visible.split(','))}枚)の範囲外です。CUDA は可視GPUを "
+                    "0 から再番号付けするため、例えば 2GPU分担なら gpus=\"0,1\" "
+                    "(または gpus 省略)にしてください")
     if backend_name == "ltx25":
         precision = env.get("LTX25_TRANSFORMER_PRECISION")
         if precision is not None and precision not in ("nf4", "fp8", "bf16"):

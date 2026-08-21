@@ -71,3 +71,8 @@ running 同期、ギャラリータブ)。
 Phase 5c: docs/phase5c-independence.md(新venvは新旧出力 MD5 完全一致(h3・ltx25 とも)。
 models 36GB / 量子化済み 27GB / loras の実体は本リポジトリへ移転済み、旧ディレクトリは
 コード+旧venvのみで symlink 経由で引き続き起動可)。**全フェーズ完了。**
+
+| 6 | GPU割当指定(48gb-dual / gpus パラメータ / GUI) | 2026-08-21 | (本コミット) |
+
+Phase 6: docs/phase6-gpu-assignment.md(h3 2GPU分担 t2i 12.2s、ltx25@GPU1 単独動作、
+resident×dual はプロセス停止フォールバックの既知制限あり)。
