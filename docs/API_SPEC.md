@@ -77,10 +77,19 @@ Phase 1(管理・パススルー)+ Phase 2(統一生成 API)の全仕様。
 - h3 の result にはバックエンドの生レスポンス(denoise_time_s / peak_vram_gb 等)が
   そのまま含まれる。
 
-### GET /api/v1/jobs/{id} / GET /api/v1/jobs?limit=N
+### GET /api/v1/jobs/{id} / GET /api/v1/jobs?limit=N / DELETE /api/v1/jobs/{id}
 
-gateway 発行ジョブの照会/一覧(新しい順)。**メモリ内レジストリのみ
-(永続化は Phase 5 予定)** — gateway 再起動でジョブ履歴は消える(成果物は残る)。
+gateway 発行ジョブの照会/一覧(新しい順)。**Phase 5b で SQLite
+(`gateway/data/jobs.sqlite3`)へ永続化** — 状態遷移時(作成/running/終端)に
+書き込み、gateway 再起動時に履歴を復元する(復元上限 1000 件)。
+
+- 統一ステータスに終端状態 **`interrupted`** を追加: gateway 再起動時に
+  running のまま残っていたジョブのうち、h3 系(同期呼び出しの worker スレッドが
+  失われるため結果を追跡できない)と、ltx25 系でバックエンド未起動・照会失敗の
+  ものがこの状態になる。ltx25 系でバックエンドが生きていれば `backend_job_id` で
+  問い合わせて実状態(running/completed/failed)に同期する。
+- `DELETE /api/v1/jobs/{id}`: 履歴レコードの削除(**成果物ファイルは消さない**)。
+  不明 ID は 404。
 
 ### POST /api/v1/assets → 201(multipart `file`)
 
@@ -92,10 +101,19 @@ gateway 発行ジョブの照会/一覧(新しい順)。**メモリ内レジス�
   変換し、conditions / audio_asset_id を組み立てる
 - h3 向け: gateway が multipart(image / last_image / references)を組み立てて添付
 
-### GET /api/v1/outputs / POST /api/v1/outputs/delete
+### GET /api/v1/outputs?offset=0&limit=100 / POST /api/v1/outputs/delete
 
-両バックエンドの `outputs/` を統合列挙(backend / filename / size / mtime / url、
-新しい順、対象拡張子 .mp4 .png .jpg .jpeg .webp .wav)。
+両バックエンドの `outputs/` を統合列挙(backend / filename / **kind** / size /
+mtime / url、新しい順、対象拡張子 .mp4 .png .jpg .jpeg .webp .wav)。
+Phase 5b で拡張:
+
+- `kind`: `image`(.png/.jpg/.jpeg/.webp)| `video`(.mp4)| `audio`(.wav)|
+  `other`(拡張子から判定)
+- ページング: `offset`(既定 0)/ `limit`(既定 100、最大 500)。レスポンスは
+  `{"items": [...], "total": N, "offset": o, "limit": l}`(従来の items 直列挙から
+  total/offset/limit を追加)
+- 動画サムネイルは生成しない(GUI 側が `<video preload="metadata">` で表示)
+
 delete は `{"backend","filename"}`(`/` `..` を含む名前・outputs 外への解決は 400)。
 制限: OUTPUT_DIR を overrides で変更した構成では既定ディレクトリのみを見る。
 
