@@ -8,12 +8,27 @@ Phase 1(管理・パススルー)+ Phase 2(統一生成 API)の全仕様。
 | メソッド/パス | 内容 |
 |---|---|
 | `GET /api/v1/backends` | プリセットカタログ(presets / toggles / overrides ポリシー) |
-| `GET /api/v1/status` | active_backend / process / backend_health / busy / vram(nvidia-smi) |
-| `POST /api/v1/backend/load` | `{"backend","preset?","overrides?","toggles?"}`。排他切替。busy 409、同一構成 no-op |
-| `POST /api/v1/backend/unload` | アクティブ停止。busy 409 |
+| `GET /api/v1/status` | active_backend / process / backend_health / busy / vram(nvidia-smi)+ `backends`(各バックエンドの `process_alive` / `weights_loaded` / `vram_mb` 2軸、Phase 5a) |
+| `POST /api/v1/backend/load` | `{"backend","preset?","overrides?","toggles?","strategy?"}`。排他切替。busy 409、同一構成 no-op |
+| `POST /api/v1/backend/unload` | `{"strategy?"}`(body 省略可)。busy 409 |
 | `/h3/{path}` `/ltx25/{path}` | パススルー(未起動時 502) |
 
 詳細は `docs/phase1-gateway.md`。
+
+### strategy(Phase 5a、docs/phase5a-resident.md)
+
+- `"process"`(既定・従来どおり): load = 旧プロセス停止 → 新プロセス起動。
+  unload = **管理下の全プロセス停止**(resident で parked 中のプロセスも含む)。
+- `"resident"`: load = 旧プロセスを温存して `/api/admin/unload` で VRAM のみ解放
+  (nvidia-smi per-process 実測で解放確認)→ 新バックエンドの既存プロセスを再有効化
+  (h3 は `/api/admin/reload`(preload_all)、ltx25 は遅延ロード)。既存プロセスの
+  env(プリセット/overrides)が要求と異なる場合は自動でプロセス再起動へ
+  フォールバックする(レスポンス `note` で通知)。unload = アクティブの VRAM 解放のみ
+  (プロセス温存)。
+- レスポンス `result`: `started`(プロセス起動)/ `reactivated`(resident 再有効化、
+  `reactivate_s` 付き)/ `no-op` / `stopped` / `unloaded-resident`。
+- バックエンド側の追加エンドポイント(直接利用も可):
+  `POST {h3|ltx25}/api/admin/unload`(busy 409)、`POST /h3/api/admin/reload`。
 
 ## 統一生成 API(Phase 2)
 

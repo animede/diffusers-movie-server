@@ -38,6 +38,7 @@
           <tr><th>プリセット</th><td id="st-preset">-</td></tr>
           <tr><th>PID / 稼働時間</th><td id="st-pid">-</td></tr>
           <tr><th>busy(生成中)</th><td id="st-busy">-</td></tr>
+          <tr><th>プロセス/重み</th><td id="st-backends">-</td></tr>
         </table>
         <h3>VRAM</h3>
         <div id="st-vram" class="vram-list"><span class="muted">-</span></div>
@@ -55,6 +56,13 @@
           <select id="ctl-preset"></select>
         </div>
         <div class="preset-desc muted" id="ctl-preset-desc"></div>
+        <div class="form-row">
+          <label for="ctl-strategy">切替戦略</label>
+          <select id="ctl-strategy">
+            <option value="resident" selected>resident(推奨: プロセス温存・高速切替)</option>
+            <option value="process">process(従来: プロセス再起動)</option>
+          </select>
+        </div>
         <div class="btn-row">
           <button id="ctl-load" class="btn primary">起動</button>
           <button id="ctl-unload" class="btn danger">アンロード</button>

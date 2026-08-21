@@ -180,8 +180,14 @@ function onStartClicked(backend) {
   startBackend(backend, selectedPreset(backend));
 }
 
-async function startBackend(backend, preset) {
+function selectedStrategy() {
+  const sel = $("ctl-strategy");
+  return sel ? sel.value : "resident";
+}
+
+async function startBackend(backend, preset, strategy) {
   if (state.loading) return;
+  strategy = strategy || selectedStrategy();
   state.loading = { backend, preset, note: null };
   const errEl = $("ov-error-" + backend);
   if (errEl) { errEl.hidden = true; errEl.textContent = ""; }
@@ -192,7 +198,7 @@ async function startBackend(backend, preset) {
     await fetchJSON("/api/v1/backend/load", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ backend, preset }),
+      body: JSON.stringify({ backend, preset, strategy }),
     });
     state.loading = null;
   } catch (e) {
@@ -326,6 +332,16 @@ function renderStatusCard() {
   else if (st.busy === false) { busyEl.textContent = "いいえ"; }
   else { busyEl.textContent = st.active_backend ? "不明(ヘルス未応答)" : "-"; }
 
+  // Phase 5a: process alive / weights loaded の2軸表示
+  const bk = st.backends || {};
+  $("st-backends").textContent = BACKEND_TABS.map((name) => {
+    const b = bk[name] || {};
+    const procTxt = b.process_alive ? "生存" : "停止";
+    const wTxt = b.weights_loaded ? "ロード済" : "未ロード";
+    const vram = (b.vram_mb != null) ? " " + (b.vram_mb / 1024).toFixed(1) + "GB" : "";
+    return name + ": プロセス" + procTxt + " / 重み" + wTxt + vram;
+  }).join(" | ");
+
   renderVram(st.vram);
 
   if (st.foreign_listeners) {
@@ -415,7 +431,11 @@ function initControls() {
     const ctlErr = $("ctl-error");
     ctlErr.hidden = true;
     try {
-      await fetchJSON("/api/v1/backend/unload", { method: "POST" });
+      await fetchJSON("/api/v1/backend/unload", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ strategy: selectedStrategy() }),
+      });
     } catch (e) {
       ctlErr.textContent = "アンロードに失敗しました: " + e.message;
       ctlErr.hidden = false;
