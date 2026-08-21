@@ -13,6 +13,7 @@
     <button class="tab-btn active" data-tab="h3">MiniMax-H3</button>
     <button class="tab-btn" data-tab="ltx25">LTX-2.5</button>
     <button class="tab-btn" data-tab="admin">バックエンド管理</button>
+    <button class="tab-btn" data-tab="gallery">ギャラリー</button>
   </nav>
   <div class="topbar-status" id="topbar-status">状態取得中…</div>
 </header>
@@ -86,6 +87,36 @@
           <tr class="jobs-empty"><td colspan="7" class="muted">ジョブはまだありません</td></tr>
         </tbody>
       </table>
+    </div>
+  </section>
+
+  <!-- ギャラリータブ(Phase 5b)。ポーリングなし: 表示時と更新ボタンでのみ取得 -->
+  <section class="tab-panel" id="panel-gallery">
+    <div class="card" id="card-gallery">
+      <h2>統一ギャラリー <span class="muted small">(両バックエンドの成果物・表示時と更新ボタンでのみ取得)</span></h2>
+      <div class="gallery-controls">
+        <label>バックエンド
+          <select id="gal-backend">
+            <option value="">すべて</option>
+            <option value="h3">MiniMax-H3</option>
+            <option value="ltx25">LTX-2.5</option>
+          </select>
+        </label>
+        <label>種類
+          <select id="gal-kind">
+            <option value="">すべて</option>
+            <option value="image">画像</option>
+            <option value="video">動画</option>
+            <option value="audio">音声</option>
+            <option value="other">その他</option>
+          </select>
+        </label>
+        <button id="gal-refresh" class="btn">更新</button>
+        <span class="muted" id="gal-count"></span>
+        <span class="error-text" id="gal-error" hidden></span>
+      </div>
+      <div class="gallery-grid" id="gal-grid"></div>
+      <div class="muted gallery-empty" id="gal-empty" hidden>表示できる成果物がありません</div>
     </div>
   </section>
 </main>
