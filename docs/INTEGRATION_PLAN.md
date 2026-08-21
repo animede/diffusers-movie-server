@@ -58,5 +58,10 @@ minimax-h3(port 8611)と diffusers-ltx2_5(port 8000)の統合。
 | 4 | 総合検収(96gb 実測含む)・README 本格化・MIGRATION.md | 2026-08-21 | (本コミット) |
 
 Phase 4 検収結果: docs/phase4-acceptance.md(h3 96gb t2v peak 91.93GB、切替 9.1〜64.1s、
-全回帰合格、実バグなし・コード無変更)。Phase 5(in-process unload・ジョブ永続化・
+全回帰合格、実バグなし・コード無変更)。
+
+| 5a | in-process unload による resident 切替(strategy パラメータ) | 2026-08-21 | (本コミット) |
+
+Phase 5a 実測: docs/phase5a-resident.md(h3→ltx25 切替 9.1s→0.5〜1.3s、
+ltx25→h3 96gb 64.1s→51.7s、VRAM リークなし)。Phase 5 残(ジョブ永続化・
 統一ギャラリー・venv完全独立化)は任意・未着手。

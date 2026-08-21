@@ -236,6 +236,31 @@ class LTXGenerator:
             self._temporal_upsample_pipe = temporal_upsample_pipe
         return self._pipe
 
+    def unload(self) -> dict:
+        """Release every pipeline/model reference so VRAM returns to (near) zero while
+        the process stays alive (Phase 5a resident switching). The next generate()
+        simply goes through load() again -- load() only checks `self._pipe is None`,
+        so dropping the references restores the exact lazy-load entry state.
+        Callers must ensure no job is running (app.main checks before calling)."""
+        freed = []
+        with self._load_lock:
+            for attr in ("_pipe", "_upsample_pipe", "_temporal_upsample_pipe",
+                         "_diffusion_decode_pipe"):
+                if getattr(self, attr) is not None:
+                    setattr(self, attr, None)
+                    freed.append(attr.lstrip("_"))
+            gc.collect()
+            allocated_gb = None
+            try:
+                import torch
+
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    allocated_gb = round(torch.cuda.memory_allocated() / 1024**3, 3)
+            except Exception:  # torch never imported / no CUDA: nothing to free
+                pass
+        return {"freed": freed, "allocated_gb": allocated_gb}
+
     def load_diffusion_decoder(self):
         """Lazily load the LTX-2.5 diffusion decoder pipeline (~0.83GB, kept resident)."""
         if self._diffusion_decode_pipe is not None:

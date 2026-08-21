@@ -67,6 +67,13 @@ class LoadRequest(BaseModel):
     preset: str | None = None
     overrides: dict[str, str] = Field(default_factory=dict)
     toggles: dict[str, bool] = Field(default_factory=dict)  # 例: {"turbo": true}
+    # Phase 5a: "process"(既定・従来どおりプロセス再起動)| "resident"
+    # (プロセス温存 + in-process unload/reload による高速切替)
+    strategy: str = "process"
+
+
+class UnloadRequest(BaseModel):
+    strategy: str = "process"  # "resident" なら VRAM 解放のみ(プロセス温存)
 
 
 @app.get("/api/v1/backends")
@@ -84,7 +91,8 @@ def api_status():
 @app.post("/api/v1/backend/load")
 def api_backend_load(req: LoadRequest):
     try:
-        return manager.load(req.backend, req.preset, req.overrides, req.toggles)
+        return manager.load(req.backend, req.preset, req.overrides, req.toggles,
+                            strategy=req.strategy)
     except ValidationError as exc:
         raise HTTPException(400, str(exc))
     except BusyError as exc:
@@ -96,9 +104,11 @@ def api_backend_load(req: LoadRequest):
 
 
 @app.post("/api/v1/backend/unload")
-def api_backend_unload():
+def api_backend_unload(req: UnloadRequest | None = None):
     try:
-        return manager.unload()
+        return manager.unload(strategy=req.strategy if req else "process")
+    except ValidationError as exc:
+        raise HTTPException(400, str(exc))
     except BusyError as exc:
         raise HTTPException(409, str(exc))
 

@@ -240,6 +240,54 @@ def api_settings_apply(
         _generation_lock.release()
 
 
+@app.post("/api/admin/unload")
+def api_admin_unload():
+    """Phase 5a(diffusers-movie-server resident 切替)用: プロセスを残したまま
+    常駐モデルを全て解放する(runner.unload_all()、各 _free_* が gc + empty_cache 済み)。
+    生成中は 409。解放後も次の生成要求は generate()/generate_ref2va() の冪等な
+    _ensure_* 群で自動再ロードされる(遅延ロードで自然復帰)が、96gb 常駐構成の
+    プリロード状態へ戻したい場合は /api/admin/reload を使う。
+    """
+    acquired = _generation_lock.acquire(blocking=False)
+    if not acquired:
+        raise HTTPException(409, "生成が進行中のためアンロードできません。完了を待ってから再試行してください。")
+    try:
+        runner.unload_all()
+        return {"result": "unloaded", "runner": runner.status()}
+    except Exception as e:
+        logger.exception("admin unload failed")
+        raise HTTPException(500, f"unload failed: {e}")
+    finally:
+        _generation_lock.release()
+
+
+@app.post("/api/admin/reload")
+def api_admin_reload():
+    """Phase 5a 用: preload_all() を再実行して定常常駐状態へ戻す(構成は起動時 env の
+    まま変わらない)。resident 切替の「復帰」で gateway から呼ばれる。生成中は 409。
+    """
+    acquired = _generation_lock.acquire(blocking=False)
+    if not acquired:
+        raise HTTPException(409, "生成が進行中のため再ロードできません。完了を待ってから再試行してください。")
+    global _current_progress
+    progress = ProgressState(job_id=uuid.uuid4().hex[:12], phase="loading", started_at=time.time())
+    with _progress_guard:
+        _current_progress = progress
+    try:
+        progress.update(phase="loading", message="モデルを再ロード中(preload_all)...")
+        t0 = time.time()
+        runner.preload_all()
+        progress.update(phase="done", message="再ロード完了")
+        return {"result": "reloaded", "elapsed_s": round(time.time() - t0, 1),
+                "runner": runner.status()}
+    except Exception as e:
+        logger.exception("admin reload failed")
+        progress.update(phase="error", error=str(e))
+        raise HTTPException(500, f"reload failed: {e}")
+    finally:
+        _generation_lock.release()
+
+
 def _run_generation(
     prompt: str,
     resolution: str,
