@@ -218,3 +218,37 @@ def test_rejects_unsupported_upload(tmp_path):
     client = TestClient(app)
     response = client.post("/api/assets", files={"file": ("notes.txt", b"not media", "text/plain")})
     assert response.status_code == 415
+
+
+def test_admin_unload(tmp_path):
+    """Phase 5a: /api/admin/unload releases the generator while idle, 409 while busy."""
+
+    class UnloadableFakeGenerator(FakeGenerator):
+        unload_calls = 0
+
+        def unload(self):
+            type(self).unload_calls += 1
+            return {"freed": ["pipe"], "allocated_gb": 0.0}
+
+    manager.generator = UnloadableFakeGenerator()
+    manager.config.output_dir = tmp_path
+    client = TestClient(app)
+
+    # idle -> unload succeeds
+    response = client.post("/api/admin/unload")
+    assert response.status_code == 200
+    assert response.json()["result"] == "unloaded"
+    assert UnloadableFakeGenerator.unload_calls == 1
+
+    # busy (in-memory running job) -> 409, generator untouched
+    from app.jobs import Job
+    from app.schemas import GenerateRequest as GR
+
+    fake_job = Job(id="busyjob", session_number=1, request=GR(prompt="x"), status="running")
+    manager.jobs["busyjob"] = fake_job
+    try:
+        response = client.post("/api/admin/unload")
+        assert response.status_code == 409
+        assert UnloadableFakeGenerator.unload_calls == 1
+    finally:
+        manager.jobs.pop("busyjob", None)

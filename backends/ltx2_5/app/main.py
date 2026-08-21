@@ -52,6 +52,18 @@ def health():
     }
 
 
+@app.post("/api/admin/unload")
+def admin_unload():
+    """Release pipelines/VRAM while keeping the process alive (Phase 5a resident
+    switching). 409 while any job is queued/running. Subsequent generation requests
+    lazy-load again via LTXGenerator.load() (no restart needed)."""
+    active = [job.id for job in manager.jobs.values() if job.status in ("queued", "running")]
+    if active:
+        raise HTTPException(status_code=409, detail=f"Generation in progress ({len(active)} job(s)); cannot unload")
+    result = manager.generator.unload()
+    return {"result": "unloaded", **result}
+
+
 @app.post("/api/sessions", response_model=SessionResponse, status_code=201)
 def create_session():
     return SessionResponse(session_number=manager.create_session())
