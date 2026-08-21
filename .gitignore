@@ -12,3 +12,4 @@ LTX-2.5-Diffusers-bnb-4bit
 *.sqlite3
 scratch*/
 gateway/run/
+gateway/data/
