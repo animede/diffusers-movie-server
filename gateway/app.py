@@ -50,6 +50,9 @@ _HOP_BY_HOP = {
 @app.on_event("startup")
 def _startup():
     manager.adopt_orphans()
+    # 復元した running ltx25 ジョブをバックエンド実状態へ同期(Phase 5b)。
+    # adopt_orphans() の後に呼ぶこと(バックエンド生存の adopt が先)。
+    registry.resync_restored()
 
 
 @app.on_event("shutdown")
@@ -164,13 +167,21 @@ def api_job_get(job_id: str):
     job = registry.get(job_id)
     if job is None:
         raise HTTPException(404, f"ジョブが見つかりません: {job_id!r}"
-                                 "(gateway 発行ジョブのみ。永続化は Phase 5 予定)")
+                                 "(gateway 発行ジョブのみ)")
     return job
 
 
 @app.get("/api/v1/jobs")
 def api_job_list(limit: int = 50):
     return {"jobs": registry.list(limit)}
+
+
+@app.delete("/api/v1/jobs/{job_id}")
+def api_job_delete(job_id: str):
+    """履歴レコードの削除(成果物ファイルは消さない)。"""
+    if not registry.delete(job_id):
+        raise HTTPException(404, f"ジョブが見つかりません: {job_id!r}")
+    return {"result": "deleted", "id": job_id}
 
 
 @app.post("/api/v1/assets", status_code=201)
@@ -189,15 +200,24 @@ async def api_asset_upload(file: UploadFile = File(...)):
 
 _OUTPUT_DIRS = {name: BACKENDS[name].dir / "outputs" for name in BACKENDS}
 _OUTPUT_SUFFIXES = {".mp4", ".png", ".jpg", ".jpeg", ".webp", ".wav"}
+_KIND_BY_SUFFIX = {
+    ".mp4": "video",
+    ".png": "image", ".jpg": "image", ".jpeg": "image", ".webp": "image",
+    ".wav": "audio",
+}
 
 
 @app.get("/api/v1/outputs")
-def api_outputs():
-    """両バックエンドの outputs/ を統合列挙(新しい順)。
+def api_outputs(offset: int = 0, limit: int = 100):
+    """両バックエンドの outputs/ を統合列挙(新しい順、ページング付き)。
 
+    - kind: image | video | audio | other(拡張子から判定、Phase 5b)
+    - offset/limit: 新しい順ソート後のページング(limit 最大 500)
     注意: OUTPUT_DIR を overrides で変更した ltx25 構成では既定ディレクトリのみを見る
     (Phase 2 の既知の制限)。
     """
+    offset = max(0, offset)
+    limit = max(1, min(limit, 500))
     items = []
     for backend, out_dir in _OUTPUT_DIRS.items():
         if not out_dir.is_dir():
@@ -209,12 +229,15 @@ def api_outputs():
             items.append({
                 "backend": backend,
                 "filename": path.name,
+                "kind": _KIND_BY_SUFFIX.get(path.suffix.lower(), "other"),
                 "size": stat.st_size,
                 "mtime": stat.st_mtime,
                 "url": f"/{backend}/outputs/{path.name}",
             })
     items.sort(key=lambda item: item["mtime"], reverse=True)
-    return {"items": items}
+    total = len(items)
+    return {"items": items[offset:offset + limit],
+            "total": total, "offset": offset, "limit": limit}
 
 
 class OutputDeleteRequest(BaseModel):

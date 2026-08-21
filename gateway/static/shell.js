@@ -26,6 +26,11 @@ const state = {
   currentTab: "h3",
   framePid: {},           // backend -> iframe を張った時点の pid
   jobRows: new Map(),     // job id -> {tr, cells...}
+  gallery: {              // Phase 5b: ギャラリー(ポーリングなし)
+    tiles: new Map(),     // "backend/filename" -> {el, item, ...}
+    total: 0,
+    fetching: false,
+  },
 };
 
 function $(id) { return document.getElementById(id); }
@@ -58,6 +63,8 @@ function initTabs() {
     document.querySelectorAll(".tab-panel").forEach((p) =>
       p.classList.toggle("active", p.id === "panel-" + state.currentTab));
     renderAll();
+    // ギャラリーはポーリングしない: タブ表示時と更新ボタンでのみ取得
+    if (state.currentTab === "gallery") refreshGallery();
   });
 }
 
@@ -593,6 +600,178 @@ function renderJobs(jobs) {
 }
 
 // ---------------------------------------------------------------------------
+// ギャラリータブ(Phase 5b)。ポーリングなし・DOM は差分更新。
+// ---------------------------------------------------------------------------
+
+const GALLERY_FETCH_LIMIT = 200;
+
+function galleryKey(item) { return item.backend + "/" + item.filename; }
+
+function formatSize(bytes) {
+  if (bytes >= 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + " MB";
+  if (bytes >= 1024) return (bytes / 1024).toFixed(0) + " KB";
+  return bytes + " B";
+}
+
+function buildGalleryMedia(item) {
+  const media = document.createElement("div");
+  media.className = "gallery-media";
+  if (item.kind === "image") {
+    const img = document.createElement("img");
+    img.loading = "lazy";
+    img.src = item.url;
+    img.alt = item.filename;
+    media.appendChild(img);
+  } else if (item.kind === "video") {
+    // 動画サムネイルは生成しない(preload="metadata" で先頭フレームを表示)
+    const video = document.createElement("video");
+    video.controls = true;
+    video.preload = "metadata";
+    video.src = item.url;
+    media.appendChild(video);
+  } else if (item.kind === "audio") {
+    const audio = document.createElement("audio");
+    audio.controls = true;
+    audio.preload = "none";
+    audio.src = item.url;
+    media.appendChild(audio);
+  } else {
+    const a = document.createElement("a");
+    a.href = item.url;
+    a.target = "_blank";
+    a.textContent = item.filename;
+    media.appendChild(a);
+  }
+  return media;
+}
+
+function galleryTile(item) {
+  const key = galleryKey(item);
+  let tile = state.gallery.tiles.get(key);
+  if (!tile) {
+    const el = document.createElement("div");
+    el.className = "gallery-tile";
+    el.dataset.backend = item.backend;
+    el.dataset.kind = item.kind;
+    el.appendChild(buildGalleryMedia(item));
+
+    const cap = document.createElement("div");
+    cap.className = "gallery-caption";
+    const name = document.createElement("a");
+    name.className = "gallery-name";
+    name.href = item.url;
+    name.target = "_blank";
+    name.textContent = item.filename;
+    name.title = item.filename;
+    const meta = document.createElement("div");
+    meta.className = "gallery-meta";
+    const info = document.createElement("span");
+    info.className = "gallery-info";
+    const del = document.createElement("button");
+    del.className = "btn danger small";
+    del.textContent = "削除";
+    del.addEventListener("click", () => deleteOutput(key));
+    meta.append(info, del);
+    cap.append(name, meta);
+    el.appendChild(cap);
+
+    tile = { el, info, item };
+    state.gallery.tiles.set(key, tile);
+  }
+  tile.item = item;
+  tile.info.textContent = item.backend + " · " + formatSize(item.size) + " · "
+    + new Date(item.mtime * 1000).toLocaleString("ja-JP");
+  return tile.el;
+}
+
+function renderGallery(items) {
+  const grid = $("gal-grid");
+  const seen = new Set();
+  // API は新しい順。既存タイルは再利用し、並び順のみ合わせる(appendChild は移動)。
+  let cursor = grid.firstElementChild;
+  for (const item of items) {
+    seen.add(galleryKey(item));
+    const el = galleryTile(item);
+    if (el !== cursor) {
+      grid.insertBefore(el, cursor);
+    } else {
+      cursor = cursor.nextElementSibling;
+    }
+  }
+  // 消えたファイル(削除済み等)のタイルを除去
+  for (const [key, tile] of Array.from(state.gallery.tiles)) {
+    if (!seen.has(key)) {
+      tile.el.remove();
+      state.gallery.tiles.delete(key);
+    }
+  }
+  applyGalleryFilter();
+}
+
+function applyGalleryFilter() {
+  const backend = $("gal-backend").value;
+  const kind = $("gal-kind").value;
+  let shown = 0;
+  for (const tile of state.gallery.tiles.values()) {
+    const hide = (backend && tile.el.dataset.backend !== backend)
+      || (kind && tile.el.dataset.kind !== kind);
+    tile.el.hidden = hide;
+    if (!hide) shown++;
+  }
+  $("gal-count").textContent = shown + " / " + state.gallery.total + " 件";
+  $("gal-empty").hidden = shown > 0;
+}
+
+async function refreshGallery() {
+  if (state.gallery.fetching) return;
+  state.gallery.fetching = true;
+  const errEl = $("gal-error");
+  errEl.hidden = true;
+  try {
+    const body = await fetchJSON(
+      "/api/v1/outputs?offset=0&limit=" + GALLERY_FETCH_LIMIT);
+    state.gallery.total = body.total != null ? body.total
+      : (body.items || []).length;
+    renderGallery(body.items || []);
+  } catch (e) {
+    errEl.textContent = "成果物一覧の取得に失敗しました: " + e.message;
+    errEl.hidden = false;
+  } finally {
+    state.gallery.fetching = false;
+  }
+}
+
+async function deleteOutput(key) {
+  const tile = state.gallery.tiles.get(key);
+  if (!tile) return;
+  const item = tile.item;
+  if (!window.confirm(item.backend + "/" + item.filename
+      + " を削除します。よろしいですか?(元に戻せません)")) return;
+  const errEl = $("gal-error");
+  errEl.hidden = true;
+  try {
+    await fetchJSON("/api/v1/outputs/delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ backend: item.backend, filename: item.filename }),
+    });
+    tile.el.remove();
+    state.gallery.tiles.delete(key);
+    state.gallery.total = Math.max(0, state.gallery.total - 1);
+    applyGalleryFilter();
+  } catch (e) {
+    errEl.textContent = "削除に失敗しました: " + e.message;
+    errEl.hidden = false;
+  }
+}
+
+function initGallery() {
+  $("gal-refresh").addEventListener("click", refreshGallery);
+  $("gal-backend").addEventListener("change", applyGalleryFilter);
+  $("gal-kind").addEventListener("change", applyGalleryFilter);
+}
+
+// ---------------------------------------------------------------------------
 // ポーリング
 // ---------------------------------------------------------------------------
 
@@ -653,6 +832,7 @@ function renderAll() {
 async function init() {
   initTabs();
   initControls();
+  initGallery();
   try {
     const body = await fetchJSON("/api/v1/backends");
     for (const entry of body.backends || []) state.catalog[entry.name] = entry;

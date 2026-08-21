@@ -1,8 +1,11 @@
 """統一ジョブモデル(gateway 側ジョブレジストリ)。
 
-- メモリ内 dict + threading.Lock のみ(**永続化は Phase 5 送り** — gateway 再起動で
-  ジョブ履歴は消える。バックエンド側の成果物/履歴は残る)。
-- 統一ステータス: queued | running | completed | failed
+- メモリ内 dict + threading.Lock を一次ソースとし、**状態遷移時に SQLite
+  (gateway/data/jobs.sqlite3)へ永続化**する(Phase 5b)。gateway 再起動時は
+  SQLite から履歴を復元する。復元時に running のまま残っていたジョブは、
+  h3 系は「interrupted」(失敗扱いの終端状態)へ、ltx25 系は backend_job_id で
+  バックエンドへ問い合わせて実状態に同期する(未起動なら interrupted)。
+- 統一ステータス: queued | running | completed | failed | interrupted
 - ltx25: バックエンドの非同期ジョブ API(POST /api/jobs)へ委譲し backend_job_id を
   保持。GET 時にバックエンドへ問い合わせて状態を都度変換する
   (queued/running → running、completed → completed、failed 系 → failed)。
@@ -13,10 +16,13 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import sqlite3
 import threading
 import time
 import uuid
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -29,7 +35,10 @@ from procman import BusyError, manager
 
 logger = logging.getLogger("gateway.jobs")
 
-TERMINAL = {"completed", "failed"}
+TERMINAL = {"completed", "failed", "interrupted"}
+
+DB_PATH = Path(__file__).resolve().parent / "data" / "jobs.sqlite3"
+RESTORE_LIMIT = 1000  # 復元する履歴の上限(新しい順)
 
 
 class NotActiveError(RuntimeError):
@@ -66,7 +75,7 @@ class UnifiedJob:
     id: str
     backend: str
     mode: str
-    status: str = "queued"          # queued | running | completed | failed
+    status: str = "queued"          # queued | running | completed | failed | interrupted
     progress: float = 0.0           # 0-1
     error: Optional[str] = None
     result: Optional[dict] = None   # image_url / video_url 等(パススルーURL形式)
@@ -96,6 +105,129 @@ class JobRegistry:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._jobs: dict[str, UnifiedJob] = {}
+        self._db_lock = threading.Lock()
+        self._init_db()
+        self._restore()
+
+    # -- 永続化(SQLite)---------------------------------------------------
+
+    def _connect(self) -> sqlite3.Connection:
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(DB_PATH, timeout=10.0)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _init_db(self) -> None:
+        with self._db_lock, self._connect() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS jobs (
+                    id TEXT PRIMARY KEY,
+                    backend TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    progress REAL NOT NULL DEFAULT 0,
+                    error TEXT,
+                    result TEXT,
+                    notes TEXT,
+                    created_at REAL NOT NULL,
+                    finished_at REAL,
+                    backend_job_id TEXT
+                )""")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at)")
+
+    def _persist(self, job: UnifiedJob) -> None:
+        """状態遷移時に呼ぶ(作成/running/終端)。失敗してもジョブ実行は止めない。"""
+        try:
+            with self._db_lock, self._connect() as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO jobs "
+                    "(id, backend, mode, status, progress, error, result, notes,"
+                    " created_at, finished_at, backend_job_id)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (job.id, job.backend, job.mode, job.status,
+                     round(job.progress, 4), job.error,
+                     json.dumps(job.result, ensure_ascii=False)
+                     if job.result is not None else None,
+                     json.dumps(job.notes, ensure_ascii=False),
+                     job.created_at, job.finished_at, job.backend_job_id))
+        except sqlite3.Error as exc:
+            logger.warning("ジョブ永続化に失敗しました(%s): %s", job.id, exc)
+
+    def _restore(self) -> None:
+        """起動時に SQLite から履歴を復元する。
+
+        running/queued のまま残っていた h3 ジョブは worker スレッドが失われている
+        ため即 interrupted へ。ltx25 ジョブはこの時点では running のまま残し、
+        resync_restored()(app 起動イベント、adopt_orphans 後)でバックエンドへ
+        問い合わせて実状態に同期する。
+        """
+        try:
+            with self._db_lock, self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?",
+                    (RESTORE_LIMIT,)).fetchall()
+        except sqlite3.Error as exc:
+            logger.warning("ジョブ履歴の復元に失敗しました: %s", exc)
+            return
+        interrupted: list[UnifiedJob] = []
+        self._pending_resync: list[str] = []
+        for row in rows:
+            job = UnifiedJob(
+                id=row["id"], backend=row["backend"], mode=row["mode"],
+                status=row["status"], progress=row["progress"] or 0.0,
+                error=row["error"],
+                result=json.loads(row["result"]) if row["result"] else None,
+                notes=json.loads(row["notes"]) if row["notes"] else [],
+                created_at=row["created_at"], finished_at=row["finished_at"],
+                backend_job_id=row["backend_job_id"])
+            if job.status not in TERMINAL:
+                if job.backend == "ltx25" and job.backend_job_id:
+                    self._pending_resync.append(job.id)
+                else:
+                    job.status = "interrupted"
+                    job.error = ("gateway 再起動によりジョブ追跡が中断されました"
+                                 "(h3 同期呼び出しの結果は失われました)")
+                    job.finished_at = job.finished_at or time.time()
+                    interrupted.append(job)
+            self._jobs[job.id] = job
+        for job in interrupted:
+            self._persist(job)
+        if rows:
+            logger.info("ジョブ履歴を %d 件復元しました(interrupted=%d, "
+                        "resync待ち=%d)", len(rows), len(interrupted),
+                        len(self._pending_resync))
+
+    def resync_restored(self) -> None:
+        """復元した running ltx25 ジョブをバックエンドの実状態に同期する。
+
+        app の startup イベント(manager.adopt_orphans() の後)から呼ぶこと。
+        バックエンド未起動・照会失敗・ジョブ不明(404)は interrupted にする。
+        """
+        pending = getattr(self, "_pending_resync", [])
+        self._pending_resync = []
+        for job_id in pending:
+            job = self._jobs.get(job_id)
+            if job is None or job.status in TERMINAL:
+                continue
+            base = BACKENDS["ltx25"].base_url()
+            try:
+                with httpx.Client(timeout=5.0) as client:
+                    resp = client.get(base + f"/api/jobs/{job.backend_job_id}")
+                    resp.raise_for_status()
+            except httpx.HTTPError as exc:
+                job.status = "interrupted"
+                job.error = ("gateway 再起動後、バックエンド ltx25 のジョブ状態を"
+                             f"確認できませんでした: {exc}")
+                job.finished_at = time.time()
+                self._persist(job)
+                logger.info("復元ジョブ %s を interrupted にしました(%s)",
+                            job.id, exc)
+                continue
+            self._apply_ltx25_state(job, resp.json())
+            self._persist(job)
+            logger.info("復元ジョブ %s をバックエンド実状態に同期しました"
+                        "(status=%s)", job.id, job.status)
 
     # -- submit ------------------------------------------------------------
 
@@ -147,6 +279,7 @@ class JobRegistry:
             with self._lock:
                 self._jobs.pop(job.id, None)
             raise
+        self._persist(job)  # 受理確定(running)時点で永続化
         return job.public()
 
     # -- ltx25 -------------------------------------------------------------
@@ -183,23 +316,8 @@ class JobRegistry:
             job.backend_job_id = resp.json()["id"]
             job.status = "running"
 
-    def _refresh_ltx25(self, job: UnifiedJob) -> None:
-        if job.status in TERMINAL:
-            return
-        if manager.active_backend_name() != "ltx25":
-            job.status = "failed"
-            job.error = "バックエンド ltx25 がジョブ完了前に停止しました(切替/unload)"
-            job.finished_at = time.time()
-            return
-        base = BACKENDS["ltx25"].base_url()
-        try:
-            with httpx.Client(timeout=5.0) as client:
-                resp = client.get(base + f"/api/jobs/{job.backend_job_id}")
-                resp.raise_for_status()
-        except httpx.HTTPError as exc:
-            logger.warning("ltx25 ジョブ照会に失敗(%s): %s", job.backend_job_id, exc)
-            return  # 一時的な失敗は前回状態のまま
-        data = resp.json()
+    def _apply_ltx25_state(self, job: UnifiedJob, data: dict) -> None:
+        """ltx25 バックエンドのジョブ応答を統一ステータスへ変換して反映する。"""
         status = data.get("status")
         job.progress = float(data.get("progress") or 0.0)
         if status in ("queued", "running"):
@@ -218,6 +336,27 @@ class JobRegistry:
             job.status = "failed"
             job.error = data.get("error") or f"ltx25 ジョブが失敗しました(status={status})"
             job.finished_at = time.time()
+
+    def _refresh_ltx25(self, job: UnifiedJob) -> None:
+        if job.status in TERMINAL:
+            return
+        if manager.active_backend_name() != "ltx25":
+            job.status = "failed"
+            job.error = "バックエンド ltx25 がジョブ完了前に停止しました(切替/unload)"
+            job.finished_at = time.time()
+            self._persist(job)
+            return
+        base = BACKENDS["ltx25"].base_url()
+        try:
+            with httpx.Client(timeout=5.0) as client:
+                resp = client.get(base + f"/api/jobs/{job.backend_job_id}")
+                resp.raise_for_status()
+        except httpx.HTTPError as exc:
+            logger.warning("ltx25 ジョブ照会に失敗(%s): %s", job.backend_job_id, exc)
+            return  # 一時的な失敗は前回状態のまま
+        self._apply_ltx25_state(job, resp.json())
+        if job.status in TERMINAL:
+            self._persist(job)
 
     # -- h3 ----------------------------------------------------------------
 
@@ -251,6 +390,7 @@ class JobRegistry:
                 job.error = f"h3 呼び出しに失敗しました: {exc}"
             finally:
                 job.finished_at = time.time()
+                self._persist(job)  # 終端状態(completed/failed)を永続化
 
         threading.Thread(target=worker, name=f"h3-job-{job.id}", daemon=True).start()
 
@@ -304,6 +444,18 @@ class JobRegistry:
                 self._refresh_h3(job)
             out.append(job.public())
         return out
+
+    def delete(self, job_id: str) -> bool:
+        """履歴レコードを削除する(成果物ファイルは消さない)。"""
+        with self._lock:
+            existed = self._jobs.pop(job_id, None) is not None
+        try:
+            with self._db_lock, self._connect() as conn:
+                cur = conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+                existed = existed or cur.rowcount > 0
+        except sqlite3.Error as exc:
+            logger.warning("ジョブレコード削除に失敗しました(%s): %s", job_id, exc)
+        return existed
 
 
 registry = JobRegistry()
