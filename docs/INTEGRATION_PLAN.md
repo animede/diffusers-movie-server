@@ -45,3 +45,18 @@ minimax-h3(port 8611)と diffusers-ltx2_5(port 8000)の統合。
   LTX-2.5-Diffusers-bnb-4bit(27GB)・loras(1.6GB)。
 - 旧フォルダ(/home/animede/minimax-h3、/home/animede/diffusers-ltx2_5)は検収完了まで無変更で残す。
 - ポート: gateway 8630 / h3 8631 / ltx25 8632(既存 8600/8601/8602/8610/8611/8620 と非衝突)
+
+## 完了記録(Phase 0〜4)
+
+| Phase | 内容 | 完了日 | コミット |
+|---|---|---|---|
+| 0 | スキャフォールド初期化 | 2026-08-20 | 4550b19 |
+| 0 | minimax-h3 / ltx2_5 バックエンド移設(symlink共有)・両スモーク合格 | 2026-08-20 | bd59d02 |
+| 1 | ゲートウェイ基盤(プロセス管理・排他切替・パススルー) | 2026-08-21 | 912337e |
+| 2 | 統一API(/api/v1/generate・統一ジョブモデル) | 2026-08-21 | 0125d6b |
+| 3 | タブ切替GUI(headless Chrome 実機検証) | 2026-08-21 | 4179178 |
+| 4 | 総合検収(96gb 実測含む)・README 本格化・MIGRATION.md | 2026-08-21 | (本コミット) |
+
+Phase 4 検収結果: docs/phase4-acceptance.md(h3 96gb t2v peak 91.93GB、切替 9.1〜64.1s、
+全回帰合格、実バグなし・コード無変更)。Phase 5(in-process unload・ジョブ永続化・
+統一ギャラリー・venv完全独立化)は任意・未着手。
