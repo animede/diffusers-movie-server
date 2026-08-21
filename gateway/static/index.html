@@ -58,6 +58,13 @@
         </div>
         <div class="preset-desc muted" id="ctl-preset-desc"></div>
         <div class="form-row">
+          <label for="ctl-gpus">実行GPU</label>
+          <select id="ctl-gpus" class="gpus-select">
+            <option value="" selected>自動(全GPU)</option>
+          </select>
+        </div>
+        <div class="overlay-warn" id="ctl-gpu-warn" hidden></div>
+        <div class="form-row">
           <label for="ctl-strategy">切替戦略</label>
           <select id="ctl-strategy">
             <option value="resident" selected>resident(推奨: プロセス温存・高速切替)</option>
