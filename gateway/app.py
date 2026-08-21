@@ -14,11 +14,12 @@ from __future__ import annotations
 
 import logging
 import subprocess
+from pathlib import Path
 from typing import Any
 
 import httpx
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -275,6 +276,23 @@ def api_prompt_enhance(req: PromptEnhanceRequest):
     except ValueError:
         content = {"detail": resp.text[:500]}
     return JSONResponse(status_code=resp.status_code, content=content)
+
+
+# ---------------------------------------------------------------------------
+# シェル GUI(Phase 3)。/static マウントとルートページ。
+# パススルー catch-all(/h3/{path} /ltx25/{path})とはパスが重ならないが、
+# 登録順の慣例に合わせて catch-all より先に置く。
+# ---------------------------------------------------------------------------
+
+_STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+
+@app.get("/", include_in_schema=False)
+def shell_index():
+    return FileResponse(_STATIC_DIR / "index.html")
+
+
+app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 
 
 # ---------------------------------------------------------------------------
