@@ -4,22 +4,23 @@
 旧 diffusers-ltx2_5(`/home/animede/diffusers-ltx2_5`、port 8000)から
 diffusers-movie-server(gateway 8630)への移行。
 
-## (a) 旧ディレクトリは削除禁止(最重要)
+## (a) 依存関係の現状(Phase 5c 完了後、2026-08-21 更新)
 
-本リポジトリの `backends/` は Phase 0 方針(`docs/INTEGRATION_PLAN.md`)により
-**venv・モデル・量子化済み重みを旧ディレクトリへの symlink で共有**している:
+**本リポジトリは旧ディレクトリから完全に独立した**(Phase 5c)。
+- venv: `backends/minimax-h3/venv`(torch2.9+cu128、diffusers PR#14355 コミット固定)と
+  `backends/ltx2_5/.venv`(torch2.11+cu130)は本リポジトリ内に**再構築した実体**。
+  新旧venvの生成出力は h3・ltx25 とも **MD5 完全一致**を確認済み
+  (docs/phase5c-independence.md)。
+- データ実体も本リポジトリ側へ移転済み: `backends/minimax-h3/models`(prequant 36GB)、
+  `backends/ltx2_5/LTX-2.5-Diffusers-bnb-4bit`(27GB)、`backends/ltx2_5/loras`。
 
-| symlink | 実体(旧ディレクトリ側) | サイズ |
-|---|---|---|
-| `backends/minimax-h3/venv` | `/home/animede/minimax-h3/venv` | torch2.9+cu128、diffusers PR#14355 コミット固定 |
-| `backends/minimax-h3/models` | `/home/animede/minimax-h3/models` | prequant TE キャッシュ 36GB |
-| `backends/ltx2_5/.venv` | `/home/animede/diffusers-ltx2_5/.venv` | torch2.11+cu130、NATTEN shadow install |
-| `backends/ltx2_5/LTX-2.5-Diffusers-bnb-4bit` | 旧ディレクトリ | 量子化済み 27GB |
-| `backends/ltx2_5/loras` | 旧ディレクトリ | IC-LoRA 2本 1.6GB |
-
-**`/home/animede/minimax-h3` と `/home/animede/diffusers-ltx2_5` を削除・改名・
-移動すると新サーバは起動できなくなる。** 旧ディレクトリの整理(削除)は
-Phase 5 の完全独立化(下記 (d))を完了してからにすること。
+**symlink の向きは逆転した**: 旧ディレクトリ側の `models` / `LTX-2.5-Diffusers-bnb-4bit` /
+`loras` は本リポジトリへの symlink になっており、**旧サーバ(8611/8000)も従来どおり
+起動できる**(旧venvは旧ディレクトリに残置)。つまり:
+- 本リポジトリ(`~/diffusers-movie-server`)を削除するとデータ実体が消え、
+  旧サーバも動かなくなる(こちらが本体)。
+- 旧ディレクトリを削除する場合は、旧サーバ運用を完全に廃止した後でよい
+  (新サーバへの影響は無い)。
 
 コード自体は rsync コピー済みのため、旧ディレクトリ側のコードを編集しても
 新サーバには反映されない(逆も同様)。コード修正は本リポジトリ側で行うこと。

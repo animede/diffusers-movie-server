@@ -60,8 +60,14 @@ minimax-h3(port 8611)と diffusers-ltx2_5(port 8000)の統合。
 Phase 4 検収結果: docs/phase4-acceptance.md(h3 96gb t2v peak 91.93GB、切替 9.1〜64.1s、
 全回帰合格、実バグなし・コード無変更)。
 
-| 5a | in-process unload による resident 切替(strategy パラメータ) | 2026-08-21 | (本コミット) |
+| 5a | in-process unload による resident 切替(strategy パラメータ) | 2026-08-21 | ea14af4 |
+| 5b | 統一ジョブの SQLite 永続化・統一ギャラリータブ | 2026-08-21 | 637b97f |
+| 5c | venv 完全独立化・データ所有権の移転(旧位置は逆向き symlink) | 2026-08-21 | (本コミット) |
 
 Phase 5a 実測: docs/phase5a-resident.md(h3→ltx25 切替 9.1s→0.5〜1.3s、
-ltx25→h3 96gb 64.1s→51.7s、VRAM リークなし)。Phase 5 残(ジョブ永続化・
-統一ギャラリー・venv完全独立化)は任意・未着手。
+ltx25→h3 96gb 64.1s→51.7s、VRAM リークなし)。
+Phase 5b: docs/phase5b-persistence-gallery.md(gateway 再起動でジョブ履歴復元、
+running 同期、ギャラリータブ)。
+Phase 5c: docs/phase5c-independence.md(新venvは新旧出力 MD5 完全一致(h3・ltx25 とも)。
+models 36GB / 量子化済み 27GB / loras の実体は本リポジトリへ移転済み、旧ディレクトリは
+コード+旧venvのみで symlink 経由で引き続き起動可)。**全フェーズ完了。**
