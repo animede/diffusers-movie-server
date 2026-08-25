@@ -45,11 +45,13 @@ from core.runner import (
     MAX_SECONDS,
     MIN_SECONDS,
     STILL_FRAME_CHOICES,
+    GenerationInterrupted,
     MiniMaxH3AudioReference,
     MiniMaxH3ImageReference,
     MiniMaxH3Runner,
     MiniMaxH3VideoReference,
     ProgressState,
+    interrupt_controller,
     seconds_to_num_frames,
 )
 
@@ -171,6 +173,30 @@ def api_progress():
         if _current_progress is None:
             return {"phase": "idle"}
         return _current_progress.snapshot()
+
+
+@app.post("/api/interrupt")
+def api_interrupt(job_id: Optional[str] = Body(None, embed=True)):
+    """現在実行中の生成に中断を要求する。
+
+    `job_id` を**指定した**場合は、現在実行中のジョブと一致するときだけ中断する
+    (不一致なら何もしない -- 中止を押した直後に次のジョブが始まっていた場合に、
+    それを巻き添えにしないため)。**省略した場合は「いま動いているものを中断する」**
+    (呼び出し側がジョブIDを知らないことがあるため。mv_studio_V2 の中止ボタンは
+    この省略形で呼ぶので、ここを「省略なら何もしない」に変えると中止が効かなくなる)。
+    反応はステップ境界まで遅延する(H3の1ステップは実測6〜9秒 -- `core/runner.py` の
+    `GenerationInterrupted` docstring参照)。中断されたリクエストは HTTP 499 で返る。
+
+    生成中でなければ `interrupted: false` を返すだけ(エラーにはしない)。
+    """
+    with _progress_guard:
+        current_job_id = _current_progress.job_id if _current_progress else None
+    requested = interrupt_controller.request(job_id)
+    return {
+        "interrupted": requested,
+        "current_job_id": current_job_id,
+        "requested_job_id": job_id,
+    }
 
 
 @app.get("/api/settings")
@@ -348,6 +374,8 @@ def _run_generation(
     progress = ProgressState(job_id=job_id, phase="starting", started_at=time.time())
     with _progress_guard:
         _current_progress = progress
+    # 前回の中断要求が残っていて今回の生成が即死しないよう、開始時に必ずクリアする。
+    interrupt_controller.begin(job_id)
 
     try:
         result = runner.generate(
@@ -376,11 +404,16 @@ def _run_generation(
         return result
     except ValueError as e:
         raise HTTPException(400, str(e))
+    except GenerationInterrupted as e:
+        logger.info("generation interrupted: %s", e)
+        progress.update(phase="error", error=str(e))
+        raise HTTPException(499, f"生成が中断されました: {e}")
     except Exception as e:
         logger.exception("generation failed")
         progress.update(phase="error", error=str(e))
         raise HTTPException(500, f"generation failed: {e}")
     finally:
+        interrupt_controller.end()
         _generation_lock.release()
 
 
@@ -533,6 +566,7 @@ def api_t2i_batch(
     progress = ProgressState(job_id=job_id, phase="starting", started_at=time.time())
     with _progress_guard:
         _current_progress = progress
+    interrupt_controller.begin(job_id)
 
     try:
         if H3_LOWVRAM:
@@ -589,11 +623,16 @@ def api_t2i_batch(
         return JSONResponse(result)
     except ValueError as e:
         raise HTTPException(400, str(e))
+    except GenerationInterrupted as e:
+        logger.info("t2i_batch generation interrupted: %s", e)
+        progress.update(phase="error", error=str(e))
+        raise HTTPException(499, f"生成が中断されました: {e}")
     except Exception as e:
         logger.exception("t2i_batch generation failed")
         progress.update(phase="error", error=str(e))
         raise HTTPException(500, f"t2i_batch generation failed: {e}")
     finally:
+        interrupt_controller.end()
         _generation_lock.release()
 
 
@@ -770,6 +809,7 @@ def api_ref2va(
         progress = ProgressState(job_id=job_id, phase="starting", started_at=time.time())
         with _progress_guard:
             _current_progress = progress
+        interrupt_controller.begin(job_id)
 
         try:
             result = runner.generate_ref2va(
@@ -796,11 +836,16 @@ def api_ref2va(
             return JSONResponse(result)
         except ValueError as e:
             raise HTTPException(400, str(e))
+        except GenerationInterrupted as e:
+            logger.info("ref2va generation interrupted: %s", e)
+            progress.update(phase="error", error=str(e))
+            raise HTTPException(499, f"生成が中断されました: {e}")
         except Exception as e:
             logger.exception("ref2va generation failed")
             progress.update(phase="error", error=str(e))
             raise HTTPException(500, f"ref2va generation failed: {e}")
         finally:
+            interrupt_controller.end()
             _generation_lock.release()
     finally:
         for tmp_path in tmp_paths:
@@ -885,6 +930,7 @@ def _run_ref_batch(
         progress = ProgressState(job_id=job_id, phase="starting", started_at=time.time())
         with _progress_guard:
             _current_progress = progress
+        interrupt_controller.begin(job_id)
 
         mode_label = "ref2i_batch" if still else "ref2va_batch"
         try:
@@ -950,11 +996,16 @@ def _run_ref_batch(
             return JSONResponse(result)
         except ValueError as e:
             raise HTTPException(400, str(e))
+        except GenerationInterrupted as e:
+            logger.info("%s generation interrupted: %s", mode_label, e)
+            progress.update(phase="error", error=str(e))
+            raise HTTPException(499, f"生成が中断されました: {e}")
         except Exception as e:
             logger.exception("%s generation failed", mode_label)
             progress.update(phase="error", error=str(e))
             raise HTTPException(500, f"{mode_label} generation failed: {e}")
         finally:
+            interrupt_controller.end()
             _generation_lock.release()
     finally:
         for tmp_path in tmp_paths:

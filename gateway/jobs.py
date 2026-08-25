@@ -332,6 +332,12 @@ class JobRegistry:
                 "generation_seconds": data.get("generation_seconds"),
                 "peak_vram_gb": data.get("peak_vram_gb"),
             }
+        elif status == "interrupted":
+            # ユーザーが `POST /ltx25/api/interrupt` で止めた場合。失敗ではないので
+            # 「ジョブが失敗しました」と言わない(統一ステータスに interrupted がある)。
+            job.status = "interrupted"
+            job.error = data.get("error") or "生成が中断要求により停止しました"
+            job.finished_at = time.time()
         else:  # failed 系
             job.status = "failed"
             job.error = data.get("error") or f"ltx25 ジョブが失敗しました(status={status})"
@@ -379,12 +385,20 @@ class JobRegistry:
                     job.status = "completed"
                     job.progress = 1.0
                 else:
-                    job.status = "failed"
                     try:
                         detail = resp.json().get("detail")
                     except Exception:
                         detail = resp.text[:500]
-                    job.error = f"h3 が {resp.status_code} を返しました: {detail}"
+                    if resp.status_code == 499:
+                        # ユーザーが `POST /h3/api/interrupt` で止めた場合。失敗では
+                        # ないので「失敗しました」と言わない(統一ステータスに
+                        # interrupted がある)。ltx25 側の `_apply_ltx25_state()` と
+                        # 扱いを揃えること。
+                        job.status = "interrupted"
+                        job.error = detail or "生成が中断要求により停止しました"
+                    else:
+                        job.status = "failed"
+                        job.error = f"h3 が {resp.status_code} を返しました: {detail}"
             except Exception as exc:  # ネットワーク断・バックエンド停止等
                 job.status = "failed"
                 job.error = f"h3 呼び出しに失敗しました: {exc}"
