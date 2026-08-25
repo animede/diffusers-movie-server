@@ -2796,6 +2796,79 @@ class _NullContext:
         return False
 
 
+class GenerationInterrupted(Exception):
+    """生成中断API(`POST /api/interrupt`)による中断を示す例外。
+
+    denoise ループのステップ境界(`timed_loop_step` 系ラッパー、および hires-fix の
+    `run_steps()`)でのみチェックされるため、反応は最大1ステップぶん遅れる
+    (H3の1ステップは実測6〜9秒 -- 中断要求からその1ステップが終わるまで待つ形になる。
+    現状の「シーン完走(約145秒)まで止まらない」よりは大幅に改善するが、即座には
+    止まらない仕様として受け入れる)。
+
+    ステップ途中のCUDA演算そのものを中断するものではない(そんな機構は無い) --
+    直前のステップが正常に完了した直後、次のステップに入る前に例外を送出するだけ。
+    そのため呼び出し元(`generate()` 等)の既存の `finally`/`except` によるVRAM解放・
+    状態復元パスをそのまま通り、CUDA的に不整合な状態でVRAMが残ることはない
+    (decode失敗時の `except BaseException: ... _restore_decode_steady_state()` と
+    同じく、denoiseループの外側は無傷)。
+    """
+
+
+class _InterruptController:
+    """プロセス内1件だけの生成を前提とした、シンプルな中断フラグ。
+
+    どのバックエンドも同時1生成(app.py の `_generation_lock` が保証)なので、
+    フラグは1個で足りる。複数スレッド(HTTPハンドラ用スレッドと、生成を実行している
+    スレッド)から読み書きされるため `threading.Lock` で保護する。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._requested = False
+        self._job_id: str | None = None
+
+    def begin(self, job_id: str | None) -> None:
+        """生成開始時に必ず呼ぶこと。前回の要求が残っていて次の生成が即死するのを防ぐ。"""
+        with self._lock:
+            self._requested = False
+            self._job_id = job_id
+
+    def request(self, job_id: str | None) -> bool:
+        """中断を要求する。
+
+        `job_id` が指定されていて現在実行中のジョブと一致しない場合は何もせず False を
+        返す(直後に始まった別のジョブを巻き添えにしないため)。現在ジョブ不明
+        (アイドル中)の場合も False。実際に中断フラグを立てたら True。
+        """
+        with self._lock:
+            if self._job_id is None:
+                return False
+            if job_id is not None and job_id != self._job_id:
+                return False
+            self._requested = True
+            return True
+
+    def check(self) -> None:
+        """denoise ループのステップ境界から呼ぶ。要求が立っていれば例外を送出する。"""
+        with self._lock:
+            requested = self._requested
+        if requested:
+            raise GenerationInterrupted("生成が中断要求により停止しました")
+
+    def current_job_id(self) -> str | None:
+        with self._lock:
+            return self._job_id
+
+    def end(self) -> None:
+        """生成終了時(成功・失敗・中断いずれでも)に呼ぶ。次の生成に影響しないようにする。"""
+        with self._lock:
+            self._job_id = None
+            self._requested = False
+
+
+interrupt_controller = _InterruptController()
+
+
 @dataclass
 class ProgressState:
     """Simple polling-friendly progress snapshot, in the spirit of diffusers-server's core/progress.py."""
@@ -3028,6 +3101,10 @@ class MiniMaxH3Runner:
         self._vae_loaded = True
         logger.info("vae/audio_vae loaded (%s) in %.1fs. gpu=%s ram=%s",
                      "GPU" if self._vae_on_gpu else "CPU", time.time() - t1, gpu_mem_gb(), ram_gb())
+        # フェーズ境界での中断チェック(loading_vae): 固定費区間でも中断に反応できるように
+        # する追加。denoise ループのステップ境界チェック(`interrupt_controller`
+        # docstring 参照)と同じ「直前の重い処理が完全に終わった直後」の位置。
+        interrupt_controller.check()
 
         from diffusers.video_processor import VideoProcessor
 
@@ -3184,6 +3261,8 @@ class MiniMaxH3Runner:
             "transformer loaded to GPU in %.1fs (quant=%s, turbo_lora=%s). gpu=%s ram=%s",
             time.time() - t0, H3_TRANSFORMER_QUANT, H3_TURBO_LORA, gpu_mem_gb(), ram_gb(),
         )
+        # フェーズ境界での中断チェック(loading_transformer)。
+        interrupt_controller.check()
 
     def _apply_turbo_lora_checkpoint(self, transformer) -> int:
         """設定済みの turbo LoRA をダウンロード → キー形式を判定 → 形式に応じた適用
@@ -3365,6 +3444,8 @@ class MiniMaxH3Runner:
             "transformer group offload enabled in %.1fs (total load %.1fs). gpu=%s ram=%s",
             time.time() - t1, time.time() - t0, gpu_mem_gb(), ram_gb(),
         )
+        # フェーズ境界での中断チェック(loading_transformer)。
+        interrupt_controller.check()
 
     def _fbc_last_step_was_skip(self) -> int:
         """Best-effort introspection of whether the just-finished transformer forward skipped
@@ -3519,6 +3600,8 @@ class MiniMaxH3Runner:
             "transformer_ref loaded to GPU in %.1fs (quant=%s). gpu=%s ram=%s",
             time.time() - t0, H3_TRANSFORMER_QUANT, gpu_mem_gb(), ram_gb(),
         )
+        # フェーズ境界での中断チェック(loading_transformer)。
+        interrupt_controller.check()
 
     def _enable_fbc_ref(self):
         """Attach FirstBlockCache hooks to the (freshly loaded) transformer_ref.
@@ -3606,6 +3689,8 @@ class MiniMaxH3Runner:
             "transformer_ref group offload enabled in %.1fs (total load %.1fs). gpu=%s ram=%s",
             time.time() - t1, time.time() - t0, gpu_mem_gb(), ram_gb(),
         )
+        # フェーズ境界での中断チェック(loading_transformer)。
+        interrupt_controller.check()
 
     def _free_transformer_ref(self):
         if not self._transformer_ref_loaded:
@@ -4142,6 +4227,8 @@ class MiniMaxH3Runner:
             time.time() - t0, cache_dir, gpu_mem_gb(),
         )
         self._detach_te_if_external()
+        # フェーズ境界での中断チェック(loading_text_encoder)。
+        interrupt_controller.check()
         return True
 
     def _save_te_prequant(self, cache_dir: Path):
@@ -4287,6 +4374,8 @@ class MiniMaxH3Runner:
         if getattr(self._pipe, "_te_projection", None) is None:
             proj_path = self._resolve_te_proj_path()
             self._pipe._te_projection = _TeProjection(proj_path, device=self._encode_device)
+        # フェーズ境界での中断チェック(loading_text_encoder)。
+        interrupt_controller.check()
 
     def _load_text_encoder(self, progress: ProgressState | None = None):
         """Load the text_encoder to GPU.
@@ -4368,6 +4457,8 @@ class MiniMaxH3Runner:
             if H3_TE_PREQUANT:
                 self._save_te_prequant(cache_dir)
             self._detach_te_if_external()
+            # フェーズ境界での中断チェック(loading_text_encoder)。
+            interrupt_controller.check()
             return
         # TE (66GB, or ~53GB pruned) + transformer (66GB) cannot coexist in 96GB VRAM:
         # measured 66.73GB for the unpruned TE alone (the checkpoint shards are
@@ -4386,6 +4477,8 @@ class MiniMaxH3Runner:
             "text_encoder%s loaded to GPU in %.1fs. gpu=%s ram=%s",
             prune_suffix, time.time() - t0, gpu_mem_gb(), ram_gb(),
         )
+        # フェーズ境界での中断チェック(loading_text_encoder)。
+        interrupt_controller.check()
 
     def _free_text_encoder(self, force: bool = False):
         """Free the resident text_encoder.
@@ -5205,6 +5298,11 @@ class MiniMaxH3Runner:
         prompt_embeds, text_token_tags = self._to_compute_device(prompt_embeds, text_token_tags)
         state.set("prompt_embeds", prompt_embeds)
         state.set("text_token_tags", text_token_tags)
+        # フェーズ境界での中断チェック(encoding): テキストエンコード自体が終わった直後。
+        # この先は layout/latents/timesteps の準備と transformer(_ref) のロードが続き、
+        # それぞれ個別のフェーズ境界チェック(loading_transformer 側、denoising 直前)で
+        # 別途カバーされる。
+        interrupt_controller.check()
 
         # upscale (hires-fix) requests: force-free the TE-nf4 even in bnb-4bit mode.
         # Pass 2 runs full self-attention over a ~4x longer packed sequence (2x spatial ->
@@ -5503,6 +5601,9 @@ class MiniMaxH3Runner:
         actual_num_frames = state.get("num_frames")
 
         # --- denoise loop, instrumented for progress polling ---
+        # denoise 開始直前にも1回チェックしておく(ループ内は timed_loop_step 側で
+        # 毎ステップ境界チェック済み -- ここは「まだ1歩も進んでいない」状態での保険)。
+        interrupt_controller.check()
         if progress:
             progress.update(phase="denoising", step=0, total_steps=num_inference_steps, message="デノイズ中...")
         t_denoise = time.time()
@@ -5577,6 +5678,9 @@ class MiniMaxH3Runner:
             orig_loop_step = denoise_step.loop_step
 
             def timed_loop_step(components, bstate, i, t):
+                # ステップ境界での中断チェック(_InterruptController の docstring 参照)。
+                # 前のステップが完全に終わった直後・次のステップの計算に入る前。
+                interrupt_controller.check()
                 ts = time.time()
                 result = orig_loop_step(components, bstate, i=i, t=t)
                 step_times.append(time.time() - ts)
@@ -5683,6 +5787,10 @@ class MiniMaxH3Runner:
                 cm = fbc_cm if fbc_cm is not None else _NullContext()
                 with cm:
                     for i in range(i_start, i_end):
+                        # ステップ境界での中断チェック(_InterruptController の docstring
+                        # 参照)。hires-fix はループを自前で回す唯一の経路のため、他の
+                        # timed_loop_step 系サイトと同じ規約でここにも入れる。
+                        interrupt_controller.check()
                         t = timesteps[i]
                         ts = time.time()
                         pre_step_video_sample = bstate.latents.clone() if (capture_last and i == i_end - 1) else None
@@ -6109,6 +6217,8 @@ class MiniMaxH3Runner:
         t_encode = time.time()
         scenes: list[dict] = []
         for idx, prompt in enumerate(prompts):
+            # フェーズ境界での中断チェック(encoding): 場面ごとのループ境界。
+            interrupt_controller.check()
             if progress:
                 progress.update(phase="encoding", message=f"場面 {idx + 1}/{n_scenes} をエンコード中...")
             state = PipelineState()
@@ -6180,6 +6290,7 @@ class MiniMaxH3Runner:
             orig_loop_step = denoise_step.loop_step
 
             def timed_loop_step(components, bstate, i, t, _idx=idx, _step_times=step_times, _skips=cache_skips):
+                interrupt_controller.check()
                 ts = time.time()
                 result = orig_loop_step(components, bstate, i=i, t=t)
                 _step_times.append(time.time() - ts)
@@ -6595,6 +6706,9 @@ class MiniMaxH3Runner:
         prompt_embeds, text_token_tags = self._to_compute_device(prompt_embeds, text_token_tags)
         state.set("prompt_embeds", prompt_embeds)
         state.set("text_token_tags", text_token_tags)
+        # フェーズ境界での中断チェック(encoding): プロンプト+参照のテキストエンコードが
+        # 終わった直後(generate() の t2va/fl2va 版と同じ位置)。
+        interrupt_controller.check()
 
         # --- reference VAE encoding (image/video refs through vae, soundtracks through
         # audio_vae) -- this is ref2va's analogue of fl2va's keyframe step, and needs the
@@ -6882,6 +6996,8 @@ class MiniMaxH3Runner:
 
         # --- denoise loop, instrumented for progress polling (mirrors generate()'s
         # non-upscale path exactly, against transformer_ref instead of transformer) ---
+        # denoise 開始直前の保険チェック(generate() と同じ位置、docstring 参照)。
+        interrupt_controller.check()
         if progress:
             progress.update(phase="denoising", step=0, total_steps=num_inference_steps, message="デノイズ中...")
         t_denoise = time.time()
@@ -6902,6 +7018,7 @@ class MiniMaxH3Runner:
         orig_loop_step = denoise_step.loop_step
 
         def timed_loop_step(components, bstate, i, t):
+            interrupt_controller.check()
             ts = time.time()
             result = orig_loop_step(components, bstate, i=i, t=t)
             step_times.append(time.time() - ts)
@@ -7278,6 +7395,8 @@ class MiniMaxH3Runner:
         t_encode = time.time()
         scenes: list[dict] = []
         for idx, prompt in enumerate(prompts):
+            # フェーズ境界での中断チェック(encoding): 場面ごとの setup ループ境界。
+            interrupt_controller.check()
             if progress:
                 progress.update(phase="encoding", message=f"場面 {idx + 1}/{n_scenes} をエンコード中...")
             state = PipelineState()
@@ -7331,8 +7450,15 @@ class MiniMaxH3Runner:
                     prompt_embeds, text_token_tags = self._to_compute_device(prompt_embeds, text_token_tags)
                     scene["state"].set("prompt_embeds", prompt_embeds)
                     scene["state"].set("text_token_tags", text_token_tags)
+                # フェーズ境界での中断チェック(encoding): 共有プレフィックスの
+                # 前方計算が終わった直後(こちらは単発の長い呼び出しなのでループ境界ではなく
+                # 呼び出し直後に1回)。
+                interrupt_controller.check()
             else:
                 for idx, scene in enumerate(scenes):
+                    # フェーズ境界での中断チェック(encoding): 場面ごとのフォールバック
+                    # エンコードループ境界。
+                    interrupt_controller.check()
                     if progress:
                         progress.update(phase="encoding", message=f"場面 {idx + 1}/{n_scenes} をエンコード中...")
                     with torch.no_grad():
@@ -7349,6 +7475,9 @@ class MiniMaxH3Runner:
         # TE(21GB)+vae(11GB) は問題なく収まることを単発実測で確認済み) ---
         self._vae_to_gpu()
         for idx, scene in enumerate(scenes):
+            # フェーズ境界での中断チェック(encoding): 場面ごとの参照VAEエンコード
+            # ループ境界。
+            interrupt_controller.check()
             if progress:
                 progress.update(phase="encoding", message=f"場面 {idx + 1}/{n_scenes} の参照をVAEエンコード中...")
             reference_encoder_step = MiniMaxH3Ref2VAReferenceEncoderStep()
@@ -7403,6 +7532,7 @@ class MiniMaxH3Runner:
             orig_loop_step = denoise_step.loop_step
 
             def timed_loop_step(components, bstate, i, t, _idx=idx, _step_times=step_times, _skips=cache_skips):
+                interrupt_controller.check()
                 ts = time.time()
                 result = orig_loop_step(components, bstate, i=i, t=t)
                 _step_times.append(time.time() - ts)

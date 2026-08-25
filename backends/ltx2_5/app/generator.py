@@ -102,6 +102,78 @@ class _ProgressRamp:
         self._progress(self._hi)
 
 
+class GenerationInterrupted(Exception):
+    """Raised from `progress_callback()` when a `POST /api/interrupt` request has been
+    accepted for the currently-running job.
+
+    Only checked at diffusers `callback_on_step_end` boundaries (i.e. once per
+    denoise step), so reaction time is bounded by one step's wall-clock cost --
+    this mirrors the H3 backend's `core/runner.py::GenerationInterrupted` (same
+    endpoint name/shape, same HTTP 499 on the caller side) so `mv_studio_V2` does not
+    need to special-case either backend. This does not abort any in-flight CUDA op;
+    it only stops the pipeline from starting its *next* step. The existing
+    `JobManager._run()`'s `except Exception` / `finally: self._save(job)` path already
+    handles marking the job failed and releasing the worker for the next job, so no
+    additional cleanup is required here.
+    """
+
+
+class _InterruptController:
+    """Process-wide single-flight interrupt flag.
+
+    Only one job runs at a time (`JobManager._run()`'s single worker thread pulls
+    from a `queue.Queue` one at a time), so a single flag is enough. Guarded by a
+    lock since it is written from the FastAPI request-handling thread and read from
+    the worker thread.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._requested = False
+        self._job_id: str | None = None
+
+    def begin(self, job_id: str | None) -> None:
+        """Call exactly once, right before a job's `generate()` call starts, so a
+        stale interrupt request from a previous job cannot instantly kill this one."""
+        with self._lock:
+            self._requested = False
+            self._job_id = job_id
+
+    def request(self, job_id: str | None) -> bool:
+        """Request an interrupt. If `job_id` is given and does not match the
+        currently-running job, does nothing and returns False (so a request racing
+        with the start of an unrelated job cannot kill it). Returns True if the flag
+        was actually set."""
+        with self._lock:
+            if self._job_id is None:
+                return False
+            if job_id is not None and job_id != self._job_id:
+                return False
+            self._requested = True
+            return True
+
+    def check(self) -> None:
+        """Call from a step-boundary callback. Raises `GenerationInterrupted` if an
+        interrupt has been requested for the currently-running job."""
+        with self._lock:
+            requested = self._requested
+        if requested:
+            raise GenerationInterrupted("generation was stopped by an interrupt request")
+
+    def current_job_id(self) -> str | None:
+        with self._lock:
+            return self._job_id
+
+    def end(self) -> None:
+        """Call once the job has finished (success, failure, or interruption)."""
+        with self._lock:
+            self._job_id = None
+            self._requested = False
+
+
+interrupt_controller = _InterruptController()
+
+
 class LTXGenerator:
     """Lazily loads the gated model so health checks remain cheap."""
 
@@ -507,6 +579,10 @@ class LTXGenerator:
 
         def progress_callback(offset: float, span: float, step_count: int):
             def on_step(_pipe, step: int, _timestep, callback_kwargs):
+                # Step-boundary interrupt check (see GenerationInterrupted's docstring):
+                # runs once per denoise step, right where diffusers already calls back
+                # into us, so no extra hook into the pipeline internals is needed.
+                interrupt_controller.check()
                 progress(min(offset + ((step + 1) / step_count) * span, 0.96))
                 return callback_kwargs
 
@@ -682,6 +758,10 @@ class LTXGenerator:
 
         def progress_callback(offset: float, span: float, step_count: int):
             def on_step(_pipe, step: int, _timestep, callback_kwargs):
+                # Step-boundary interrupt check (see GenerationInterrupted's docstring):
+                # runs once per denoise step, right where diffusers already calls back
+                # into us, so no extra hook into the pipeline internals is needed.
+                interrupt_controller.check()
                 progress(min(offset + ((step + 1) / step_count) * span, 0.96))
                 return callback_kwargs
 
