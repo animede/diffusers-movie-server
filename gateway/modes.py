@@ -69,6 +69,10 @@ H3_EXTRA_KEYS = {
     "cache", "cache_threshold", "attn", "turbo", "mute",  # 即反映パラメータ
     "upscale",            # t2va のアップスケール
     "frames",             # t2i / ref2i の still フレーム数(22|5)
+    # ref2va/ref2i の参照画像正規化短辺(未指定ならバックエンド側の
+    # H3_REF_IMAGE_SHORT_EDGE 既定=2048を使う。backends/minimax-h3/app.py の
+    # /api/ref2va 等が受け付ける任意パラメータをそのまま素通しする)。
+    "reference_image_short_edge",
 }
 LTX25_EXTRA_KEYS = {
     "upscale", "upscale_method", "temporal_upscale", "decoder",
