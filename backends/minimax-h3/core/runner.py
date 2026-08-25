@@ -491,6 +491,59 @@ if H3_CACHE not in ("none", "fbc"):
     raise ValueError(f"H3_CACHE must be 'none' or 'fbc', got {H3_CACHE!r}")
 H3_CACHE_THRESHOLD = float(os.environ.get("H3_CACHE_THRESHOLD", "0.05"))
 
+# Overrides diffusers' `ConfigSpec("reference_image_short_edge", 2048)`
+# (modular_pipelines/minimax_h3/before_encoder.py), which ref2va's prefix-encode step
+# uses to normalize every reference image's short edge before it goes into Qwen3-VL-32B:
+# `scale = reference_image_short_edge / min(width, height)` -- this is applied even when
+# it means *upscaling* the reference, and there is no area cap on top of it. Measured on
+# this box: a 1280x720 reference gets scaled up to 3648x2048, producing a 7,309-token
+# prefix that alone takes ~92.9s to encode (of a ~140s scene; denoise is only 20-27s) --
+# see the "single ref-prefix cache MISS: encoded 7309 prefix tokens in 92.9s" log line.
+# Default 2048 matches diffusers' own default exactly, so leaving this unset reproduces
+# current behaviour byte-for-byte (`_ensure_pipe_shell` below skips the
+# `register_to_config` call entirely in that case). Lowering it shrinks the prefix (fewer
+# tokens -> faster encode) but also shrinks how much detail of the reference survives
+# into the prefix, which can affect character consistency -- this has NOT been quality
+# A/B'd, so treat any non-default value as experimental and eyeball the output.
+H3_REF_IMAGE_SHORT_EDGE_RAW = os.environ.get("H3_REF_IMAGE_SHORT_EDGE", "").strip()
+H3_REF_IMAGE_SHORT_EDGE_DEFAULT = 2048
+if H3_REF_IMAGE_SHORT_EDGE_RAW:
+    try:
+        H3_REF_IMAGE_SHORT_EDGE = int(H3_REF_IMAGE_SHORT_EDGE_RAW)
+        if H3_REF_IMAGE_SHORT_EDGE <= 0:
+            raise ValueError
+    except ValueError:
+        logger.warning(
+            "H3_REF_IMAGE_SHORT_EDGE=%r is not a positive integer -- ignoring, using "
+            "diffusers' default of %d.",
+            H3_REF_IMAGE_SHORT_EDGE_RAW, H3_REF_IMAGE_SHORT_EDGE_DEFAULT,
+        )
+        H3_REF_IMAGE_SHORT_EDGE = H3_REF_IMAGE_SHORT_EDGE_DEFAULT
+else:
+    H3_REF_IMAGE_SHORT_EDGE = H3_REF_IMAGE_SHORT_EDGE_DEFAULT
+
+
+def _resolve_ref_image_short_edge(override: int | None) -> int:
+    """Per-request counterpart of `H3_REF_IMAGE_SHORT_EDGE` (see that env var's own
+    comment above for the mechanism and the measured encode/denoise-time tradeoff).
+
+    `override is None` (the only case app.py's `/api/ref2va` etc. hit when the caller
+    omits the field entirely) returns `H3_REF_IMAGE_SHORT_EDGE` unchanged -- i.e. this
+    process's env-var-resolved default, byte-for-byte the same value `_ensure_pipe_shell`
+    would already have applied. Explicit values are validated the same way the env var
+    is (positive int), but raise `ValueError` instead of warning-and-falling-back, since
+    this is a live request the caller can correct and resubmit (unlike an env var typo
+    baked in at process start).
+    """
+    if override is None:
+        return H3_REF_IMAGE_SHORT_EDGE
+    if not isinstance(override, int) or isinstance(override, bool) or override <= 0:
+        raise ValueError(
+            f"reference_image_short_edge は正の整数で指定してください: {override!r}"
+        )
+    return override
+
+
 # EXPERIMENTAL, opt-in, not yet A/B'd against the committed default at task-write time
 # (this env var and its wiring are themselves the subject of that pending A/B -- see
 # dev_notes/ or the task that added this comment). "none" (default) = transformer stays
@@ -2993,6 +3046,20 @@ class MiniMaxH3Runner:
         logger.info("pipe shell built: blocks=%s components=%s",
                      self._pipe._blocks.__class__.__name__, self._pipe.component_names)
 
+        # H3_REF_IMAGE_SHORT_EDGE override (see its definition above for the "why").
+        # Only touch the config when it actually differs from diffusers' own default, so
+        # the default path calls `register_to_config` exactly as often as before this
+        # change (zero times) and stays byte-for-byte identical.
+        if H3_REF_IMAGE_SHORT_EDGE != H3_REF_IMAGE_SHORT_EDGE_DEFAULT:
+            self._pipe.register_to_config(reference_image_short_edge=H3_REF_IMAGE_SHORT_EDGE)
+            logger.info(
+                "reference_image_short_edge overridden: %d -> %d (H3_REF_IMAGE_SHORT_EDGE). "
+                "Affects ref2va's reference-prefix encode step: shorter edge -> fewer "
+                "prefix tokens -> faster Qwen3-VL-32B prefix encode, but less reference "
+                "detail reaches the prefix (character-consistency impact not A/B'd).",
+                H3_REF_IMAGE_SHORT_EDGE_DEFAULT, H3_REF_IMAGE_SHORT_EDGE,
+            )
+
     def _ensure_pipe_ref_shell(self):
         """PR #14355 (f37ab93): no second shell to build any more (see the `_pipe_ref`
         field comment in `__init__` for why) -- `self._pipe_ref` is just made to point at
@@ -4685,6 +4752,11 @@ class MiniMaxH3Runner:
             ),
             "video_vae_fp16": H3_VIDEO_VAE_FP16,
             "transformer_quant": H3_TRANSFORMER_QUANT,
+            # ref2va's reference-image normalization short edge (H3_REF_IMAGE_SHORT_EDGE,
+            # see its definition above). Reported here (rather than only logged once at
+            # pipe-shell build time) so a run's logs can be cross-checked against which
+            # setting was actually in effect. 2048 = diffusers' own default / unset.
+            "ref_image_short_edge": H3_REF_IMAGE_SHORT_EDGE,
             "lowvram": H3_LOWVRAM_RAW,
             "lowvram_group": H3_LOWVRAM_GROUP,
             # import 時の logger.info は uvicorn がロギングを設定する前に走って消えるので、
@@ -6457,6 +6529,12 @@ class MiniMaxH3Runner:
         mute: bool = False,
         still: bool = False,
         still_frames: int = 22,
+        # Per-request override of `reference_image_short_edge` (see
+        # H3_REF_IMAGE_SHORT_EDGE's module-level comment for the "why"). `None` (default)
+        # means "use whatever this process's H3_REF_IMAGE_SHORT_EDGE env var resolved to"
+        # -- byte-for-byte identical to this parameter not existing at all. Validated and
+        # applied just before the setup step below (see that call site's comment).
+        reference_image_short_edge: int | None = None,
     ) -> dict:
         """
         Runs ref2va: joint video+audio generation conditioned on an ordered list of
@@ -6668,6 +6746,28 @@ class MiniMaxH3Runner:
         state.set("attention_kwargs", None)
         state.set("latents", None)
         state.set("audio_latents", None)
+
+        # Per-request `reference_image_short_edge` override (see
+        # `_resolve_ref_image_short_edge`'s docstring). Read by the setup step called
+        # right below via `MiniMaxH3Ref2VASetupStep.__call__` ->
+        # `before_encoder.py:490`, so it must be set on the shared pipe config *before*
+        # that call, every request (not just when it differs from the current value --
+        # unlike `_ensure_pipe_shell`'s one-time env-var setup, a later request with no
+        # override must not silently keep an earlier request's explicit value, so this
+        # always re-asserts the resolved value rather than skipping when unchanged).
+        # Cache-safety note: ref2va's own prefix cache is keyed off the actual resized
+        # reference pixels/shape (see H3_REF_PREFIX_CACHE's module comment), which
+        # already differ whenever this value differs -- so there is no risk of one
+        # request's cached prefix leaking into a request that asked for a different
+        # short edge; a changed short edge is just a cache miss like any other input change.
+        resolved_short_edge = _resolve_ref_image_short_edge(reference_image_short_edge)
+        pipe.register_to_config(reference_image_short_edge=resolved_short_edge)
+        if resolved_short_edge != H3_REF_IMAGE_SHORT_EDGE_DEFAULT:
+            logger.info(
+                "ref2va reference_image_short_edge=%d (default=%d)%s",
+                resolved_short_edge, H3_REF_IMAGE_SHORT_EDGE_DEFAULT,
+                " [per-request override]" if reference_image_short_edge is not None else " [H3_REF_IMAGE_SHORT_EDGE]",
+            )
 
         # --- setup (canvas / frame count / reference prep) ---
         # Reference images/videos/audio are decoded and resized here (each at its own
@@ -7242,6 +7342,7 @@ class MiniMaxH3Runner:
             "turbo": instant["turbo"],
             "mute": bool(mute),
             "cache_skipped_steps": cache_skips[0] if instant["effective_cache"] == "fbc" else None,
+            "reference_image_short_edge": resolved_short_edge,
             "references_summary": [
                 {"index": index, "kind": kind, "has_audio": bool(references[index].has_audio)}
                 for index, kind in enumerate(kinds)
@@ -7272,6 +7373,10 @@ class MiniMaxH3Runner:
         # 出力 mp4 に音声ストリームを入れない (生成そのものは止まらない --
         # `_mux_mp4` の docstring 参照)。
         mute: bool = False,
+        # 単発 generate_ref2va() と同じ per-request override。全場面共通
+        # (references 自体が全場面共通なのと同じ理由、バッチ内で場面ごとに変える
+        # ユースケースが無いため)。
+        reference_image_short_edge: int | None = None,
     ) -> dict:
         """参照共通・プロンプト違いの ref2va 生成 N 本を、`H3_LOWVRAM=1` の固定費を
         バッチ全体で1回に償却して回す (`generate_still_batch()` の ref2va 版)。
@@ -7347,6 +7452,9 @@ class MiniMaxH3Runner:
                     "場面間で尺が揃う保証がないためバッチでは使えません)。"
                 )
             batch_num_frames = seconds_to_num_frames(seconds)
+        # Fail fast, before acquiring `self._load_lock` / doing any loading work below
+        # (same early-validation placement as the other `raise ValueError`s just above).
+        resolved_short_edge = _resolve_ref_image_short_edge(reference_image_short_edge)
 
         from diffusers.modular_pipelines.minimax_h3.before_denoise import (
             MiniMaxH3PrepareConditionLatentsStep,
@@ -7390,6 +7498,19 @@ class MiniMaxH3Runner:
         # `MiniMaxH3SetTimestepsStep` より前に適用しておく)。
         self._apply_turbo_video_shift(instant["turbo"])
         pipe = self._pipe_ref
+
+        # Same per-request override as generate_ref2va() (see that call site's comment
+        # for the mechanism / cache-safety note). Applied once here, before the
+        # per-scene setup-step loop below, since `references` (and hence this value) is
+        # constant across all scenes in a batch and `pipe` is the same shell each
+        # iteration reuses.
+        pipe.register_to_config(reference_image_short_edge=resolved_short_edge)
+        if resolved_short_edge != H3_REF_IMAGE_SHORT_EDGE_DEFAULT:
+            logger.info(
+                "ref batch reference_image_short_edge=%d (default=%d)%s",
+                resolved_short_edge, H3_REF_IMAGE_SHORT_EDGE_DEFAULT,
+                " [per-request override]" if reference_image_short_edge is not None else " [H3_REF_IMAGE_SHORT_EDGE]",
+            )
 
         # --- encode 位相 (TE 常駐): 全場面の setup + テキスト/参照ビジョンエンコード ---
         t_encode = time.time()
@@ -7662,6 +7783,7 @@ class MiniMaxH3Runner:
             "cache_threshold": instant["cache_threshold"] if instant["effective_cache"] == "fbc" else None,
             "turbo": instant["turbo"],
             "mute": bool(mute),
+            "reference_image_short_edge": resolved_short_edge,
             "references_summary": [
                 {"index": index, "kind": kind, "has_audio": bool(references[index].has_audio)}
                 for index, kind in enumerate(kinds)

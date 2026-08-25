@@ -730,6 +730,7 @@ def api_ref2va(
     mute: bool = Form(False),
     still: int = Form(0),
     frames: int = Form(22),
+    reference_image_short_edge: Optional[int] = Form(None),
 ):
     """ref2va: 画像最大9・動画最大3・音声最大3(計12参照)からの動画+音声生成。
 
@@ -749,6 +750,13 @@ def api_ref2va(
 
     `num_inference_steps=None` はそのリクエストの実効 turbo から解決する
     (`resolve_num_inference_steps()` 参照)。
+
+    `reference_image_short_edge` は任意パラメータ(未指定ならプロセス起動時の
+    H3_REF_IMAGE_SHORT_EDGE 環境変数の値、既定2048、を使う=挙動は完全に従来どおり)。
+    参照画像をQwen3-VL-32Bへ通す前に正規化する短辺サイズで、小さいほどプレフィックス
+    トークン数が減りエンコード・denoiseとも高速化するが、参照の細部再現度が下がる
+    (トレードオフの実測は core/runner.py の H3_REF_IMAGE_SHORT_EDGE コメント参照)。
+    不正値(正の整数でない)は400。
     """
     global _current_progress
 
@@ -762,6 +770,10 @@ def api_ref2va(
         raise HTTPException(400, f"frames は {STILL_FRAME_CHOICES} のいずれかです: {frames}")
     if (height is None) != (width is None):
         raise HTTPException(400, "height と width は両方指定するか、両方省略してください")
+    if reference_image_short_edge is not None and reference_image_short_edge <= 0:
+        raise HTTPException(
+            400, f"reference_image_short_edge は正の整数で指定してください: {reference_image_short_edge}"
+        )
     # 32の倍数でない値はエラーにせず丸める(t2va/fl2va と同じ方針。省略時はサーバが
     # H3 自身の 16:9 キャンバスを解決するので触らない)。
     if height is not None:
@@ -828,6 +840,7 @@ def api_ref2va(
                 mute=mute,
                 still=bool(still),
                 still_frames=frames,
+                reference_image_short_edge=reference_image_short_edge,
             )
             result["job_id"] = job_id
             result["video_url"] = f"/outputs/{Path(result['mp4_path']).name}"
@@ -867,13 +880,15 @@ def _run_ref_batch(
     attn: Optional[str],
     turbo: Optional[bool],
     mute: bool = False,
+    reference_image_short_edge: Optional[int] = None,
 ) -> JSONResponse:
     """/api/ref2i_batch (still=True) と /api/ref2va_batch (still=False) の共通実装。
 
     `H3_LOWVRAM=1` ではモデルロード固定費をバッチ全体で1回に償却する位相並べ替え
     (core/runner.py の generate_ref_batch) を使い、他モードは逐次 generate_ref2va()
     で同じレスポンス形式を返す。参照・seed・解像度・尺・ステップ数は全場面共通
-    (変えられるのはプロンプトのみ)。
+    (変えられるのはプロンプトのみ)。reference_image_short_edge も全場面共通
+    (未指定なら /api/ref2va と同じくプロセスの H3_REF_IMAGE_SHORT_EDGE を使う)。
 
     `num_inference_steps=None` はそのリクエストの実効 turbo から解決する
     (`resolve_num_inference_steps()` 参照)。バッチ全場面で同じ値を使う。
@@ -900,6 +915,10 @@ def _run_ref_batch(
     if height is not None:
         height = round_canvas_value(height)
         width = round_canvas_value(width)
+    if reference_image_short_edge is not None and reference_image_short_edge <= 0:
+        raise HTTPException(
+            400, f"reference_image_short_edge は正の整数で指定してください: {reference_image_short_edge}"
+        )
 
     # 参照のスプールと構築は /api/ref2va と同じ手順 (tmp ファイル → MiniMaxH3*Reference.from_file)。
     tmp_paths: list[Path] = []
@@ -951,6 +970,7 @@ def _run_ref_batch(
                     attn=attn,
                     turbo=turbo,
                     mute=mute,
+                    reference_image_short_edge=reference_image_short_edge,
                 )
             else:
                 # 常駐モード: 逐次 generate_ref2va() でも固定費はほぼ増えない。
@@ -963,6 +983,7 @@ def _run_ref_batch(
                         seconds=seconds, num_inference_steps=num_inference_steps, seed=seed,
                         progress=progress, cache=cache, cache_threshold=cache_threshold,
                         attn=attn, turbo=turbo, mute=mute, still=still, still_frames=frames,
+                        reference_image_short_edge=reference_image_short_edge,
                     )
                     scenes.append({
                         "prompt": p,
@@ -986,6 +1007,9 @@ def _run_ref_batch(
                     "num_inference_steps": num_inference_steps, "seed": seed,
                     "total_elapsed_s": round(total, 2),
                     "per_image_s": round(total / len(cleaned), 2),
+                    # 全場面で同じ値 (reference_image_short_edge はバッチ全体で固定) なので
+                    # 代表として最後の scene の解決済み値を使う。
+                    "reference_image_short_edge": r["reference_image_short_edge"],
                     "scenes": scenes,
                 }
             result["job_id"] = job_id
@@ -1026,14 +1050,19 @@ def api_ref2i_batch(
     attn: Optional[str] = Form(None),
     turbo: Optional[bool] = Form(None),
     mute: bool = Form(False),
+    reference_image_short_edge: Optional[int] = Form(None),
 ):
     """参照付き静止画のバッチ生成: 共通の references + プロンプト配列から、
     キャラクター一貫の場面静止画を連続生成する(/api/t2i_batch の ref2va 版)。
+
+    reference_image_short_edge は /api/ref2va と同じ任意パラメータ(全場面共通、
+    未指定ならプロセスの H3_REF_IMAGE_SHORT_EDGE を使う)。
     """
     return _run_ref_batch(
         prompts=prompts, references=references, still=True, frames=frames, seconds=None,
         num_inference_steps=num_inference_steps, seed=seed, height=height, width=width,
         cache=cache, cache_threshold=cache_threshold, attn=attn, turbo=turbo, mute=mute,
+        reference_image_short_edge=reference_image_short_edge,
     )
 
 
@@ -1051,16 +1080,21 @@ def api_ref2va_batch(
     attn: Optional[str] = Form(None),
     turbo: Optional[bool] = Form(None),
     mute: bool = Form(False),
+    reference_image_short_edge: Optional[int] = Form(None),
 ):
     """参照付き動画のバッチ生成: 共通の references + プロンプト配列から、
     物語の各場面の動画を連続生成する。尺 (seconds) は全場面共通で必須
     (音声参照からの尺自動導出はバッチでは使えない)。低VRAMモードでは
     モデルロード固定費 (~110s + 参照ビジョンエンコード) がバッチ全体で1回になる。
+
+    reference_image_short_edge は /api/ref2va と同じ任意パラメータ(全場面共通、
+    未指定ならプロセスの H3_REF_IMAGE_SHORT_EDGE を使う)。
     """
     return _run_ref_batch(
         prompts=prompts, references=references, still=False, frames=22, seconds=seconds,
         num_inference_steps=num_inference_steps, seed=seed, height=height, width=width,
         cache=cache, cache_threshold=cache_threshold, attn=attn, turbo=turbo, mute=mute,
+        reference_image_short_edge=reference_image_short_edge,
     )
 
 
