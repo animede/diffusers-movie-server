@@ -53,8 +53,42 @@ H3_PRESETS = {
     "96gb": Preset(
         name="96gb",
         env={},
-        description="既定(env なし)。全モデル常駐、起動時プリロードで常駐 87.3GB。96GB 専有前提。",
+        description="既定(env なし)。全モデル常駐、起動時プリロードで常駐 87.3GB。96GB 専有前提。"
+                    "**ref2va 主体の用途では 96gb-int8 の方が 1.8倍速い(168.4s → 92.7s)**: "
+                    "bf16 では transformer_ref(66GB)と TE-nf4(21GB)が同時に載らず、"
+                    "リクエストごとに transformer_ref の再ロード(実測 34.7秒)が入るため。",
         vram_hint="常駐 87.3GB / t2va peak ~92GB",
+    ),
+    "96gb-int8": Preset(
+        name="96gb-int8",
+        # 2026-08-24 実測(RTX PRO 6000 96GB、768×448・8秒・turbo・seed 777・ref2va、
+        # 定常状態 = transformer_ref ロード済みの2本目):
+        #   96gb (bf16) : 合計 168.4s / denoise 20.5s / decode 5.4s / 固定費 142.6s / peak 87.9GB
+        #   96gb-int8   : 合計  92.7s / denoise 20.9s / decode 5.5s / 固定費  66.3s / peak 73.8GB
+        # denoise/decode はほぼ同じで、差は丸ごと固定費(142.6s → 66.3s)。bf16 は
+        # transformer_ref(66GB)+ TE-nf4(21GB)が 96GB に同時に載らず、リクエストごとに
+        # transformer_ref を 34.7秒かけて載せ替えていた。int8(34GB)なら
+        # 34 + 21 + VAE 11 = 66GB で全部常駐でき、この載せ替えが消える。
+        # 残る 66.3s の内訳: 参照エンコード ~55s(README も ref2va のボトルネックと記載)
+        # + VAE の GPU⇔CPU 往復 11.6s(TE_QUANT=bnb-4bit のときだけ発生する設計)。
+        # turbo は load 時トグル・リクエスト単位のどちらでも指定できる
+        # (2026-08-24 に _validate_combination() の無条件拒否を comfy 形式限定へ修正した。
+        #  既定の lightx2v 版は diffusers ネイティブで int8 と併用できる)。
+        #
+        # **int8 の代償(ref2va 以外の用途では要検討)**:
+        #  - denoise 単体は bf16 の方が 5〜14% 速い(README: t2i 2.07s vs 2.40s /
+        #    t2va 14.05s vs 14.81s)。ref2va で int8 が勝つのは載せ替えが消えるからで、
+        #    載せ替えが元々起きない用途では逆転しうる。
+        #  - **同一 seed でも bf16 とは出力が変わる**(README: PSNR 19dB の軌道分岐)。
+        #    bf16 とのビット再現が要る対照実験では 96gb を使うこと。
+        env={"H3_TRANSFORMER_QUANT": "int8"},
+        description="96GB機の ref2va 最適(transformer int8)。96gb(bf16)比 1.8倍速の "
+                    "合計 92.7s(denoise 20.9s / decode 5.5s / 固定費 66.3s)。"
+                    "int8(34GB)なら transformer_ref と TE-nf4 が同時常駐でき、bf16 で "
+                    "毎リクエスト発生していた transformer_ref の載せ替え(34.7s)が消える。"
+                    "代償: denoise 単体は bf16 が 5〜14% 速く、同一 seed でも bf16 とは "
+                    "出力が変わる(PSNR 19dB の軌道分岐)。ref2va 主体でないなら 96gb を。",
+        vram_hint="ref2va peak 73.8GB(768×448・8秒。96gb bf16 は 87.9GB)",
     ),
     "48gb-lowvram": Preset(
         name="48gb-lowvram",
@@ -137,9 +171,24 @@ LTX25_PRESETS = {
     ),
     "fp8": Preset(
         name="fp8",
+        # ⚠ OFFLOAD_MODE=none との併用は 48GB では不可(2026-08-22 実測、2回検証)。
+        # ltx25 単体で 42〜45GB まで伸び、**512×288・3秒という最小構成でも OOM** する。
+        # 同居プロセスのキャッシュを解放して余白を 2.4GB 増やしても再現したので、
+        # 「他プロセスに圧迫されていたから」ではなく fp8 全常駐そのものが 48GB 級に
+        # 対して大きすぎる。vram_hint の「常駐 ~18GB」は model オフロード時の値。
+        # 速度が要るなら nf4-fast(全常駐でも ~28GB)を使う。
         env={"LTX25_TRANSFORMER_PRECISION": "fp8"},
-        description="fp8 layerwise casting(bf16 相当品質)。48GB級向け。",
-        vram_hint="常駐 ~18GB / peak ~29GB",
+        description="fp8 layerwise casting(bf16 相当品質)。48GB級向け(model オフロード)。",
+        vram_hint="常駐 ~18GB / peak ~29GB(オフロードあり。none 併用は48GBで OOM)",
+    ),
+    "nf4-fast": Preset(
+        name="nf4-fast",
+        # nf4 は peak ~17.2GB と軽いので、48GB なら全常駐にできる。
+        # 既定の model オフロードは毎ステップ transformer が CPU⇄GPU を往復して
+        # 大幅に遅くなるため、速度優先ならこちら。
+        env={"OFFLOAD_MODE": "none"},
+        description="bnb 4bit transformer + オフロードなし。48GB級で速度優先。",
+        vram_hint="peak ~17.2GB 相当(全常駐)",
     ),
     "bf16": Preset(
         name="bf16",
@@ -247,13 +296,34 @@ def resolve_env(backend_name: str, preset_name: str | None,
     return env, preset_name
 
 
+# turbo LoRA のうち **comfy 形式(融合QKV、Ostris 版)** だけが int8 と非互換。
+# 機序: `apply_turbo_lora()` の `fuse_projections()` が to_q/to_k/to_v を `torch.cat` で
+# 融合するが、torchao の Int8Tensor に `aten.cat` カーネルが無い。
+# **既定の lightx2v 版(diffusers ネイティブ)は融合しない**ので int8 でも動く。
+# バックエンド側の2つのガード(core/runner.py:946、core/settings.py の
+# validate_instant_settings)はどちらも `turbo_lora_expected_format() == "comfy"` 条件付き。
+# gateway だけが無条件に拒否しており実態と食い違っていた(2026-08-24 修正)。
+# 実証: preset=96gb + H3_TRANSFORMER_QUANT=int8 + turbo で 92.7秒の生成に成功
+# (transformer_quant="int8" / turbo_lora=true / total_elapsed_s=92.7 をログで確認)。
+_H3_TURBO_COMFY_REPOS = ("larryvrh/MiniMax-H3-Turbo-Lora",)
+_H3_TURBO_DEFAULT_REPO = "lightx2v/Minimax-h3-Turbo"  # core/runner.py:879 の既定と合わせる
+
+
+def _h3_turbo_is_comfy_format(env: dict[str, str]) -> bool:
+    """この env の turbo LoRA が comfy 形式(融合QKV)か。バックエンドの判定のミラー。"""
+    repo = (env.get("H3_TURBO_LORA_REPO") or _H3_TURBO_DEFAULT_REPO).strip()
+    return repo in _H3_TURBO_COMFY_REPOS
+
+
 def _validate_combination(backend_name: str, env: dict[str, str]) -> None:
     if backend_name == "h3":
         turbo = env.get("H3_TURBO_LORA") == "1"
-        if turbo and env.get("H3_TRANSFORMER_QUANT") == "int8":
+        if turbo and env.get("H3_TRANSFORMER_QUANT") == "int8" and _h3_turbo_is_comfy_format(env):
             raise ValidationError(
-                "turbo(H3_TURBO_LORA=1)と H3_TRANSFORMER_QUANT=int8 は併用できません"
-                "(torchao Int8Tensor に aten.cat が無い既知の禁止事項)")
+                "turbo LoRA(comfy 形式 = 融合QKV)と H3_TRANSFORMER_QUANT=int8 は"
+                "併用できません(fuse_projections() の torch.cat が torchao Int8Tensor に"
+                "対応していない)。既定の lightx2v 版(diffusers ネイティブ)なら int8 でも"
+                f"動きます — H3_TURBO_LORA_REPO を外すか {_H3_TURBO_DEFAULT_REPO!r} にしてください")
         if turbo and env.get("H3_LOWVRAM") == "group":
             raise ValidationError(
                 "turbo(H3_TURBO_LORA=1)と H3_LOWVRAM=group は併用できません"
