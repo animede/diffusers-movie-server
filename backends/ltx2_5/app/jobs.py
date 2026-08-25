@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from .config import Settings
-from .generator import LTXGenerator
+from .generator import GenerationInterrupted, LTXGenerator, interrupt_controller
 from .schemas import GenerateRequest
 
 # Output filename prefixes for still-image modes (PNG instead of MP4).
@@ -198,6 +198,9 @@ class JobManager:
             job = self.jobs[job_id]
             job.status = "running"
             self._save(job)
+            # 前回ジョブの中断要求が残っていて今回のジョブが即死しないよう、開始時に
+            # 必ずクリアする(core/runner.py 側の同名パターンと同じ理由)。
+            interrupt_controller.begin(job.id)
             try:
                 still_prefix = STILL_IMAGE_PREFIXES.get(job.request.mode)
                 target = self.config.output_dir / (
@@ -213,9 +216,13 @@ class JobManager:
                 else:
                     job.video_url = f"/outputs/{job.id}.mp4"
                 job.status = "completed"
+            except GenerationInterrupted as exc:
+                job.error = str(exc)
+                job.status = "interrupted"
             except Exception as exc:
                 job.error = str(exc)
                 job.status = "failed"
             finally:
+                interrupt_controller.end()
                 self._save(job)
                 self._queue.task_done()

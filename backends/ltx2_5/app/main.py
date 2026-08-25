@@ -1,15 +1,17 @@
 import subprocess
 import uuid
 from pathlib import Path
+from typing import Optional
 
 import httpx
-from fastapi import FastAPI, File, HTTPException, Response, UploadFile
+from fastapi import Body, FastAPI, File, HTTPException, Response, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
 from safetensors import safe_open
 
 from .config import settings
+from .generator import interrupt_controller
 from .jobs import JobManager
 from .schemas import (
     AssetResponse,
@@ -49,6 +51,30 @@ def health():
         "model": settings.model_id,
         "loaded": manager.generator._pipe is not None,
         "prompt_enhancer": bool(settings.llm_base_url and settings.llm_model),
+    }
+
+
+@app.post("/api/interrupt")
+def api_interrupt(job_id: Optional[str] = Body(None, embed=True)):
+    """Request that the currently-running job stop.
+
+    If `job_id` is given and does not match the job currently executing, this is a
+    no-op (so a request racing with the start of an unrelated job cannot kill it).
+    Only checked at denoise step boundaries (see `generator.GenerationInterrupted`'s
+    docstring), so reaction time is bounded by roughly one step's wall-clock cost --
+    this is the same contract as the H3 backend's `POST /api/interrupt` (same
+    endpoint name/request/response shape), so callers do not need to special-case
+    either backend. An interrupted job settles into `status: "interrupted"` when
+    polled via `GET /api/jobs/{job_id}` (there is no synchronous HTTP response to
+    return an error code on here, since job submission is async/queued -- see
+    `POST /api/jobs`)."""
+    active = [job.id for job in manager.jobs.values() if job.status == "running"]
+    current_job_id = active[0] if active else None
+    requested = interrupt_controller.request(job_id)
+    return {
+        "interrupted": requested,
+        "current_job_id": current_job_id,
+        "requested_job_id": job_id,
     }
 
 
