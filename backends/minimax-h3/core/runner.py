@@ -103,12 +103,14 @@ There are two loading strategies, selected by the `H3_TE_QUANT` env var:
 from __future__ import annotations
 
 import gc
+import hashlib
 import io
 import json
 import logging
 import os
 import threading
 import time
+import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -969,6 +971,15 @@ FPS = 24
 # `torch.cat([])` で落ちる)。
 STILL_FRAME_CHOICES = (22, 5)
 
+# Opt-in ("0" default = 完全に無効、既存の ref2va 経路と無変更)。"1" で
+# `generate_ref2va()` の Audio Drive を有効化する: 生成対象の音声行 (packed layout の
+# `[text | 参照ブロック | 生成音声行 | 生成映像行]` のうち「生成音声行」) を、
+# `references` に含まれる最初の `MiniMaxH3AudioReference` の波形から encode した
+# latent で置き換え、denoise 中ずっとクリーン (t=1.0 固定・無変更) に固定する。
+# 詳細は `generate_ref2va()` 内の該当コメント、および `_build_audio_drive_latents()` /
+# `_apply_audio_drive_condition_rows()` の docstring 参照。
+H3_AUDIO_DRIVE = os.environ.get("H3_AUDIO_DRIVE", "0").strip() == "1"
+
 # Opt-out ("1" default). "1" = `AutoencoderKLMiniMaxH3._decode()` に「潜在フレームが
 # 1チャンク未満 (num_chunks==0、潜在1-2フレーム)なら全トークンを単一の `_decode_clip()`
 # で復号する」分岐を monkeypatch で追加する(下の `_patch_vae_smallclip_decode()`)。
@@ -1056,6 +1067,56 @@ if H3_VAE_SMALLCLIP_FIX:
 # - つまりバッチ出力は従来経路とビット一致しない (sage/FBC と同種の epsilon 級ドリフト)。
 #   ビット再現が要る対照実験では H3_REF_PREFIX_CACHE=0 を使うこと
 H3_REF_PREFIX_CACHE = os.environ.get("H3_REF_PREFIX_CACHE", "1").strip() == "1"
+
+
+# 既定 OFF: 上の共有プレフィックスを **単発 `/api/ref2va` のリクエスト間** でも持ち越す。
+# バッチ (`H3_REF_PREFIX_CACHE`) は1回の呼び出しの中で完結するので安全側の既定が ON だが、
+# こちらはプロセス寿命の KV キャッシュ (実測 ~1.0GiB VRAM) をリクエストをまたいで持つため、
+# 「既存挙動を変えない」を優先して既定 OFF にしてある (効果と安全性が実測で固まってから
+# 既定を変えること)。
+#
+# 何が節約されるか: 同じ参照 (画像) で音声/プロンプトだけ違うリクエストを連投するとき、
+# 参照ラベル+ビジョンの Qwen3-VL 前方計算 (768x448/8s の実測で ~55s) が2回目以降まるごと
+# 消える。単発リクエストごとに参照の再エンコードが起きていたのはドキュメント既知の穴
+# (README「単発リクエストの繰り返しでは共有されない」)。
+#
+# 成立条件 (実測で確認、`_single_ref_prefix_cache_key` がこの条件を機械的に判定する):
+# - **画像参照のみ** (+ 音声参照はいくつでも可)。音声は `_build_presentation` が
+#   `"<Audio j>: "` のラベルしか出さず波形は conditioner に届かないので、音声ファイルの
+#   中身も長さも変わってプレフィックスのトークン列は**ビット単位で不変** (プローブ実測:
+#   別内容・別長さの wav 4本で prefix_ids_sha / pixel_values_sha が完全一致)。
+# - **動画参照が1つでもあると使えない** (動画はピクセルがプレフィックスに入るため、
+#   中身が違えばプレフィックスも違う -- プローブ実測 max_abs_diff=102.0)。この場合は
+#   従来のフル計算経路へ黙って落ちる (キャッシュは破棄する)。
+#
+# 精度: プレフィックス部分はフル計算と**ビット一致**、プロンプト末尾は相対RMS ~1.5% の
+# 丸め差 (`H3_REF_PREFIX_CACHE` のコメントと同じ理由・同じ水準)。ビット再現が要る対照
+# 実験では 0 のままにすること。
+#
+# **TE を解放しない構成では自動的に無効化する** (2026-08-24 レビュー指摘):
+# キャッシュ (KV 約1.04GiB) は `_free_text_encoder()` に相乗りして捨てている。しかし
+#   - `H3_TE_DEVICE` 指定時 (48gb-dual): `_free_text_encoder` が early return するため
+#     TE が解放されず、キャッシュが **TE 側 GPU に恒久常駐**する。48gb-dual の TE 側は
+#     「ref2va に約24GB 必要 (24GBカードは境界)」とプリセット自身が書いている GPU で、
+#     そこへ 1.04GiB を返さないまま載せるのは危険。
+#   - `H3_TE_PROJ` 指定時 (16gb-proj): 同じく TE 恒久常駐。16GB カード (peak ~11.4GB) に
+#     +1.04GiB。しかも投影TE × 参照経路は元々 UNVERIFIED。
+# どちらも実測していないので、明示的に無効化して理由をログに出す。
+# 必要になったら「TE を解放しない構成でもキャッシュを個別に解放する」実装を足すこと。
+_H3_REF_PREFIX_CACHE_SINGLE_REQUESTED = (
+    os.environ.get("H3_REF_PREFIX_CACHE_SINGLE", "0").strip() == "1"
+)
+if _H3_REF_PREFIX_CACHE_SINGLE_REQUESTED and (H3_TE_DEVICE or H3_TE_PROJ):
+    logger.warning(
+        "H3_REF_PREFIX_CACHE_SINGLE=1 is ignored: the cache is freed together with the "
+        "text_encoder, but H3_TE_DEVICE=%r / H3_TE_PROJ=%r keep the TE resident, so the "
+        "~1.04GiB KV cache would never be released on that GPU (untested). "
+        "Drop H3_TE_DEVICE / H3_TE_PROJ to use the single-request prefix cache.",
+        H3_TE_DEVICE, H3_TE_PROJ,
+    )
+H3_REF_PREFIX_CACHE_SINGLE = _H3_REF_PREFIX_CACHE_SINGLE_REQUESTED and not (
+    H3_TE_DEVICE or H3_TE_PROJ
+)
 
 
 # H3_TE_PROJ 有効時、H3 トークナイザ固有の特殊トークン (`<d>`=151669 / `</d>`=151670)
@@ -1346,6 +1407,285 @@ def _encode_ref_prompts_shared_prefix(
         results.append((prompt_embeds, text_token_tags))
 
     return results
+
+
+@dataclass
+class _SingleRefPrefixEntry:
+    """`H3_REF_PREFIX_CACHE_SINGLE` の1エントリ (同時に1つだけ保持する)。
+
+    `cache`/`prefix_hidden` は GPU 常駐 (実測 ~1.0GiB + ~40MiB)。`rope_deltas` を
+    一緒に持つのが要点 -- 下の `_encode_ref2va_prompt_prefix_cached` の docstring 参照。
+    """
+
+    key: str
+    cache: object            # transformers DynamicCache (プレフィックス長に crop 済み)
+    prefix_hidden: torch.Tensor
+    prefix_tags: list[int]
+    prefix_len: int
+    rope_deltas: torch.Tensor | None
+    te_ref: object           # weakref.ref(text_encoder) -- 解放/再ロードの検出用
+    device: torch.device
+    dtype: torch.dtype
+    te_layer: int
+    te_proj_id: int | None
+    nbytes: int
+
+
+# プロセス内に高々1エントリ。`generate_ref2va()` は app.py の generation_lock で直列化
+# されているので追加のロックは要らない (キャッシュを触るのは生成経路だけ)。
+_single_ref_prefix_entry: "_SingleRefPrefixEntry | None" = None
+
+
+def _clear_single_ref_prefix_cache(reason: str) -> None:
+    """単発プレフィックスキャッシュを捨てる (VRAM も返す)。
+
+    呼ばれる場所は3つ: (1) キー不一致・条件外 (動画参照など) で作り直すとき、
+    (2) `_free_text_encoder()` が実際に TE を落とすとき (KV は TE と同じ計算グラフの
+    産物なので、TE が入れ替わったら必ず捨てる)、(3) `unload()`。
+    """
+    global _single_ref_prefix_entry
+    if _single_ref_prefix_entry is None:
+        return
+    freed = _single_ref_prefix_entry.nbytes / 1024**3
+    _single_ref_prefix_entry = None
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    logger.info("single ref-prefix cache cleared (%.2fGiB): %s", freed, reason)
+
+
+def _single_ref_prefix_cache_key(
+    prefix_ids: list[int],
+    vision_inputs: dict,
+) -> str | None:
+    """プレフィックスの実体からキーを作る。使えない構成なら `None`。
+
+    キーはファイル名やリクエストIDではなく **実際にプレフィックス forward へ入る値**
+    (トークン列 + 画像テンソルのバイト列 + grid) から作る。これで参照の枚数・順序
+    (ラベル番号が変わる)・解像度・ピクセルの中身、どれが変わっても必ず別キーになる。
+    音声は `_build_presentation` がラベルしか出さないので `prefix_ids` に自然に
+    含まれ、波形そのものはキーに入らない (= 音声だけ差し替えた連投でヒットする、
+    これがこの機能の狙い)。
+
+    `None` を返す条件:
+      - 動画参照がある (`pixel_values_videos`)。動画はピクセルがプレフィックスに
+        入るのでリクエスト間で同一とみなせない (プローブ実測 max_abs_diff=102.0)。
+      - 画像参照が1枚も無い (キャッシュする価値が無く、`pixel_values` も無い)。
+    """
+    if vision_inputs.get("pixel_values_videos") is not None:
+        return None
+    pixel_values = vision_inputs.get("pixel_values")
+    if pixel_values is None:
+        return None
+    h = hashlib.sha256()
+    h.update(np.asarray(prefix_ids, dtype=np.int64).tobytes())
+    grid = vision_inputs.get("image_grid_thw")
+    if grid is not None:
+        h.update(grid.detach().to("cpu").contiguous().numpy().tobytes())
+    pv = pixel_values.detach().to("cpu").contiguous()
+    h.update(str(pv.dtype).encode())
+    h.update(np.asarray(pv.shape, dtype=np.int64).tobytes())
+    try:
+        raw = pv.numpy()
+    except TypeError:
+        # bf16 等 numpy に無い dtype はバイト列として見る。
+        raw = pv.view(torch.uint8).numpy()
+    h.update(raw.tobytes())
+    return h.hexdigest()
+
+
+def _encode_ref2va_prompt_prefix_cached(
+    components,
+    prompt: str,
+    normalized_references,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    r"""単発 `/api/ref2va` 用: 参照プレフィックスの KV キャッシュを**リクエスト間で**
+    使い回す (`H3_REF_PREFIX_CACHE_SINGLE=1` のときだけ呼ばれる)。使えない構成なら
+    `None` を返し、呼び出し側は従来の `_encode_ref2va_prompt()` へ落ちる。
+
+    仕組みは `_encode_ref_prompts_shared_prefix` (バッチ版) と同一で、違いは
+    「プレフィックスを1回の呼び出しの中で使い切らず、モジュール変数に残す」ことだけ。
+    そのぶんバッチ版には無い3つの安全装置が要る:
+
+    1. **`model.rope_deltas` の保存/復元**。これは `Qwen3VLModel` の *インスタンス状態*
+       で、プレフィックス forward が書き、継続 forward が読む
+       (`compute_3d_position_ids`: `past_key_values_length > 0` の枝で
+       `position_ids = arange(past_len, past_len+seq) + self.rope_deltas`)。バッチ版は
+       「プレフィックス→全継続」を1呼び出しで閉じるので放置できたが、リクエストを
+       またぐと間に t2va のプロンプトエンコードや `/api/prompt/enhance` が挟まって
+       `rope_deltas` が上書きされうる。そこでプレフィックス時の値を clone して持ち、
+       **継続の直前に必ず書き戻す**。これで間に何が挟まっても継続は同じ位置IDで走る。
+    2. **text_encoder の同一性チェック**。KV は特定の TE インスタンスの重みで作った
+       ものなので、TE が解放/再ロード/量子化変更されたら無効。`weakref` で保持して
+       「今の `components.text_encoder` と同一オブジェクトか」を毎回見る
+       (`_free_text_encoder()` 側でも能動的に捨てている -- 二重の安全側)。
+    3. **キーは参照の実体から**。`_single_ref_prefix_cache_key()` 参照。
+
+    VRAM: プレフィックス 4109 トークンの `DynamicCache` は実測 ~1.0GiB
+    (64層 x kv_heads 8 x head_dim 128 x K/V 2 x bf16) + `prefix_hidden` ~40MiB。
+    """
+    global _single_ref_prefix_entry
+    from diffusers.modular_pipelines.minimax_h3.encoders import MiniMaxH3Ref2VATextEncoderStep
+    from transformers.cache_utils import DynamicCache
+
+    step = MiniMaxH3Ref2VATextEncoderStep()
+    te_proj = _te_projection_for(components)
+    te_layer = _te_encoder_layer_for(components)
+    num_layers = components.text_encoder.config.text_config.num_hidden_layers
+    if num_layers <= te_layer:
+        raise ValueError(
+            f"MiniMax-H3 conditions on `hidden_states[{te_layer}]` of its Qwen3-VL "
+            f"conditioner, which needs more than {te_layer} decoder layers, but "
+            f"`text_encoder` has {num_layers}."
+        )
+
+    t_key = time.time()
+    vision_inputs, image_token_counts, video_token_counts, video_timestamps = step._gather_vision_features(
+        components.processor, normalized_references, components.fps
+    )
+    prefix_ids, prefix_tags = step._build_presentation(
+        components.tokenizer,
+        "",
+        normalized_references,
+        image_token_counts,
+        video_token_counts,
+        video_timestamps,
+        text_tag=components.text_tag,
+        video_tag=components.video_tag,
+    )
+    key = _single_ref_prefix_cache_key(prefix_ids, vision_inputs)
+    if key is None:
+        # 動画参照あり / 画像参照なし -- この構成では持ち越せない。持っていた分は
+        # VRAM を無駄に占めるだけなので捨てて、従来経路へ落とす。
+        _clear_single_ref_prefix_cache("unsupported references (video or no image)")
+        return None
+    if te_proj is not None:
+        _reject_unsupported_proj_tokens(prefix_ids)
+
+    model = components.text_encoder.model
+    hook = getattr(components.text_encoder, "_hf_hook", None)
+    if hook is not None and hasattr(hook, "pre_forward"):
+        hook.pre_forward(components.text_encoder)
+
+    entry = _single_ref_prefix_entry
+    hit = (
+        entry is not None
+        and entry.key == key
+        and entry.te_ref() is components.text_encoder
+        and entry.device == device
+        and entry.dtype == dtype
+        and entry.te_layer == te_layer
+        and entry.te_proj_id == (id(te_proj) if te_proj is not None else None)
+    )
+    if not hit:
+        if entry is not None:
+            # ローカル参照を先に落としてから捨てる -- 残したままだと refcount が
+            # 下がらず、新しいプレフィックスを確保する前に VRAM が返らない。
+            entry = None
+            _clear_single_ref_prefix_cache("reference/text-encoder changed")
+        t_prefix = time.time()
+        prefix_input = torch.tensor([prefix_ids], dtype=torch.long, device=device)
+        mm_token_type_ids = torch.tensor(
+            components.processor.create_mm_token_type_ids([prefix_ids]), dtype=torch.long, device=device
+        )
+        pixel_values = vision_inputs.get("pixel_values")
+        image_grid_thw = vision_inputs.get("image_grid_thw")
+        cache = DynamicCache(config=model.config)
+        with torch.no_grad():
+            prefix_out = model(
+                input_ids=prefix_input,
+                attention_mask=torch.ones_like(prefix_input),
+                mm_token_type_ids=mm_token_type_ids,
+                pixel_values=(
+                    None if pixel_values is None else pixel_values.to(device, components.text_encoder.dtype)
+                ),
+                image_grid_thw=None if image_grid_thw is None else image_grid_thw.to(device),
+                pixel_values_videos=None,
+                video_grid_thw=None,
+                past_key_values=cache,
+                use_cache=True,
+                output_hidden_states=True,
+            )
+        prefix_hidden = prefix_out.hidden_states[te_layer].to(device=device, dtype=dtype)
+        if te_proj is not None:
+            prefix_hidden = te_proj.project(prefix_hidden, dtype=dtype)
+        prefix_len = cache.get_seq_length()
+        rope_deltas = getattr(model, "rope_deltas", None)
+        nbytes = sum(
+            t.numel() * t.element_size()
+            for layer in cache.layers
+            for t in (layer.keys, layer.values)
+            if t is not None
+        ) + prefix_hidden.numel() * prefix_hidden.element_size()
+        entry = _SingleRefPrefixEntry(
+            key=key,
+            cache=cache,
+            prefix_hidden=prefix_hidden,
+            prefix_tags=list(prefix_tags),
+            prefix_len=prefix_len,
+            rope_deltas=None if rope_deltas is None else rope_deltas.clone(),
+            te_ref=weakref.ref(components.text_encoder),
+            device=device,
+            dtype=dtype,
+            te_layer=te_layer,
+            te_proj_id=id(te_proj) if te_proj is not None else None,
+            nbytes=nbytes,
+        )
+        _single_ref_prefix_entry = entry
+        logger.info(
+            "single ref-prefix cache MISS: encoded %d prefix tokens in %.1fs (key prep %.2fs), "
+            "kept %.2fGiB resident (key=%s)",
+            prefix_len, time.time() - t_prefix, t_prefix - t_key, nbytes / 1024**3, key[:12],
+        )
+    else:
+        logger.info(
+            "single ref-prefix cache HIT: reusing %d prefix tokens (%.2fGiB, key prep %.2fs, key=%s)",
+            entry.prefix_len, entry.nbytes / 1024**3, time.time() - t_key, key[:12],
+        )
+
+    # --- 継続 (プロンプト末尾のみ) ---
+    # rope_deltas は毎回書き戻す (MISS 直後でも安いので無条件に -- 上の docstring 1.)。
+    if entry.rope_deltas is not None:
+        model.rope_deltas = entry.rope_deltas.clone()
+    # 直前の継続で伸びたままになっていないことを保証する (正常系では継続の直後に
+    # crop 済みだが、例外で抜けた場合の保険)。
+    if entry.cache.get_seq_length() != entry.prefix_len:
+        entry.cache.crop(entry.prefix_len)
+
+    suffix_ids = components.tokenizer(prompt, add_special_tokens=False)["input_ids"]
+    if te_proj is not None:
+        _reject_unsupported_proj_tokens(suffix_ids)
+    suffix_input = torch.tensor([suffix_ids], dtype=torch.long, device=device)
+    try:
+        with torch.no_grad():
+            suffix_out = model(
+                input_ids=suffix_input,
+                attention_mask=None,
+                mm_token_type_ids=None,
+                pixel_values=None,
+                image_grid_thw=None,
+                pixel_values_videos=None,
+                video_grid_thw=None,
+                past_key_values=entry.cache,
+                use_cache=True,
+                output_hidden_states=True,
+            )
+        if te_proj is not None:
+            # 継続断片の位置0はシーケンス先頭ではないので sink_out 置換をしない
+            # (`_TeProjection.project_continuation` の docstring 参照)。
+            suffix_hidden = te_proj.project_continuation(suffix_out.hidden_states[te_layer], dtype=dtype)
+        else:
+            suffix_hidden = suffix_out.hidden_states[te_layer].to(device=device, dtype=dtype)
+    finally:
+        entry.cache.crop(entry.prefix_len)
+
+    prompt_embeds = torch.cat([entry.prefix_hidden, suffix_hidden], dim=1)
+    text_token_tags = torch.tensor(
+        entry.prefix_tags + [components.text_tag] * len(suffix_ids), dtype=torch.long
+    )
+    return prompt_embeds, text_token_tags
 
 
 @contextmanager
@@ -2237,6 +2577,154 @@ def _num_frames_from_audio_reference(references: list, fps: int) -> int:
         )
     num_samples = waveform.shape[-1]
     return align_num_frames(round(num_samples / sample_rate * fps))
+
+
+def _build_audio_drive_latents(pipe, references: list, actual_num_frames: int) -> torch.Tensor | None:
+    r"""Audio Drive (`H3_AUDIO_DRIVE=1`) 用: 駆動音声を encode して `(2, audio_latent_channels,
+    N)` の audio_latents テンソルにして返す。`references` に `MiniMaxH3AudioReference` が
+    1つも無ければ `None` を返す (呼び出し側はこれを「発動しない」合図として扱うこと)。
+
+    最初に見つかった `MiniMaxH3AudioReference` の波形を流用する (専用の API 引数は
+    追加しない -- 参照としての音声はそのまま `references` に残り、ref2va の通常の
+    参照エンコード経路 (`MiniMaxH3Ref2VAReferenceEncoderStep`) が別途エンコードする)。
+
+    正規化・エンコード手順は `MiniMaxH3Ref2VAReferenceEncoderStep.__call__`
+    (diffusers `modular_pipelines/minimax_h3/encoders.py:740-760` 付近) と完全に同一
+    にする (独自の正規化を発明しない): `audio_vae.encode(...)` -> `posterior.mode()`
+    -> `transpose` -> `(x - latents_mean) / latents_std`。ここでは行化
+    (`.reshape(-1, C)`) はせず、`MiniMaxH3PrepareLatentsStep` がそのまま受け付ける
+    `(2, C, N)` 形状で返す (行化はそのステップ自身が
+    `.permute(0, 2, 1).reshape(-1, C)` で行う -- 参照エンコーダ出力とビット一致する
+    ことは `probe_layout.py`/`check_layout.py`/`pack_roundtrip.py` で検証済み)。
+
+    `N = audio_latent_num_frames(actual_num_frames)` に厳密に合わせる: 波形を
+    `N * 800` サンプル (audio_vae は 32000Hz・800 samples/latent) へ trim/pad してから
+    encode し、encode 結果が N と1行ずれる場合に備えて encode 後にも latent 側で
+    trim/pad し、`assert` で N 一致を確認する。
+    """
+    from diffusers.modular_pipelines.minimax_h3.before_encoder import MiniMaxH3Ref2VASetupStep
+    from diffusers.modular_pipelines.minimax_h3.modular_pipeline import (
+        MINIMAX_H3_AUDIO_LATENTS_PER_SECOND,
+        audio_latent_num_frames,
+    )
+
+    audio_ref = next((entry for entry in references if isinstance(entry, MiniMaxH3AudioReference)), None)
+    if audio_ref is None:
+        logger.warning(
+            "H3_AUDIO_DRIVE=1 ですが references に MiniMaxH3AudioReference がありません -- "
+            "Audio Drive は発動せず、通常の ref2va 経路にフォールバックします。"
+        )
+        return None
+
+    device = pipe._execution_device
+    audio_channels = pipe.audio_channels
+    audio_latent_channels = pipe.audio_latent_channels
+    target_sample_rate = pipe.audio_sampling_rate
+    N = audio_latent_num_frames(actual_num_frames)
+    samples_per_latent = target_sample_rate // MINIMAX_H3_AUDIO_LATENTS_PER_SECOND
+    target_num_samples = N * samples_per_latent
+
+    sample_rate = audio_ref.sample_rate
+    if sample_rate is None:
+        sample_rate = target_sample_rate
+    orig_num_samples = int(audio_ref.audio.shape[-1])
+
+    # `_normalize_audio_condition` は truncate のみ (max_duration 経由) で pad はしない。
+    # そのため先に truncate+resample+mono->stereo をこのステップに任せ、その後 pad/trim を
+    # このヘルパー側で厳密に行う (target_sample_rate に揃った後のサンプル数基準で行う
+    # 必要があるため -- max_duration は resample 前の sample_rate 基準の秒数)。
+    waveform = MiniMaxH3Ref2VASetupStep._normalize_audio_condition(
+        audio_ref.audio,
+        sample_rate,
+        target_sample_rate,
+        max_duration=max(orig_num_samples / sample_rate, target_num_samples / target_sample_rate),
+    )
+    resampled_num_samples = int(waveform.shape[-1])
+    if resampled_num_samples < target_num_samples:
+        waveform = torch.nn.functional.pad(waveform, (0, target_num_samples - resampled_num_samples))
+    elif resampled_num_samples > target_num_samples:
+        waveform = waveform[:, :target_num_samples]
+    trimmed_num_samples = int(waveform.shape[-1])
+
+    logger.info(
+        "Audio Drive: driving audio orig_samples=%d (sr=%s) -> trimmed/padded=%d samples "
+        "(target N=%d, samples/latent=%d)",
+        orig_num_samples, sample_rate, trimmed_num_samples, N, samples_per_latent,
+    )
+
+    audio_latents_mean = torch.tensor(pipe.audio_vae.config.latents_mean).view(1, 1, -1)
+    audio_latents_std = torch.tensor(pipe.audio_vae.config.latents_std).view(1, 1, -1)
+
+    with torch.no_grad():
+        posterior = pipe.audio_vae.encode(waveform.to(device)[:, None], return_dict=False)[0]
+        latents = posterior.mode().float().cpu().transpose(1, 2)  # (2, T, C)
+        normalized = (latents - audio_latents_mean) / audio_latents_std  # (2, T, C)
+
+    encoded_num_frames = normalized.shape[1]
+    if encoded_num_frames != N:
+        # audio_vae のチャンク境界の丸めで N と1行ずれることがある -- latent 側でも
+        # 厳密に N へ trim/pad する (task の指示どおり)。
+        if encoded_num_frames < N:
+            pad = N - encoded_num_frames
+            normalized = torch.nn.functional.pad(normalized, (0, 0, 0, pad))
+        else:
+            normalized = normalized[:, :N, :]
+
+    audio_latents = normalized.transpose(1, 2).contiguous()  # (2, C, N) -- what PrepareLatentsStep expects
+    assert audio_latents.shape == (audio_channels, audio_latent_channels, N), (
+        f"Audio Drive: injected audio_latents shape {tuple(audio_latents.shape)} != "
+        f"expected {(audio_channels, audio_latent_channels, N)}"
+    )
+    logger.info(
+        "Audio Drive: encoded latent shape=%s (posterior.mode) -> injected shape=%s",
+        tuple(latents.shape), tuple(audio_latents.shape),
+    )
+    return audio_latents
+
+
+def _inflate_audio_drive_condition_rows(state, num_generated_audio_latents: int, audio_channels: int) -> int:
+    r"""Audio Drive (`H3_AUDIO_DRIVE=1`) 用: `state["num_condition_audio_rows"]` を
+    「生成音声行も含めてすべて条件行」に見せかけ、denoise 中はクリーン (t=1.0固定・
+    無変更) に凍結する。書き換え前の (参照行数のみの) 元の値を返す -- 呼び出し側は
+    これを保持しておき、`_restore_audio_drive_condition_rows()` に渡して必ず復元する
+    こと。
+
+    **重要**: `MiniMaxH3Ref2VADenoiseStep.__call__`
+    (`MiniMaxH3DenoiseLoopWrapper.__call__`, diffusers `denoise.py:260-266`) は
+    `state` から `block_state` を**ループの前に1回だけ** `get_block_state()` で
+    読み出し、以後 denoise ループの全ステップはその `block_state` (ローカルな
+    スナップショット) を使い回す (`state` への書き戻しはループ終了後の
+    `set_block_state()` のみ)。そのため、この関数で膨らませた
+    `num_condition_audio_rows` は **`denoise_step(pipe, state)` の呼び出しが
+    終わるまで `state` 上で膨らんだままにしておく必要がある** (`timesteps_step` の
+    呼び出しが終わった直後に戻してしまうと、後で呼ばれる denoise ループが
+    元の値でスナップショットを取ってしまい、生成音声行が凍結されない)。
+
+    呼び出し側 (`generate_ref2va()` の4分岐、将来的には `generate_ref_batch()` も) は
+    「`ref2va_latents_step` の後・`timesteps_step` の前」でこれを呼び (`ref2va_latents_step`
+    自身が参照行数との一致を検証するため、それより前に書き換えてはいけない)、
+    「`MiniMaxH3AfterDenoiseStep` の直前」(denoise ループの後) で
+    `_restore_audio_drive_condition_rows()` を呼んで元へ戻すこと。
+    """
+    original = state.get("num_condition_audio_rows")
+    inflated = original + num_generated_audio_latents * audio_channels
+    state.set("num_condition_audio_rows", inflated)
+    logger.info(
+        "Audio Drive: num_condition_audio_rows %s -> %s (freezing generated audio rows)",
+        original, inflated,
+    )
+    return original
+
+
+def _restore_audio_drive_condition_rows(state, original: int) -> None:
+    r"""`_inflate_audio_drive_condition_rows()` が返した元の値へ `state`
+    (`num_condition_audio_rows`) を戻す。`MiniMaxH3AfterDenoiseStep` の呼び出し直前に
+    必ず呼ぶこと -- 戻し忘れると、生成行だけを切り出す `decoders.py` の
+    `audio_rows.reshape(components.audio_channels, block_state.num_audio_latents, ...)`
+    が 0 要素の reshape になり確実に落ちる。
+    """
+    state.set("num_condition_audio_rows", original)
+    logger.info("Audio Drive: num_condition_audio_rows restored -> %s", original)
 
 
 def gpu_mem_gb() -> dict:
@@ -3955,6 +4443,12 @@ class MiniMaxH3Runner:
         # above, since they are the same object) rather than a fix for a live bug. Left
         # in rather than deleted: harmless, and it stays correct if this alias
         # relationship were ever to change again.
+        # 単発プレフィックス KV キャッシュ (`H3_REF_PREFIX_CACHE_SINGLE`) は、これから
+        # 落とす TE インスタンスの重みで作ったもの。TE を落とす以上は必ず一緒に捨てる
+        # (捨てないと ~1.0GiB の VRAM が「もう二度と使えない KV」として残る。
+        # `_encode_ref2va_prompt_prefix_cached` 側の weakref チェックでも救えるが、
+        # VRAM を即座に返すためここで能動的に捨てる)。既定 OFF のときは常に no-op。
+        _clear_single_ref_prefix_cache("text_encoder freed")
         del self._pipe.text_encoder
         self._pipe.text_encoder = None
         if self._pipe_ref is not None and getattr(self._pipe_ref, "text_encoder", None) is not None:
@@ -4023,6 +4517,9 @@ class MiniMaxH3Runner:
         self._free_transformer()
         self._free_transformer_ref()
         self._free_text_encoder(force=True)
+        # `_free_text_encoder` は TE 外部常駐 (`H3_TE_DEVICE`) では早期 return するので、
+        # そちらの構成でも確実に捨てるためここでも呼ぶ (既定 OFF なら no-op)。
+        _clear_single_ref_prefix_cache("unload_all")
         self._free_vaes()
         self._active_variant = None
         logger.info("unload_all: done in %.1fs. gpu=%s ram=%s", time.time() - t0, gpu_mem_gb(), ram_gb())
@@ -6080,10 +6577,21 @@ class MiniMaxH3Runner:
         if progress:
             progress.update(phase="encoding", message="プロンプト+参照をエンコード中...")
         with self._te_attached(), torch.no_grad():
-            prompt_embeds, text_token_tags = _encode_ref2va_prompt(
-                pipe, prompt, state.get("normalized_references"),
-                device=self._encode_device, dtype=torch.bfloat16,
-            )
+            encoded = None
+            if H3_REF_PREFIX_CACHE_SINGLE:
+                # 参照が同一 (画像参照のみ、音声/プロンプトは違ってよい) ならプレフィックスの
+                # KV キャッシュを前回リクエストから使い回す。使えない構成 (動画参照あり等)
+                # なら `None` が返り、下の従来経路へそのまま落ちる。
+                encoded = _encode_ref2va_prompt_prefix_cached(
+                    pipe, prompt, state.get("normalized_references"),
+                    device=self._encode_device, dtype=torch.bfloat16,
+                )
+            if encoded is None:
+                encoded = _encode_ref2va_prompt(
+                    pipe, prompt, state.get("normalized_references"),
+                    device=self._encode_device, dtype=torch.bfloat16,
+                )
+            prompt_embeds, text_token_tags = encoded
         prompt_embeds, text_token_tags = self._to_compute_device(prompt_embeds, text_token_tags)
         state.set("prompt_embeds", prompt_embeds)
         state.set("text_token_tags", text_token_tags)
@@ -6098,6 +6606,15 @@ class MiniMaxH3Runner:
         # `_ensure_vaes`/`_load_text_encoder`), including the "already resident from a
         # previous ref2va request's steady state" case -- see that comment for the bug
         # this closes. Nothing more to free here; just bring vae onto GPU.
+        #
+        # H3_AUDIO_DRIVE (opt-in, "0" default): set inside whichever branch below runs,
+        # while `audio_vae` is still GPU-resident (see `_build_audio_drive_latents()`'s
+        # docstring for why it cannot wait until after `_vae_to_cpu()`). Declared here,
+        # ahead of the dispatch, so every branch (and the `H3_AUDIO_DRIVE and
+        # audio_drive_latents is not None` checks around each branch's own
+        # `timesteps_step` call) can rely on it always being defined, even for the
+        # `H3_AUDIO_DRIVE=0` (default, fully inert) path.
+        audio_drive_latents = None
         if H3_LOWVRAM_GROUP:
             # UPDATE (found via this task's own 32GB-ballast verification, after the
             # original version of this branch -- which called `self._vae_to_gpu()`
@@ -6128,6 +6645,12 @@ class MiniMaxH3Runner:
             self._vae_to_gpu()
             reference_encoder_step = MiniMaxH3Ref2VAReferenceEncoderStep()
             _, state = reference_encoder_step(pipe, state)
+            if H3_AUDIO_DRIVE:
+                # Must run inside this "audio_vae on GPU" window, before `_vae_to_cpu()`
+                # parks it back -- see `_build_audio_drive_latents()`'s docstring.
+                audio_drive_latents = _build_audio_drive_latents(pipe, references, actual_num_frames)
+                if audio_drive_latents is not None:
+                    state.set("audio_latents", audio_drive_latents)
             self._vae_to_cpu()
             with self._load_lock:
                 self._ensure_transformer_ref(progress)
@@ -6141,6 +6664,10 @@ class MiniMaxH3Runner:
             ref2va_latents_step = MiniMaxH3Ref2VAPrepareLatentsStep()
             _, state = ref2va_latents_step(pipe, state)
             timesteps_step = MiniMaxH3SetTimestepsStep()
+            if H3_AUDIO_DRIVE and audio_drive_latents is not None:
+                audio_drive_original_num_condition_audio_rows = _inflate_audio_drive_condition_rows(
+                    state, state.get("num_audio_latents"), pipe.audio_channels
+                )
             _, state = timesteps_step(pipe, state)
         elif H3_LOWVRAM:
             self._vae_to_gpu()
@@ -6160,6 +6687,12 @@ class MiniMaxH3Runner:
             # TE freed and transformer_ref loaded.
             reference_encoder_step = MiniMaxH3Ref2VAReferenceEncoderStep()
             _, state = reference_encoder_step(pipe, state)
+            if H3_AUDIO_DRIVE:
+                # Must run inside this "audio_vae on GPU" window, before `_vae_to_cpu()`
+                # parks it back -- see `_build_audio_drive_latents()`'s docstring.
+                audio_drive_latents = _build_audio_drive_latents(pipe, references, actual_num_frames)
+                if audio_drive_latents is not None:
+                    state.set("audio_latents", audio_drive_latents)
             self._vae_to_cpu()
 
             layout_step = MiniMaxH3Ref2VAPrepareLayoutStep()
@@ -6171,6 +6704,10 @@ class MiniMaxH3Runner:
             ref2va_latents_step = MiniMaxH3Ref2VAPrepareLatentsStep()
             _, state = ref2va_latents_step(pipe, state)
             timesteps_step = MiniMaxH3SetTimestepsStep()
+            if H3_AUDIO_DRIVE and audio_drive_latents is not None:
+                audio_drive_original_num_condition_audio_rows = _inflate_audio_drive_condition_rows(
+                    state, state.get("num_audio_latents"), pipe.audio_channels
+                )
             _, state = timesteps_step(pipe, state)
 
             # TE 外部常駐 (`H3_TE_DEVICE`) のとき、この分岐の前提「layout 系ステップは
@@ -6195,6 +6732,12 @@ class MiniMaxH3Runner:
             self._vae_to_gpu()
             reference_encoder_step = MiniMaxH3Ref2VAReferenceEncoderStep()
             _, state = reference_encoder_step(pipe, state)
+            if H3_AUDIO_DRIVE:
+                # Must run inside this "audio_vae on GPU" window, before `_vae_to_cpu()`
+                # parks it back -- see `_build_audio_drive_latents()`'s docstring.
+                audio_drive_latents = _build_audio_drive_latents(pipe, references, actual_num_frames)
+                if audio_drive_latents is not None:
+                    state.set("audio_latents", audio_drive_latents)
             self._vae_to_cpu()
             with self._load_lock:
                 self._ensure_transformer_ref(progress)
@@ -6234,6 +6777,10 @@ class MiniMaxH3Runner:
                 ref2va_latents_step = MiniMaxH3Ref2VAPrepareLatentsStep()
                 _, state = ref2va_latents_step(pipe, state)
                 timesteps_step = MiniMaxH3SetTimestepsStep()
+                if H3_AUDIO_DRIVE and audio_drive_latents is not None:
+                    audio_drive_original_num_condition_audio_rows = _inflate_audio_drive_condition_rows(
+                        state, state.get("num_audio_latents"), pipe.audio_channels
+                    )
                 _, state = timesteps_step(pipe, state)
         else:
             # `none` mode: TE's job is done -- free it and bring in transformer_ref
@@ -6248,6 +6795,15 @@ class MiniMaxH3Runner:
                 self._ensure_transformer_ref(progress)
             reference_encoder_step = MiniMaxH3Ref2VAReferenceEncoderStep()
             _, state = reference_encoder_step(pipe, state)
+            if H3_AUDIO_DRIVE:
+                # `none` mode keeps `vae`/`audio_vae` permanently GPU-resident (see the
+                # branch comment above), so there is no "vae on GPU" window to miss here
+                # -- but for consistency with the other three branches (and in case that
+                # assumption ever changes) this still runs right after the reference
+                # encoder step, before anything else touches `audio_vae`.
+                audio_drive_latents = _build_audio_drive_latents(pipe, references, actual_num_frames)
+                if audio_drive_latents is not None:
+                    state.set("audio_latents", audio_drive_latents)
 
             # --- layout / condition latents / latents / ref2va latents / timesteps ---
             # TE 外部常駐 (`H3_TE_DEVICE`) のときはピン窓の中で回す。TE を切り離すと
@@ -6271,6 +6827,10 @@ class MiniMaxH3Runner:
                 ref2va_latents_step = MiniMaxH3Ref2VAPrepareLatentsStep()
                 _, state = ref2va_latents_step(pipe, state)
                 timesteps_step = MiniMaxH3SetTimestepsStep()
+                if H3_AUDIO_DRIVE and audio_drive_latents is not None:
+                    audio_drive_original_num_condition_audio_rows = _inflate_audio_drive_condition_rows(
+                        state, state.get("num_audio_latents"), pipe.audio_channels
+                    )
                 _, state = timesteps_step(pipe, state)
 
         # bnb-4bit mode (bf16 transformer_ref): force-free TE-nf4 (~21GB) before denoise,
@@ -6372,6 +6932,19 @@ class MiniMaxH3Runner:
         # layout step above) are NOT zero here -- a reference always adds condition rows,
         # which is exactly what this step drops before reshaping the generated rows back
         # into a 5D video tensor / channel-major audio tensor.
+        #
+        # H3_AUDIO_DRIVE: `num_condition_audio_rows` was inflated (by whichever branch
+        # ran above, via `_inflate_audio_drive_condition_rows()`) to freeze the
+        # generated audio rows through the just-finished denoise loop -- see that
+        # function's docstring for why it has to stay inflated in `state` all the way
+        # through the `denoise_step(pipe, state)` call above. It MUST be restored here,
+        # before `MiniMaxH3AfterDenoiseStep` runs: that step slices the generated rows
+        # as `audio_latents[num_condition_audio_rows:]` and reshapes them assuming the
+        # *un*-inflated (reference-rows-only) count -- left inflated, the slice would be
+        # empty and the reshape would fail (`decoders.py`'s
+        # `audio_rows.reshape(components.audio_channels, block_state.num_audio_latents, ...)`).
+        if H3_AUDIO_DRIVE and audio_drive_latents is not None:
+            _restore_audio_drive_condition_rows(state, audio_drive_original_num_condition_audio_rows)
         after_denoise_step = MiniMaxH3AfterDenoiseStep()
         _, state = after_denoise_step(pipe, state)
 
