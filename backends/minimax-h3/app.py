@@ -731,6 +731,7 @@ def api_ref2va(
     still: int = Form(0),
     frames: int = Form(22),
     reference_image_short_edge: Optional[int] = Form(None),
+    audio_drive: Optional[bool] = Form(None),
 ):
     """ref2va: 画像最大9・動画最大3・音声最大3(計12参照)からの動画+音声生成。
 
@@ -757,6 +758,11 @@ def api_ref2va(
     トークン数が減りエンコード・denoiseとも高速化するが、参照の細部再現度が下がる
     (トレードオフの実測は core/runner.py の H3_REF_IMAGE_SHORT_EDGE コメント参照)。
     不正値(正の整数でない)は400。
+
+    `audio_drive` は任意パラメータ(未指定ならプロセス起動時の H3_AUDIO_DRIVE
+    環境変数の値を使う=挙動は完全に従来どおり)。true/false を指定すると
+    その環境変数より優先される(このリクエストだけ Audio Drive を有効/無効にする、
+    プロセス再起動不要)。詳細は core/runner.py の H3_AUDIO_DRIVE コメント参照。
     """
     global _current_progress
 
@@ -841,6 +847,7 @@ def api_ref2va(
                 still=bool(still),
                 still_frames=frames,
                 reference_image_short_edge=reference_image_short_edge,
+                audio_drive=audio_drive,
             )
             result["job_id"] = job_id
             result["video_url"] = f"/outputs/{Path(result['mp4_path']).name}"

@@ -6535,6 +6535,15 @@ class MiniMaxH3Runner:
         # -- byte-for-byte identical to this parameter not existing at all. Validated and
         # applied just before the setup step below (see that call site's comment).
         reference_image_short_edge: int | None = None,
+        # Per-request override of the module-level `H3_AUDIO_DRIVE` env-var default.
+        # `None` (default) means "use whatever this process's H3_AUDIO_DRIVE env var
+        # resolved to" -- byte-for-byte identical to this parameter not existing at all.
+        # `True`/`False` take precedence over the env var for this one request. Resolved
+        # once, right below, into a local `audio_drive_effective` that every one of the
+        # (former) `H3_AUDIO_DRIVE` guard sites in this method now reads instead of the
+        # module-level constant directly (the constant itself is untouched and still
+        # backs the env-var default via this resolution).
+        audio_drive: bool | None = None,
     ) -> dict:
         """
         Runs ref2va: joint video+audio generation conditioned on an ordered list of
@@ -6567,6 +6576,10 @@ class MiniMaxH3Runner:
         `generate()` (see core/settings.py), applied to `transformer_ref` instead of
         `transformer`. `upscale` is not a parameter here at all (see above), so there is
         no upscale-vs-turbo interaction to validate on this path.
+
+        `audio_drive`: per-request override of the module-level `H3_AUDIO_DRIVE` env-var
+        default (`None` = use the env var, unchanged behavior). See that constant's
+        module comment and `_build_audio_drive_latents()`'s docstring for what it does.
 
         Returns a dict with mp4_path, frame counts, timing and VRAM/RAM stats, in the
         same shape `generate()` returns (plus `references_summary`).
@@ -6606,6 +6619,12 @@ class MiniMaxH3Runner:
         from diffusers.modular_pipelines.modular_pipeline import PipelineState
 
         t_start = time.time()
+        # Per-request override of `H3_AUDIO_DRIVE` (see this parameter's own docstring
+        # paragraph above). `None` -> fall back to the module-level env-var default,
+        # byte-for-byte identical to today's always-env-var behavior. Every
+        # `H3_AUDIO_DRIVE`-gated branch below reads this local instead of the module
+        # constant directly.
+        audio_drive_effective = H3_AUDIO_DRIVE if audio_drive is None else audio_drive
         if not references:
             raise ValueError("ref2va needs at least one reference; use generate() for text-only requests.")
         # TE 外部常駐 (H3_TE_DEVICE) の TE用GPUが 24GB 未満なら ref2va は動かない:
@@ -6859,7 +6878,7 @@ class MiniMaxH3Runner:
             self._vae_to_gpu()
             reference_encoder_step = MiniMaxH3Ref2VAReferenceEncoderStep()
             _, state = reference_encoder_step(pipe, state)
-            if H3_AUDIO_DRIVE:
+            if audio_drive_effective:
                 # Must run inside this "audio_vae on GPU" window, before `_vae_to_cpu()`
                 # parks it back -- see `_build_audio_drive_latents()`'s docstring.
                 audio_drive_latents = _build_audio_drive_latents(pipe, references, actual_num_frames)
@@ -6878,7 +6897,7 @@ class MiniMaxH3Runner:
             ref2va_latents_step = MiniMaxH3Ref2VAPrepareLatentsStep()
             _, state = ref2va_latents_step(pipe, state)
             timesteps_step = MiniMaxH3SetTimestepsStep()
-            if H3_AUDIO_DRIVE and audio_drive_latents is not None:
+            if audio_drive_effective and audio_drive_latents is not None:
                 audio_drive_original_num_condition_audio_rows = _inflate_audio_drive_condition_rows(
                     state, state.get("num_audio_latents"), pipe.audio_channels
                 )
@@ -6901,7 +6920,7 @@ class MiniMaxH3Runner:
             # TE freed and transformer_ref loaded.
             reference_encoder_step = MiniMaxH3Ref2VAReferenceEncoderStep()
             _, state = reference_encoder_step(pipe, state)
-            if H3_AUDIO_DRIVE:
+            if audio_drive_effective:
                 # Must run inside this "audio_vae on GPU" window, before `_vae_to_cpu()`
                 # parks it back -- see `_build_audio_drive_latents()`'s docstring.
                 audio_drive_latents = _build_audio_drive_latents(pipe, references, actual_num_frames)
@@ -6918,7 +6937,7 @@ class MiniMaxH3Runner:
             ref2va_latents_step = MiniMaxH3Ref2VAPrepareLatentsStep()
             _, state = ref2va_latents_step(pipe, state)
             timesteps_step = MiniMaxH3SetTimestepsStep()
-            if H3_AUDIO_DRIVE and audio_drive_latents is not None:
+            if audio_drive_effective and audio_drive_latents is not None:
                 audio_drive_original_num_condition_audio_rows = _inflate_audio_drive_condition_rows(
                     state, state.get("num_audio_latents"), pipe.audio_channels
                 )
@@ -6946,7 +6965,7 @@ class MiniMaxH3Runner:
             self._vae_to_gpu()
             reference_encoder_step = MiniMaxH3Ref2VAReferenceEncoderStep()
             _, state = reference_encoder_step(pipe, state)
-            if H3_AUDIO_DRIVE:
+            if audio_drive_effective:
                 # Must run inside this "audio_vae on GPU" window, before `_vae_to_cpu()`
                 # parks it back -- see `_build_audio_drive_latents()`'s docstring.
                 audio_drive_latents = _build_audio_drive_latents(pipe, references, actual_num_frames)
@@ -6991,7 +7010,7 @@ class MiniMaxH3Runner:
                 ref2va_latents_step = MiniMaxH3Ref2VAPrepareLatentsStep()
                 _, state = ref2va_latents_step(pipe, state)
                 timesteps_step = MiniMaxH3SetTimestepsStep()
-                if H3_AUDIO_DRIVE and audio_drive_latents is not None:
+                if audio_drive_effective and audio_drive_latents is not None:
                     audio_drive_original_num_condition_audio_rows = _inflate_audio_drive_condition_rows(
                         state, state.get("num_audio_latents"), pipe.audio_channels
                     )
@@ -7009,7 +7028,7 @@ class MiniMaxH3Runner:
                 self._ensure_transformer_ref(progress)
             reference_encoder_step = MiniMaxH3Ref2VAReferenceEncoderStep()
             _, state = reference_encoder_step(pipe, state)
-            if H3_AUDIO_DRIVE:
+            if audio_drive_effective:
                 # `none` mode keeps `vae`/`audio_vae` permanently GPU-resident (see the
                 # branch comment above), so there is no "vae on GPU" window to miss here
                 # -- but for consistency with the other three branches (and in case that
@@ -7041,7 +7060,7 @@ class MiniMaxH3Runner:
                 ref2va_latents_step = MiniMaxH3Ref2VAPrepareLatentsStep()
                 _, state = ref2va_latents_step(pipe, state)
                 timesteps_step = MiniMaxH3SetTimestepsStep()
-                if H3_AUDIO_DRIVE and audio_drive_latents is not None:
+                if audio_drive_effective and audio_drive_latents is not None:
                     audio_drive_original_num_condition_audio_rows = _inflate_audio_drive_condition_rows(
                         state, state.get("num_audio_latents"), pipe.audio_channels
                     )
@@ -7160,7 +7179,7 @@ class MiniMaxH3Runner:
         # *un*-inflated (reference-rows-only) count -- left inflated, the slice would be
         # empty and the reshape would fail (`decoders.py`'s
         # `audio_rows.reshape(components.audio_channels, block_state.num_audio_latents, ...)`).
-        if H3_AUDIO_DRIVE and audio_drive_latents is not None:
+        if audio_drive_effective and audio_drive_latents is not None:
             _restore_audio_drive_condition_rows(state, audio_drive_original_num_condition_audio_rows)
         after_denoise_step = MiniMaxH3AfterDenoiseStep()
         _, state = after_denoise_step(pipe, state)
@@ -7343,6 +7362,7 @@ class MiniMaxH3Runner:
             "mute": bool(mute),
             "cache_skipped_steps": cache_skips[0] if instant["effective_cache"] == "fbc" else None,
             "reference_image_short_edge": resolved_short_edge,
+            "audio_drive": bool(audio_drive_effective),
             "references_summary": [
                 {"index": index, "kind": kind, "has_audio": bool(references[index].has_audio)}
                 for index, kind in enumerate(kinds)
