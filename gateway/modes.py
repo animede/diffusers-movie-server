@@ -73,6 +73,10 @@ H3_EXTRA_KEYS = {
     # H3_REF_IMAGE_SHORT_EDGE 既定=2048を使う。backends/minimax-h3/app.py の
     # /api/ref2va 等が受け付ける任意パラメータをそのまま素通しする)。
     "reference_image_short_edge",
+    # ref2va の Audio Drive をリクエスト単位で切替(未指定ならバックエンド側の
+    # H3_AUDIO_DRIVE 環境変数の値を使う。/api/ref2va のみ対応、ref2va_batch/ref2i_batch
+    # は未対応 -- backends/minimax-h3/app.py 参照)。
+    "audio_drive",
 }
 LTX25_EXTRA_KEYS = {
     "upscale", "upscale_method", "temporal_upscale", "decoder",
@@ -191,6 +195,8 @@ def build_h3_request(mode: str, params: dict[str, Any], extra: dict[str, Any],
         data[key] = value
     if isinstance(data.get("mute"), bool):
         data["mute"] = "true" if data["mute"] else "false"
+    if isinstance(data.get("audio_drive"), bool):
+        data["audio_drive"] = "true" if data["audio_drive"] else "false"
 
     # アセット → ファイルフィールド
     files: list[tuple[str, tuple[str, bytes, str]]] = []
