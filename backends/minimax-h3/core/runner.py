@@ -1025,13 +1025,23 @@ FPS = 24
 STILL_FRAME_CHOICES = (22, 5)
 
 # Opt-in ("0" default = 完全に無効、既存の ref2va 経路と無変更)。"1" で
-# `generate_ref2va()` の Audio Drive を有効化する: 生成対象の音声行 (packed layout の
+# `generate_ref2va()` の Vocal Lock を有効化する: 生成対象の音声行 (packed layout の
 # `[text | 参照ブロック | 生成音声行 | 生成映像行]` のうち「生成音声行」) を、
 # `references` に含まれる最初の `MiniMaxH3AudioReference` の波形から encode した
 # latent で置き換え、denoise 中ずっとクリーン (t=1.0 固定・無変更) に固定する。
-# 詳細は `generate_ref2va()` 内の該当コメント、および `_build_audio_drive_latents()` /
-# `_apply_audio_drive_condition_rows()` の docstring 参照。
-H3_AUDIO_DRIVE = os.environ.get("H3_AUDIO_DRIVE", "0").strip() == "1"
+# 詳細は `generate_ref2va()` 内の該当コメント、および `_build_vocal_lock_latents()` /
+# `_apply_vocal_lock_condition_rows()` の docstring 参照。
+#
+# 旧名 `H3_AUDIO_DRIVE` の後方互換: `H3_VOCAL_LOCK` が未設定で `H3_AUDIO_DRIVE` が
+# 設定されている場合のみその値を使う(新名を優先)。2026-08 の改名(audio_drive ->
+# vocal_lock、出所の ComfyUI-H3-NativeAudioLock は "audio lock" と呼んでおり、本実装は
+# 駆動源が分離ボーカルである点が固有なので vocal_lock とした。「Audio Drive」は本
+# プロジェクトの造語で、機構の実体(駆動ではなく凍結)を誤って示唆していた)。
+if "H3_VOCAL_LOCK" not in os.environ and "H3_AUDIO_DRIVE" in os.environ:
+    logger.warning("環境変数 H3_AUDIO_DRIVE は旧名です。H3_VOCAL_LOCK へ移行してください。")
+    H3_VOCAL_LOCK = os.environ.get("H3_AUDIO_DRIVE", "0").strip() == "1"
+else:
+    H3_VOCAL_LOCK = os.environ.get("H3_VOCAL_LOCK", "0").strip() == "1"
 
 # Opt-out ("1" default). "1" = `AutoencoderKLMiniMaxH3._decode()` に「潜在フレームが
 # 1チャンク未満 (num_chunks==0、潜在1-2フレーム)なら全トークンを単一の `_decode_clip()`
@@ -2632,8 +2642,8 @@ def _num_frames_from_audio_reference(references: list, fps: int) -> int:
     return align_num_frames(round(num_samples / sample_rate * fps))
 
 
-def _build_audio_drive_latents(pipe, references: list, actual_num_frames: int) -> torch.Tensor | None:
-    r"""Audio Drive (`H3_AUDIO_DRIVE=1`) 用: 駆動音声を encode して `(2, audio_latent_channels,
+def _build_vocal_lock_latents(pipe, references: list, actual_num_frames: int) -> torch.Tensor | None:
+    r"""Vocal Lock (`H3_VOCAL_LOCK=1`) 用: 駆動音声を encode して `(2, audio_latent_channels,
     N)` の audio_latents テンソルにして返す。`references` に `MiniMaxH3AudioReference` が
     1つも無ければ `None` を返す (呼び出し側はこれを「発動しない」合図として扱うこと)。
 
@@ -2664,8 +2674,8 @@ def _build_audio_drive_latents(pipe, references: list, actual_num_frames: int) -
     audio_ref = next((entry for entry in references if isinstance(entry, MiniMaxH3AudioReference)), None)
     if audio_ref is None:
         logger.warning(
-            "H3_AUDIO_DRIVE=1 ですが references に MiniMaxH3AudioReference がありません -- "
-            "Audio Drive は発動せず、通常の ref2va 経路にフォールバックします。"
+            "H3_VOCAL_LOCK=1 ですが references に MiniMaxH3AudioReference がありません -- "
+            "Vocal Lock は発動せず、通常の ref2va 経路にフォールバックします。"
         )
         return None
 
@@ -2700,7 +2710,7 @@ def _build_audio_drive_latents(pipe, references: list, actual_num_frames: int) -
     trimmed_num_samples = int(waveform.shape[-1])
 
     logger.info(
-        "Audio Drive: driving audio orig_samples=%d (sr=%s) -> trimmed/padded=%d samples "
+        "Vocal Lock: driving audio orig_samples=%d (sr=%s) -> trimmed/padded=%d samples "
         "(target N=%d, samples/latent=%d)",
         orig_num_samples, sample_rate, trimmed_num_samples, N, samples_per_latent,
     )
@@ -2725,21 +2735,21 @@ def _build_audio_drive_latents(pipe, references: list, actual_num_frames: int) -
 
     audio_latents = normalized.transpose(1, 2).contiguous()  # (2, C, N) -- what PrepareLatentsStep expects
     assert audio_latents.shape == (audio_channels, audio_latent_channels, N), (
-        f"Audio Drive: injected audio_latents shape {tuple(audio_latents.shape)} != "
+        f"Vocal Lock: injected audio_latents shape {tuple(audio_latents.shape)} != "
         f"expected {(audio_channels, audio_latent_channels, N)}"
     )
     logger.info(
-        "Audio Drive: encoded latent shape=%s (posterior.mode) -> injected shape=%s",
+        "Vocal Lock: encoded latent shape=%s (posterior.mode) -> injected shape=%s",
         tuple(latents.shape), tuple(audio_latents.shape),
     )
     return audio_latents
 
 
-def _inflate_audio_drive_condition_rows(state, num_generated_audio_latents: int, audio_channels: int) -> int:
-    r"""Audio Drive (`H3_AUDIO_DRIVE=1`) 用: `state["num_condition_audio_rows"]` を
+def _inflate_vocal_lock_condition_rows(state, num_generated_audio_latents: int, audio_channels: int) -> int:
+    r"""Vocal Lock (`H3_VOCAL_LOCK=1`) 用: `state["num_condition_audio_rows"]` を
     「生成音声行も含めてすべて条件行」に見せかけ、denoise 中はクリーン (t=1.0固定・
     無変更) に凍結する。書き換え前の (参照行数のみの) 元の値を返す -- 呼び出し側は
-    これを保持しておき、`_restore_audio_drive_condition_rows()` に渡して必ず復元する
+    これを保持しておき、`_restore_vocal_lock_condition_rows()` に渡して必ず復元する
     こと。
 
     **重要**: `MiniMaxH3Ref2VADenoiseStep.__call__`
@@ -2757,27 +2767,27 @@ def _inflate_audio_drive_condition_rows(state, num_generated_audio_latents: int,
     「`ref2va_latents_step` の後・`timesteps_step` の前」でこれを呼び (`ref2va_latents_step`
     自身が参照行数との一致を検証するため、それより前に書き換えてはいけない)、
     「`MiniMaxH3AfterDenoiseStep` の直前」(denoise ループの後) で
-    `_restore_audio_drive_condition_rows()` を呼んで元へ戻すこと。
+    `_restore_vocal_lock_condition_rows()` を呼んで元へ戻すこと。
     """
     original = state.get("num_condition_audio_rows")
     inflated = original + num_generated_audio_latents * audio_channels
     state.set("num_condition_audio_rows", inflated)
     logger.info(
-        "Audio Drive: num_condition_audio_rows %s -> %s (freezing generated audio rows)",
+        "Vocal Lock: num_condition_audio_rows %s -> %s (freezing generated audio rows)",
         original, inflated,
     )
     return original
 
 
-def _restore_audio_drive_condition_rows(state, original: int) -> None:
-    r"""`_inflate_audio_drive_condition_rows()` が返した元の値へ `state`
+def _restore_vocal_lock_condition_rows(state, original: int) -> None:
+    r"""`_inflate_vocal_lock_condition_rows()` が返した元の値へ `state`
     (`num_condition_audio_rows`) を戻す。`MiniMaxH3AfterDenoiseStep` の呼び出し直前に
     必ず呼ぶこと -- 戻し忘れると、生成行だけを切り出す `decoders.py` の
     `audio_rows.reshape(components.audio_channels, block_state.num_audio_latents, ...)`
     が 0 要素の reshape になり確実に落ちる。
     """
     state.set("num_condition_audio_rows", original)
-    logger.info("Audio Drive: num_condition_audio_rows restored -> %s", original)
+    logger.info("Vocal Lock: num_condition_audio_rows restored -> %s", original)
 
 
 def gpu_mem_gb() -> dict:
@@ -6535,15 +6545,15 @@ class MiniMaxH3Runner:
         # -- byte-for-byte identical to this parameter not existing at all. Validated and
         # applied just before the setup step below (see that call site's comment).
         reference_image_short_edge: int | None = None,
-        # Per-request override of the module-level `H3_AUDIO_DRIVE` env-var default.
-        # `None` (default) means "use whatever this process's H3_AUDIO_DRIVE env var
+        # Per-request override of the module-level `H3_VOCAL_LOCK` env-var default.
+        # `None` (default) means "use whatever this process's H3_VOCAL_LOCK env var
         # resolved to" -- byte-for-byte identical to this parameter not existing at all.
         # `True`/`False` take precedence over the env var for this one request. Resolved
-        # once, right below, into a local `audio_drive_effective` that every one of the
-        # (former) `H3_AUDIO_DRIVE` guard sites in this method now reads instead of the
+        # once, right below, into a local `vocal_lock_effective` that every one of the
+        # (former) `H3_VOCAL_LOCK` guard sites in this method now reads instead of the
         # module-level constant directly (the constant itself is untouched and still
         # backs the env-var default via this resolution).
-        audio_drive: bool | None = None,
+        vocal_lock: bool | None = None,
     ) -> dict:
         """
         Runs ref2va: joint video+audio generation conditioned on an ordered list of
@@ -6577,9 +6587,9 @@ class MiniMaxH3Runner:
         `transformer`. `upscale` is not a parameter here at all (see above), so there is
         no upscale-vs-turbo interaction to validate on this path.
 
-        `audio_drive`: per-request override of the module-level `H3_AUDIO_DRIVE` env-var
+        `vocal_lock`: per-request override of the module-level `H3_VOCAL_LOCK` env-var
         default (`None` = use the env var, unchanged behavior). See that constant's
-        module comment and `_build_audio_drive_latents()`'s docstring for what it does.
+        module comment and `_build_vocal_lock_latents()`'s docstring for what it does.
 
         Returns a dict with mp4_path, frame counts, timing and VRAM/RAM stats, in the
         same shape `generate()` returns (plus `references_summary`).
@@ -6619,12 +6629,12 @@ class MiniMaxH3Runner:
         from diffusers.modular_pipelines.modular_pipeline import PipelineState
 
         t_start = time.time()
-        # Per-request override of `H3_AUDIO_DRIVE` (see this parameter's own docstring
+        # Per-request override of `H3_VOCAL_LOCK` (see this parameter's own docstring
         # paragraph above). `None` -> fall back to the module-level env-var default,
         # byte-for-byte identical to today's always-env-var behavior. Every
-        # `H3_AUDIO_DRIVE`-gated branch below reads this local instead of the module
+        # `H3_VOCAL_LOCK`-gated branch below reads this local instead of the module
         # constant directly.
-        audio_drive_effective = H3_AUDIO_DRIVE if audio_drive is None else audio_drive
+        vocal_lock_effective = H3_VOCAL_LOCK if vocal_lock is None else vocal_lock
         if not references:
             raise ValueError("ref2va needs at least one reference; use generate() for text-only requests.")
         # TE 外部常駐 (H3_TE_DEVICE) の TE用GPUが 24GB 未満なら ref2va は動かない:
@@ -6840,14 +6850,14 @@ class MiniMaxH3Runner:
         # previous ref2va request's steady state" case -- see that comment for the bug
         # this closes. Nothing more to free here; just bring vae onto GPU.
         #
-        # H3_AUDIO_DRIVE (opt-in, "0" default): set inside whichever branch below runs,
-        # while `audio_vae` is still GPU-resident (see `_build_audio_drive_latents()`'s
+        # H3_VOCAL_LOCK (opt-in, "0" default): set inside whichever branch below runs,
+        # while `audio_vae` is still GPU-resident (see `_build_vocal_lock_latents()`'s
         # docstring for why it cannot wait until after `_vae_to_cpu()`). Declared here,
-        # ahead of the dispatch, so every branch (and the `H3_AUDIO_DRIVE and
-        # audio_drive_latents is not None` checks around each branch's own
+        # ahead of the dispatch, so every branch (and the `H3_VOCAL_LOCK and
+        # vocal_lock_latents is not None` checks around each branch's own
         # `timesteps_step` call) can rely on it always being defined, even for the
-        # `H3_AUDIO_DRIVE=0` (default, fully inert) path.
-        audio_drive_latents = None
+        # `H3_VOCAL_LOCK=0` (default, fully inert) path.
+        vocal_lock_latents = None
         if H3_LOWVRAM_GROUP:
             # UPDATE (found via this task's own 32GB-ballast verification, after the
             # original version of this branch -- which called `self._vae_to_gpu()`
@@ -6878,12 +6888,12 @@ class MiniMaxH3Runner:
             self._vae_to_gpu()
             reference_encoder_step = MiniMaxH3Ref2VAReferenceEncoderStep()
             _, state = reference_encoder_step(pipe, state)
-            if audio_drive_effective:
+            if vocal_lock_effective:
                 # Must run inside this "audio_vae on GPU" window, before `_vae_to_cpu()`
-                # parks it back -- see `_build_audio_drive_latents()`'s docstring.
-                audio_drive_latents = _build_audio_drive_latents(pipe, references, actual_num_frames)
-                if audio_drive_latents is not None:
-                    state.set("audio_latents", audio_drive_latents)
+                # parks it back -- see `_build_vocal_lock_latents()`'s docstring.
+                vocal_lock_latents = _build_vocal_lock_latents(pipe, references, actual_num_frames)
+                if vocal_lock_latents is not None:
+                    state.set("audio_latents", vocal_lock_latents)
             self._vae_to_cpu()
             with self._load_lock:
                 self._ensure_transformer_ref(progress)
@@ -6897,8 +6907,8 @@ class MiniMaxH3Runner:
             ref2va_latents_step = MiniMaxH3Ref2VAPrepareLatentsStep()
             _, state = ref2va_latents_step(pipe, state)
             timesteps_step = MiniMaxH3SetTimestepsStep()
-            if audio_drive_effective and audio_drive_latents is not None:
-                audio_drive_original_num_condition_audio_rows = _inflate_audio_drive_condition_rows(
+            if vocal_lock_effective and vocal_lock_latents is not None:
+                vocal_lock_original_num_condition_audio_rows = _inflate_vocal_lock_condition_rows(
                     state, state.get("num_audio_latents"), pipe.audio_channels
                 )
             _, state = timesteps_step(pipe, state)
@@ -6920,12 +6930,12 @@ class MiniMaxH3Runner:
             # TE freed and transformer_ref loaded.
             reference_encoder_step = MiniMaxH3Ref2VAReferenceEncoderStep()
             _, state = reference_encoder_step(pipe, state)
-            if audio_drive_effective:
+            if vocal_lock_effective:
                 # Must run inside this "audio_vae on GPU" window, before `_vae_to_cpu()`
-                # parks it back -- see `_build_audio_drive_latents()`'s docstring.
-                audio_drive_latents = _build_audio_drive_latents(pipe, references, actual_num_frames)
-                if audio_drive_latents is not None:
-                    state.set("audio_latents", audio_drive_latents)
+                # parks it back -- see `_build_vocal_lock_latents()`'s docstring.
+                vocal_lock_latents = _build_vocal_lock_latents(pipe, references, actual_num_frames)
+                if vocal_lock_latents is not None:
+                    state.set("audio_latents", vocal_lock_latents)
             self._vae_to_cpu()
 
             layout_step = MiniMaxH3Ref2VAPrepareLayoutStep()
@@ -6937,8 +6947,8 @@ class MiniMaxH3Runner:
             ref2va_latents_step = MiniMaxH3Ref2VAPrepareLatentsStep()
             _, state = ref2va_latents_step(pipe, state)
             timesteps_step = MiniMaxH3SetTimestepsStep()
-            if audio_drive_effective and audio_drive_latents is not None:
-                audio_drive_original_num_condition_audio_rows = _inflate_audio_drive_condition_rows(
+            if vocal_lock_effective and vocal_lock_latents is not None:
+                vocal_lock_original_num_condition_audio_rows = _inflate_vocal_lock_condition_rows(
                     state, state.get("num_audio_latents"), pipe.audio_channels
                 )
             _, state = timesteps_step(pipe, state)
@@ -6965,12 +6975,12 @@ class MiniMaxH3Runner:
             self._vae_to_gpu()
             reference_encoder_step = MiniMaxH3Ref2VAReferenceEncoderStep()
             _, state = reference_encoder_step(pipe, state)
-            if audio_drive_effective:
+            if vocal_lock_effective:
                 # Must run inside this "audio_vae on GPU" window, before `_vae_to_cpu()`
-                # parks it back -- see `_build_audio_drive_latents()`'s docstring.
-                audio_drive_latents = _build_audio_drive_latents(pipe, references, actual_num_frames)
-                if audio_drive_latents is not None:
-                    state.set("audio_latents", audio_drive_latents)
+                # parks it back -- see `_build_vocal_lock_latents()`'s docstring.
+                vocal_lock_latents = _build_vocal_lock_latents(pipe, references, actual_num_frames)
+                if vocal_lock_latents is not None:
+                    state.set("audio_latents", vocal_lock_latents)
             self._vae_to_cpu()
             with self._load_lock:
                 self._ensure_transformer_ref(progress)
@@ -7010,8 +7020,8 @@ class MiniMaxH3Runner:
                 ref2va_latents_step = MiniMaxH3Ref2VAPrepareLatentsStep()
                 _, state = ref2va_latents_step(pipe, state)
                 timesteps_step = MiniMaxH3SetTimestepsStep()
-                if audio_drive_effective and audio_drive_latents is not None:
-                    audio_drive_original_num_condition_audio_rows = _inflate_audio_drive_condition_rows(
+                if vocal_lock_effective and vocal_lock_latents is not None:
+                    vocal_lock_original_num_condition_audio_rows = _inflate_vocal_lock_condition_rows(
                         state, state.get("num_audio_latents"), pipe.audio_channels
                     )
                 _, state = timesteps_step(pipe, state)
@@ -7028,15 +7038,15 @@ class MiniMaxH3Runner:
                 self._ensure_transformer_ref(progress)
             reference_encoder_step = MiniMaxH3Ref2VAReferenceEncoderStep()
             _, state = reference_encoder_step(pipe, state)
-            if audio_drive_effective:
+            if vocal_lock_effective:
                 # `none` mode keeps `vae`/`audio_vae` permanently GPU-resident (see the
                 # branch comment above), so there is no "vae on GPU" window to miss here
                 # -- but for consistency with the other three branches (and in case that
                 # assumption ever changes) this still runs right after the reference
                 # encoder step, before anything else touches `audio_vae`.
-                audio_drive_latents = _build_audio_drive_latents(pipe, references, actual_num_frames)
-                if audio_drive_latents is not None:
-                    state.set("audio_latents", audio_drive_latents)
+                vocal_lock_latents = _build_vocal_lock_latents(pipe, references, actual_num_frames)
+                if vocal_lock_latents is not None:
+                    state.set("audio_latents", vocal_lock_latents)
 
             # --- layout / condition latents / latents / ref2va latents / timesteps ---
             # TE 外部常駐 (`H3_TE_DEVICE`) のときはピン窓の中で回す。TE を切り離すと
@@ -7060,8 +7070,8 @@ class MiniMaxH3Runner:
                 ref2va_latents_step = MiniMaxH3Ref2VAPrepareLatentsStep()
                 _, state = ref2va_latents_step(pipe, state)
                 timesteps_step = MiniMaxH3SetTimestepsStep()
-                if audio_drive_effective and audio_drive_latents is not None:
-                    audio_drive_original_num_condition_audio_rows = _inflate_audio_drive_condition_rows(
+                if vocal_lock_effective and vocal_lock_latents is not None:
+                    vocal_lock_original_num_condition_audio_rows = _inflate_vocal_lock_condition_rows(
                         state, state.get("num_audio_latents"), pipe.audio_channels
                     )
                 _, state = timesteps_step(pipe, state)
@@ -7169,8 +7179,8 @@ class MiniMaxH3Runner:
         # which is exactly what this step drops before reshaping the generated rows back
         # into a 5D video tensor / channel-major audio tensor.
         #
-        # H3_AUDIO_DRIVE: `num_condition_audio_rows` was inflated (by whichever branch
-        # ran above, via `_inflate_audio_drive_condition_rows()`) to freeze the
+        # H3_VOCAL_LOCK: `num_condition_audio_rows` was inflated (by whichever branch
+        # ran above, via `_inflate_vocal_lock_condition_rows()`) to freeze the
         # generated audio rows through the just-finished denoise loop -- see that
         # function's docstring for why it has to stay inflated in `state` all the way
         # through the `denoise_step(pipe, state)` call above. It MUST be restored here,
@@ -7179,8 +7189,8 @@ class MiniMaxH3Runner:
         # *un*-inflated (reference-rows-only) count -- left inflated, the slice would be
         # empty and the reshape would fail (`decoders.py`'s
         # `audio_rows.reshape(components.audio_channels, block_state.num_audio_latents, ...)`).
-        if audio_drive_effective and audio_drive_latents is not None:
-            _restore_audio_drive_condition_rows(state, audio_drive_original_num_condition_audio_rows)
+        if vocal_lock_effective and vocal_lock_latents is not None:
+            _restore_vocal_lock_condition_rows(state, vocal_lock_original_num_condition_audio_rows)
         after_denoise_step = MiniMaxH3AfterDenoiseStep()
         _, state = after_denoise_step(pipe, state)
 
@@ -7362,7 +7372,7 @@ class MiniMaxH3Runner:
             "mute": bool(mute),
             "cache_skipped_steps": cache_skips[0] if instant["effective_cache"] == "fbc" else None,
             "reference_image_short_edge": resolved_short_edge,
-            "audio_drive": bool(audio_drive_effective),
+            "vocal_lock": bool(vocal_lock_effective),
             "references_summary": [
                 {"index": index, "kind": kind, "has_audio": bool(references[index].has_audio)}
                 for index, kind in enumerate(kinds)
