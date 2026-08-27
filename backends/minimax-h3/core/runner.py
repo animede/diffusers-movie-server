@@ -882,6 +882,15 @@ H3_INT8_MODULES_TO_NOT_CONVERT = [
     "time_embedder", "time_proj", "token_refiner",
     "norm_out", "proj_out", "audio_proj_out",
 ]
+# H3_TRANSFORMER_PREQUANT のメタデータ用の「定義時点のスナップショット」。
+# diffusers の `TorchAoHfQuantizer._process_model_before_weight_loading()` は
+# `quantization_config.modules_to_not_convert`(= 上のリストそのもの)を **in-place で
+# extend する**(keep_in_fp32_modules の "rope" 追加や、複数回ロードでの重複追加。
+# 2026-08-27 の実機 meta.json で確認)。そのため上のリストはプロセス内のロード回数に
+# 応じて中身が変わってしまい、キャッシュ無効化メタデータの比較キーには使えない。
+# 量子化の実効レシピ(「どの層を変換しないか」)は重複や "rope" の有無で変わらない
+# (マッチ判定は any() なので同値)ため、pristine なスナップショットを比較キーにする。
+_H3_INT8_MODULES_TO_NOT_CONVERT_PRISTINE = tuple(H3_INT8_MODULES_TO_NOT_CONVERT)
 
 # int8 shrinks each big transformer from ~66.3GB (bf16) to ~34.0GB (measured, see
 # logs/server_int8.log), so transformer(34.0) + transformer_ref(~34, same recipe) +
@@ -894,6 +903,67 @@ H3_INT8_MODULES_TO_NOT_CONVERT = [
 # together with `H3_TRANSFORMER_QUANT=int8`; bf16 mode (~66.3GB each) cannot fit both
 # at once and keeps the existing one-resident-at-a-time behaviour unchanged.
 H3_TRANSFORMER_BOTH_RESIDENT = H3_TRANSFORMER_QUANT == "int8"
+
+# 量子化済み transformer/transformer_ref のディスクキャッシュ (既定ON、H3_TE_PREQUANT と
+# 同じ設計思想)。
+#
+# 動機: `H3_TRANSFORMER_QUANT=int8` は起動のたびに 66GB の bf16 重みを読み、
+# `quantize_()` (torchao `Int8WeightOnlyConfig(version=2)`) でその場から int8 へ量子化
+# する。この量子化はモデルが変わらない限り決定的な処理なので、**量子化後の重みを
+# 一度保存しておけば次回以降は読むだけで済む**という H3_TE_PREQUANT と全く同じ理屈が
+# そのまま当てはまる。
+#
+# 実現可能性は本タスクで実機検証済み (2026-08-27、Phase 1 probe):
+# diffusers の `save_pretrained()`/`from_pretrained()` の既定 (`safe_serialization=True`)
+# が、torchao>=0.16.0 の `flatten_tensor_state_dict`/`unflatten_tensor_state_dict`
+# (safetensors ネイティブ経路、`torchao.prototype.safetensors.safetensors_support`) を
+# 経由して `Int8Tensor` をそのまま安全に直列化できることを確認した。小型ダミー
+# ModelMixin (Linear層 + modules_to_not_convert 相当の除外層) で
+# 量子化 → save_pretrained → 別インスタンスへ from_pretrained → 固定入力での
+# forward 出力を比較し、`torch.equal` で完全一致 (max_abs_diff 0.0)。
+# H3_TE_PREQUANT の bnb-4bit 直列化 (transformers 側の実装) とは別の直列化機構
+# (diffusers+torchao 側) だが、対応する版が両方ともビット一致で動くことを確認済み。
+#
+# TE 側との違い: TE は「設定ごとに別ディレクトリ」だけで衝突を防いでいたが、
+# transformer は 2 インスタンス (`transformer` / `transformer_ref`) が別々の
+# チェックポイント "スロット" (同一モデルクラス/config だが `_ensure_transformer` と
+# `_ensure_transformer_ref` で個別にロード・保存される) を持つため、キャッシュも
+# 個別ディレクトリにする (`models/prequant/transformer_int8/` /
+# `models/prequant/transformer_ref_int8/`)。
+#
+# **保存する瞬間の注意**: `H3_TURBO_LORA` の構造的な Linear wrap や
+# `_apply_turbo_setting` の遅延 turbo LoRA 適用より**前** (量子化直後、
+# `_transformer_loaded = True` を立てる直前) に保存する。turbo LoRA は Linear モジュール
+# 自体を差し替えるため、保存済みキャッシュに焼き込んでしまうと「turbo無効のはずの
+# リクエストでも turbo 適用済みの重みしか手に入らない」事故になる。attention backend
+# 切替 (属性代入のみ)・FBC (HookRegistry フック)・AdaLN precompute
+# (`adaln_proj` サブモジュール差し替えは遅延実行、ロード時点ではまだ発生しない) は
+# いずれも `state_dict()` に影響しないため、この保存点より後で構わない
+# (本タスクで各実装のソースを確認して裏付け済み)。
+#
+# ディスク消費は各インスタンドあたり int8 で ~34GB (bf16 66GB の約半分)、2インスタンス
+# で ~68GB。空きが `H3_TRANSFORMER_PREQUANT_MIN_FREE_GB` を下回る場合は保存をスキップし、
+# 警告だけ出して**生成は続行する** (H3_TE_PREQUANT と同じ fail-open 方針、キャッシュは
+# あくまで高速化であって機能ではない)。"0" で完全無効化できる。
+H3_TRANSFORMER_PREQUANT = os.environ.get("H3_TRANSFORMER_PREQUANT", "1").strip() == "1"
+H3_TRANSFORMER_PREQUANT_DIR = Path(
+    os.environ.get("H3_TRANSFORMER_PREQUANT_DIR", str(H3_TE_PREQUANT_DIR))
+)
+# TE (17-21GB) よりシャードがはるかに大きい (~34GB/インスタンス) ため、TE の既定 25GB
+# より大きい下限を既定にする。
+H3_TRANSFORMER_PREQUANT_MIN_FREE_GB = float(
+    os.environ.get("H3_TRANSFORMER_PREQUANT_MIN_FREE_GB", "40")
+)
+# 保存前に確認する空きホスト RAM の下限 (GB)。`save_pretrained` は
+# `max_shard_size="10GB"` のシャード単位で `state.dict()` (GPU上のテンソルのまま) を
+# safetensors へ直列化するため、34GB 全体を一度に CPU へコピーするわけではない
+# (本タスクでソースを確認: `modeling_utils.py` の `save_pretrained` はシャードごとに
+# `safetensors.torch.save_file(shard, ...)` を呼ぶだけで、GPU テンソルの CPU コピーは
+# safetensors 内部がシャード単位で行う) が、念のため CLAUDE.md #33 と同じ流儀で
+# 事前ガードを掛ける。
+H3_TRANSFORMER_PREQUANT_MIN_RAM_GB = float(
+    os.environ.get("H3_TRANSFORMER_PREQUANT_MIN_RAM_GB", "15")
+)
 
 # ref2va リクエストの終わりに、入口で解放した t2va 用 `transformer` を**その場で**
 # 積み直すか (2026-08-12 に既定を「積み直さない」へ変更)。
@@ -3733,20 +3803,28 @@ class MiniMaxH3Runner:
         if progress:
             progress.update(phase="loading_transformer", message="transformer をロード中...")
         t0 = time.time()
+        loaded_from_prequant = False
         if H3_TRANSFORMER_QUANT == "int8":
-            from diffusers import TorchAoConfig
-            from torchao.quantization import Int8WeightOnlyConfig
+            # 量子化済みキャッシュがあればそこから読む (H3_TRANSFORMER_PREQUANT の
+            # module docstring 参照)。読めた場合は bf16ロード+量子化を丸ごと省略する。
+            if H3_TRANSFORMER_PREQUANT and self._load_transformer_from_prequant(
+                self._transformer_prequant_dir(is_ref=False), is_ref=False, progress=progress
+            ):
+                loaded_from_prequant = True
+            else:
+                from diffusers import TorchAoConfig
+                from torchao.quantization import Int8WeightOnlyConfig
 
-            quant_config = TorchAoConfig(
-                Int8WeightOnlyConfig(version=2),
-                modules_to_not_convert=H3_INT8_MODULES_TO_NOT_CONVERT,
-            )
-            self._pipe.load_components(
-                names=["transformer"],
-                dtype=torch.bfloat16,
-                quantization_config={"transformer": quant_config},
-                device_map={"transformer": "cuda"},
-            )
+                quant_config = TorchAoConfig(
+                    Int8WeightOnlyConfig(version=2),
+                    modules_to_not_convert=H3_INT8_MODULES_TO_NOT_CONVERT,
+                )
+                self._pipe.load_components(
+                    names=["transformer"],
+                    dtype=torch.bfloat16,
+                    quantization_config={"transformer": quant_config},
+                    device_map={"transformer": "cuda"},
+                )
         else:
             self._pipe.load_components(names=["transformer"], dtype=torch.bfloat16)
             self._pipe.transformer.to(DEVICE)
@@ -3768,6 +3846,14 @@ class MiniMaxH3Runner:
                 "transformer load failed (see the diffusers 'Failed to create component "
                 "transformer' warning above for the underlying error, often CUDA OOM) -- "
                 "self._pipe.transformer is still None after load_components()."
+            )
+        # 初回のみ (量子化を実際にその場で行ったときだけ): 量子化済みの重みを保存して
+        # おき、次回以降のロードを短縮する。turbo LoRA の構造的 wrap や attention
+        # backend/FBC/AdaLN precompute の設定 (いずれも下記) より**前**、量子化直後の
+        # まっさらな状態で保存する (H3_TRANSFORMER_PREQUANT の module docstring 参照)。
+        if H3_TRANSFORMER_QUANT == "int8" and H3_TRANSFORMER_PREQUANT and not loaded_from_prequant:
+            self._save_transformer_prequant(
+                self._transformer_prequant_dir(is_ref=False), self._pipe.transformer, is_ref=False
             )
         self._transformer_loaded = True
         self._active_variant = "t2va"
@@ -4111,20 +4197,28 @@ class MiniMaxH3Runner:
         if progress:
             progress.update(phase="loading_transformer", message="transformer_ref (ref2va) をロード中...")
         t0 = time.time()
+        loaded_from_prequant = False
         if H3_TRANSFORMER_QUANT == "int8":
-            from diffusers import TorchAoConfig
-            from torchao.quantization import Int8WeightOnlyConfig
+            # 量子化済みキャッシュがあればそこから読む (`_ensure_transformer` と同じ、
+            # H3_TRANSFORMER_PREQUANT の module docstring 参照)。
+            if H3_TRANSFORMER_PREQUANT and self._load_transformer_from_prequant(
+                self._transformer_prequant_dir(is_ref=True), is_ref=True, progress=progress
+            ):
+                loaded_from_prequant = True
+            else:
+                from diffusers import TorchAoConfig
+                from torchao.quantization import Int8WeightOnlyConfig
 
-            quant_config = TorchAoConfig(
-                Int8WeightOnlyConfig(version=2),
-                modules_to_not_convert=H3_INT8_MODULES_TO_NOT_CONVERT,
-            )
-            self._pipe_ref.load_components(
-                names=["transformer_ref"],
-                dtype=torch.bfloat16,
-                quantization_config={"transformer_ref": quant_config},
-                device_map={"transformer_ref": "cuda"},
-            )
+                quant_config = TorchAoConfig(
+                    Int8WeightOnlyConfig(version=2),
+                    modules_to_not_convert=H3_INT8_MODULES_TO_NOT_CONVERT,
+                )
+                self._pipe_ref.load_components(
+                    names=["transformer_ref"],
+                    dtype=torch.bfloat16,
+                    quantization_config={"transformer_ref": quant_config},
+                    device_map={"transformer_ref": "cuda"},
+                )
         else:
             self._pipe_ref.load_components(names=["transformer_ref"], dtype=torch.bfloat16)
             self._pipe_ref.transformer_ref.to(DEVICE)
@@ -4138,6 +4232,12 @@ class MiniMaxH3Runner:
                 "component transformer_ref' warning above for the underlying error, "
                 "often CUDA OOM) -- self._pipe_ref.transformer_ref is still None after "
                 "load_components()."
+            )
+        # See `_ensure_transformer`'s matching save call: only on a fresh in-place
+        # quantize, and before turbo LoRA/attn backend/FBC/AdaLN precompute setup below.
+        if H3_TRANSFORMER_QUANT == "int8" and H3_TRANSFORMER_PREQUANT and not loaded_from_prequant:
+            self._save_transformer_prequant(
+                self._transformer_prequant_dir(is_ref=True), self._pipe_ref.transformer_ref, is_ref=True
             )
         self._transformer_ref_loaded = True
         self._active_variant = "ref2va"
@@ -4838,6 +4938,176 @@ class MiniMaxH3Runner:
             )
         except Exception:
             logger.exception("量子化済み TE の保存に失敗(生成は続行): %s", cache_dir)
+            try:
+                if tmp_dir.exists():
+                    shutil.rmtree(tmp_dir)
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # transformer/transformer_ref 量子化済みキャッシュ (H3_TRANSFORMER_PREQUANT)
+    # ------------------------------------------------------------------
+    def _transformer_prequant_dir(self, is_ref: bool) -> Path:
+        """量子化済み transformer(_ref) のキャッシュ先。TE と同じく**設定ごとに別
+        ディレクトリ**にする (`transformer_int8` / `transformer_ref_int8` -- 2つの
+        インスタンスは同一モデルクラス/config だが個別にロード・保存されるため、
+        混同しないよう名前でも分ける)。H3_TRANSFORMER_QUANT が int8 以外のときは
+        呼び出し側がそもそもこのキャッシュに触れないので、ディレクトリ名に量子化方式は
+        含めていない (現状 int8 のみが対象)。"""
+        name = "transformer_ref_int8" if is_ref else "transformer_int8"
+        return H3_TRANSFORMER_PREQUANT_DIR / name
+
+    def _transformer_prequant_metadata(self) -> dict:
+        """キャッシュ無効化用のメタデータ。保存時に `meta.json` として書き込み、
+        ロード時にこれと一致するかを確認する。一致しなければキャッシュは無効
+        (作り直す) 扱い -- ソースチェックポイントが更新された、torchao がバージョン
+        アップされた、量子化レシピ (modules_to_not_convert) が変わった、のいずれかで
+        古い重みを黙って読んでしまう事故を防ぐ。
+
+        ソースチェックポイントの識別には HF ローカルキャッシュのスナップショットパス
+        (コミットハッシュを含む、`try_to_load_from_cache` で安価に取得できる) を使う --
+        ファイル自体のハッシュ化は 66GB を読み直すことになり本末転倒なので行わない。
+        """
+        import importlib.metadata
+
+        from huggingface_hub import try_to_load_from_cache
+
+        try:
+            cached = try_to_load_from_cache(MODEL_ID, "transformer/config.json")
+            source_snapshot = str(cached) if cached else None
+        except Exception:
+            source_snapshot = None
+        return {
+            "model_id": MODEL_ID,
+            "source_snapshot": source_snapshot,
+            "torchao_version": importlib.metadata.version("torchao"),
+            "torch_version": torch.__version__,
+            "quant_config": "Int8WeightOnlyConfig(version=2)",
+            # プロセス内で mutate されうる H3_INT8_MODULES_TO_NOT_CONVERT ではなく、
+            # 定義時点の pristine スナップショットを使う(定義箇所のコメント参照)。
+            "modules_to_not_convert": sorted(_H3_INT8_MODULES_TO_NOT_CONVERT_PRISTINE),
+        }
+
+    def _load_transformer_from_prequant(
+        self, cache_dir: Path, is_ref: bool, progress: ProgressState | None = None
+    ) -> bool:
+        """量子化済みキャッシュから transformer(_ref) を読む。成功したら True。
+
+        `_load_te_from_prequant` と同じ fail-open 方針: 読めなかった場合 (キャッシュが
+        存在しない、壊れている、メタデータが現在の設定と食い違う) は**例外を投げず
+        False を返す** -- 呼び出し側は黙って通常の bf16ロード+量子化経路へ落ちる。
+        """
+        meta_path = cache_dir / "meta.json"
+        config_path = cache_dir / "config.json"
+        if not (meta_path.exists() and config_path.exists()):
+            return False
+        try:
+            saved_meta = json.loads(meta_path.read_text())
+        except Exception:
+            logger.warning("transformer 量子化済みキャッシュの meta.json が壊れています、"
+                            "通常経路へフォールバック: %s", cache_dir)
+            return False
+        current_meta = self._transformer_prequant_metadata()
+        if saved_meta != current_meta:
+            logger.info(
+                "transformer 量子化済みキャッシュのメタデータが現在の設定と不一致のため無効"
+                "扱いにします (通常経路で作り直します): %s\n保存済み=%s\n現在=%s",
+                cache_dir, saved_meta, current_meta,
+            )
+            return False
+        label = "transformer_ref" if is_ref else "transformer"
+        if progress:
+            progress.update(
+                phase="loading_transformer",
+                message=f"{label} (量子化済みキャッシュ) をロード中...",
+            )
+        t0 = time.time()
+        try:
+            from diffusers import MiniMaxH3Transformer3DModel
+
+            tr = MiniMaxH3Transformer3DModel.from_pretrained(str(cache_dir), torch_dtype=torch.bfloat16)
+            tr = tr.to(DEVICE)
+        except Exception:
+            logger.exception(
+                "%s 量子化済みキャッシュの読み込みに失敗、通常経路へフォールバック: %s",
+                label, cache_dir,
+            )
+            return False
+        if is_ref:
+            self._pipe_ref.transformer_ref = tr
+        else:
+            self._pipe.transformer = tr
+        logger.info(
+            "%s loaded from prequantized cache in %.1fs (%s). gpu=%s",
+            label, time.time() - t0, cache_dir, gpu_mem_gb(),
+        )
+        return True
+
+    def _save_transformer_prequant(self, cache_dir: Path, transformer, is_ref: bool):
+        """ロード済み (量子化直後、turbo LoRA 等でまだ手を加えていない) transformer(_ref)
+        を量子化済みのまま保存する。失敗しても生成は続行する (`_save_te_prequant` と
+        同じ fail-open 方針)。
+
+        呼び出し側 (`_ensure_transformer`/`_ensure_transformer_ref`) は、turbo LoRA の
+        構造的な Linear wrap や attention backend 設定より**前**、量子化直後にこれを
+        呼ぶこと -- 保存点の妥当性は本タスクの Phase 1/2 で確認済み (H3_TRANSFORMER_
+        PREQUANT の module docstring 参照)。
+        """
+        import shutil
+
+        label = "transformer_ref" if is_ref else "transformer"
+        try:
+            free_gb = shutil.disk_usage(
+                H3_TRANSFORMER_PREQUANT_DIR.parent if H3_TRANSFORMER_PREQUANT_DIR.exists()
+                else Path.cwd()
+            ).free / 1e9
+        except Exception:
+            free_gb = float("inf")
+        if free_gb < H3_TRANSFORMER_PREQUANT_MIN_FREE_GB:
+            logger.warning(
+                "%s 量子化済みキャッシュの保存をスキップ: 空きディスクが %.1fGB で下限 %.1fGB"
+                "を下回る (H3_TRANSFORMER_PREQUANT_MIN_FREE_GB で調整可、"
+                "H3_TRANSFORMER_PREQUANT=0 で無効化可)",
+                label, free_gb, H3_TRANSFORMER_PREQUANT_MIN_FREE_GB,
+            )
+            return
+        avail_ram = ram_gb()["avail_gb"]
+        if avail_ram < H3_TRANSFORMER_PREQUANT_MIN_RAM_GB:
+            logger.warning(
+                "%s 量子化済みキャッシュの保存をスキップ: 空きホストRAMが %.1fGBで下限 %.1fGB"
+                "を下回る (CLAUDE.md #33 と同じ理由でホストRAM枯渇を避けるため。"
+                "H3_TRANSFORMER_PREQUANT_MIN_RAM_GB で調整可)",
+                label, avail_ram, H3_TRANSFORMER_PREQUANT_MIN_RAM_GB,
+            )
+            return
+        tmp_dir = cache_dir.with_name(cache_dir.name + ".tmp")
+        try:
+            if tmp_dir.exists():
+                shutil.rmtree(tmp_dir)
+            tmp_dir.parent.mkdir(parents=True, exist_ok=True)
+            t0 = time.time()
+            # `save_pretrained` の既定 (`safe_serialization=True`, `max_shard_size="10GB"`)
+            # はシャード単位で `safetensors.torch.save_file()` を呼ぶ (GPU上のテンソルの
+            # ままの `state_dict()` をシャードに分けて直列化するため、34GB 全体を一度に
+            # CPU へ複製することはない -- モジュール冒頭の H3_TRANSFORMER_PREQUANT_MIN_RAM_GB
+            # のコメント参照)。
+            transformer.save_pretrained(str(tmp_dir))
+            (tmp_dir / "meta.json").write_text(
+                json.dumps(self._transformer_prequant_metadata(), indent=2, ensure_ascii=False)
+            )
+            # 一時ディレクトリへ書いてから rename する: 保存中にプロセスが落ちても
+            # 中途半端なキャッシュが「有効」に見えてしまうのを防ぐ (config.json/meta.json
+            # の存在でキャッシュ有無を判定しているため)。
+            if cache_dir.exists():
+                shutil.rmtree(cache_dir)
+            tmp_dir.rename(cache_dir)
+            size_gb = sum(f.stat().st_size for f in cache_dir.rglob("*") if f.is_file()) / 1e9
+            logger.info(
+                "%s 量子化済みキャッシュを保存: %s (%.2fGB, %.1fs)。次回以降のロードが高速になる",
+                label, cache_dir, size_gb, time.time() - t0,
+            )
+        except Exception:
+            logger.exception("%s 量子化済みキャッシュの保存に失敗(生成は続行): %s", label, cache_dir)
             try:
                 if tmp_dir.exists():
                     shutil.rmtree(tmp_dir)
