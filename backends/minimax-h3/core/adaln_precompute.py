@@ -46,21 +46,63 @@ v1 scope (see `core/runner.py`'s `H3_ADALN_PRECOMP` block for the enforced guard
 bf16 transformer only (`H3_TRANSFORMER_QUANT=none`), no `H3_LOWVRAM`/`H3_LOWVRAM_GROUP`,
 and rejected outright against turbo (`H3_TURBO_LORA` env default, and any per-request
 `turbo=True` override -- see `core/settings.py`'s `validate_instant_settings()`). The
-turbo-incompatibility is a real structural conflict, not just an unverified
-combination: `core/runner.py`'s `apply_turbo_lora()`/`apply_diffusers_turbo_lora()`
-wrap every block's `adaln_proj.linear` in a `_TurboLoRALinear` (see
-`_turbo_lora_key_map()`'s docstring, `blocks.N.adaln_proj.linear` key), and that
-wrapping is toggled per-REQUEST via `_TurboLoRALinear.enabled` on an already-resident
-transformer instance (`set_turbo_lora_enabled()`), not fixed at load time. A precompute
-table is baked once, from whatever `adaln_proj.linear` behaviour existed when
-`precompute()` ran, for one fixed schedule -- it cannot simultaneously serve a
-turbo=True request (different LoRA-adjusted modulation, and typically a different
-video-schedule shift, see `_apply_turbo_video_shift()`) and a turbo=False request
-(plain modulation) off the same table, and `precompute()` deletes `block.adaln_proj`
-outright (the LoRA-wrapped `.linear` submodule goes with it), so there is nothing left
-to toggle after precompute runs. Serving both would need a per-turbo-state table pair
-rebuilt on every toggle, which defeats the "compute once" design this technique exists
-for -- out of scope here, guarded instead of silently mishandled.
+turbo-incompatibility was written up as "a real structural conflict, not just an
+unverified combination", reasoning from `core/runner.py`'s `apply_turbo_lora()`
+(comfy-format LoRA): that function wraps every block's `adaln_proj.linear` in a
+`_TurboLoRALinear` (see `_turbo_lora_key_map()`'s docstring, `blocks.N.adaln_proj.linear`
+key), toggled per-REQUEST via `_TurboLoRALinear.enabled` on an already-resident
+transformer instance (`set_turbo_lora_enabled()`), not fixed at load time -- true for
+that checkpoint format, but this v1 analysis generalized from the comfy-format LoRA to
+"turbo" as a whole without checking whether the *other* supported format touches the
+same submodule.
+
+v2 (coexistence, this module's current scope -- see `docs/h3-adaln-precompute-
+20260826.md`'s dated coexistence section for the full verification writeup): it does
+not. This project's actual default/production turbo LoRA
+(`H3_TURBO_LORA_REPO=lightx2v/Minimax-h3-Turbo`, the diffusers-native/DMD-distilled
+format `apply_diffusers_turbo_lora()` applies) was checked key-by-key against all 5 of
+its non-comfyui-mirror checkpoint files on HF Hub (t2va/fl2va 4step/8step v0.1/v1.0/v1.1
+variants) -- every one of them adapts only `attn.{to_q,to_k,to_v,to_out.0}` and
+`ff.net.{0.proj,2}` (312 wrapped Linears each, matching `apply_diffusers_turbo_lora()`'s
+own docstring count), and NONE of them has an `adaln_proj`- or `norm_out`-prefixed key
+(0 out of 312 paths, for all 5 files). `apply_diffusers_turbo_lora()`'s own key
+derivation (`paths = sorted({k.rsplit(".lora_", 1)[0] ...})`, reading straight off
+whatever keys the checkpoint actually has) confirms this is not an artifact of a
+hand-maintained key map that might be missing an entry the way the comfy-format
+`_turbo_lora_key_map()` is (that one *is* hand-maintained and explicitly includes
+`adaln_proj.linear`/`norm_out.linear`) -- the diffusers-native LoRA genuinely never
+learned an AdaLN delta, so wrapping the rest of the transformer with it changes nothing
+about what `block.adaln_proj`/`self.norm_out` compute. That makes the two techniques
+independent for this format: a table built by running the trajectory GEMMs through
+`block.adaln_proj` (turbo-wrapped elsewhere in the transformer, or not -- irrelevant,
+since turbo never wraps `adaln_proj` itself under this format) is bit-exact for both
+turbo=True and turbo=False requests off the exact same table, with no rebuild needed
+on toggle. `enable_adaln_precompute()`'s own docstring below documents the remaining
+ordering requirement this relies on (precompute must not fire before the request's
+`apply_instant_settings()` turbo wrap has already run, purely so precompute doesn't
+observe half-wrapped state mid-request -- not because the wrap could change what
+`adaln_proj` computes).
+
+The comfy-format LoRA (`larryvrh/MiniMax-H3-Turbo-Lora`, `_TURBO_COMFY_REPOS`) is a
+genuine exception: its checkpoint DOES carry 51 `adaln_proj`/`norm_out`-prefixed
+keys (verified directly against all 3 cached snapshots of the un-pruned original,
+259 total paths per file, 51 of them AdaLN: 50 blocks' `adaln_proj.linear` + 1
+`final_layer.adaln_proj.linear` -> `norm_out.linear`, per `_turbo_lora_key_map()`'s own
+docstring) and `apply_turbo_lora()` wraps them the same way as everything else.
+`families/qwen_image` CLAUDE.md #44 in the sibling diffusers-server project hit the
+identical fused-attn-plus-AdaLN LoRA shape (IC-LoRA) and the fix there was the same one
+this module uses: never let precompute silently observe a turbo-wrapped
+`adaln_proj.linear` and treat it as the plain projection. `precompute()` (below) now
+raises loudly if it finds any `block.adaln_proj.linear` (the specific submodule it
+reads and then deletes -- `self.norm_out.linear`/`final_layer` is a separate module
+`precompute()` has never touched, in v1 or v2, so a comfy-format wrap surviving there
+is harmless and intentionally left alone) already wrapped in a `_TurboLoRALinear` when
+it runs -- this can only happen with the comfy-format LoRA (the only format that ever
+wraps that specific submodule), so this guard is v2's enforcement point for keeping the
+comfy format out of the precompute path, replacing v1's blanket "reject all turbo" rule
+at the settings-validation layer with a narrower, format-specific one (see
+`core/settings.py`'s `validate_instant_settings()` and `core/runner.py`'s
+`H3_ADALN_PRECOMP` import-time block, both updated to match).
 """
 
 from __future__ import annotations
@@ -134,6 +176,57 @@ def _timestep_embedding(transformer, timestep: torch.Tensor) -> torch.Tensor:
     return transformer.time_embedder(temb.to(transformer.time_embedder.linear_1.weight.dtype))
 
 
+def _reject_turbo_wrapped_adaln(transformer) -> None:
+    """Refuse to precompute if any `block.adaln_proj.linear` is already a
+    `_TurboLoRALinear` wrapper.
+
+    This is the coexistence guard described in this module's own docstring (v2
+    section): the default/production turbo LoRA (diffusers-native format,
+    `apply_diffusers_turbo_lora()`) never wraps `adaln_proj` at all, verified against
+    every non-comfyui-mirror checkpoint file lightx2v ships -- so in the normal case
+    this loop finds nothing and returns immediately. The only checkpoint format that
+    *does* wrap `adaln_proj.linear` is the comfy-format LoRA
+    (`apply_turbo_lora()`/`_turbo_lora_key_map()`, `_TURBO_COMFY_REPOS`), which this
+    project already keeps out of int8/lowvram mode for an unrelated reason (`aten.cat`
+    on `Int8Tensor`, see `core/settings.py`) but does NOT otherwise block from the bf16
+    path this module targets. If that format ever reaches here, `precompute()`'s own
+    `for parameter in projection.linear.parameters()` walk would silently read
+    `_TurboLoRALinear.base`'s parameters (the property aliasing at the top of this
+    file's docstring-referenced `_TurboLoRALinear.weight`/`.bias` makes that walk
+    succeed without error) and then `del projection` would throw away the LoRA delta
+    entirely -- a silent, wrong-answer failure mode, not a crash, so it needs an
+    explicit check rather than relying on some other line to fail first.
+
+    Imports `_TurboLoRALinear` from `core.runner` lazily (not at this module's own
+    import time) to avoid a circular import: `core/runner.py` imports
+    `core.adaln_precompute` lazily too (inside `_ensure_transformer`/
+    `enable_adaln_precompute`'s own call sites), specifically so the two modules never
+    need to import each other at load time.
+    """
+    from core.runner import _TurboLoRALinear
+
+    wrapped_blocks = [
+        i for i, block in enumerate(transformer.transformer_blocks)
+        if isinstance(block.adaln_proj.linear, _TurboLoRALinear)
+    ]
+    if wrapped_blocks:
+        raise RuntimeError(
+            f"AdaLN precompute cannot run: {len(wrapped_blocks)} block(s) "
+            f"(e.g. block {wrapped_blocks[0]}) have a turbo-LoRA-wrapped "
+            "adaln_proj.linear (_TurboLoRALinear). This only happens with the "
+            "comfy-format turbo LoRA checkpoint (_TURBO_COMFY_REPOS, e.g. "
+            "larryvrh/MiniMax-H3-Turbo-Lora) -- unlike the default diffusers-native "
+            "format (lightx2v/Minimax-h3-Turbo), the comfy format's LoRA genuinely "
+            "adapts adaln_proj, so a table baked from these wrapped modules would "
+            "silently discard the LoRA delta once `del projection` runs (the walk "
+            "over `projection.linear.parameters()` reads the wrapped base's "
+            "parameters just fine -- this cannot be caught by a shape/attribute "
+            "error, only by this explicit check). Use the default diffusers-native "
+            "turbo LoRA (H3_TURBO_LORA_REPO=lightx2v/Minimax-h3-Turbo, or leave "
+            "H3_TURBO_LORA_REPO/H3_TURBO_LORA_FILE unset) with H3_ADALN_PRECOMP=1."
+        )
+
+
 @torch.no_grad()
 def precompute(transformer, row_timestep_plan: list) -> dict:
     """Build every block's modulation table for the whole trajectory and free the
@@ -147,6 +240,19 @@ def precompute(transformer, row_timestep_plan: list) -> dict:
     into this table's rows exactly as it always indexed into the uncached projection's
     output rows -- the row layout is unchanged, only how those rows are produced is).
 
+    Coexistence with turbo (v2, see module docstring): runs AFTER
+    `apply_instant_settings()`'s turbo wrap for this request (`enable_adaln_precompute()`
+    arms the transformer at load time, but the actual table build is deferred to the
+    denoise loop's first step -- see that function's docstring -- which is always after
+    `generate()`/`generate_ref2va()` have already called `apply_instant_settings()`).
+    For the default diffusers-native turbo LoRA this is inconsequential either way (that
+    format never touches `adaln_proj`, verified in this module's docstring), but running
+    after keeps the ordering correct in case a future non-adaln-touching LoRA format
+    someday DOES wrap some other module `_timestep_embedding()` reads through (it does
+    not today -- `time_proj`/`time_embedder` are never turbo-wrapped by either format).
+    `_reject_turbo_wrapped_adaln()` (above) is the actual enforcement point for the one
+    format that DOES conflict (comfy-format), not this ordering.
+
     Raises if this transformer already has a precompute table installed (call
     `is_precomputed()` first, or just check `H3_ADALN_PRECOMP`'s own `_wanted` flag --
     see `enable_adaln_precompute()`) -- a repeat call would try to read
@@ -156,6 +262,7 @@ def precompute(transformer, row_timestep_plan: list) -> dict:
     """
     if is_precomputed(transformer):
         raise RuntimeError("AdaLN precompute is already installed on this transformer.")
+    _reject_turbo_wrapped_adaln(transformer)
 
     device = next(transformer.parameters()).device
     embeddings = [_timestep_embedding(transformer, ts.to(device)) for ts, _ in row_timestep_plan]
@@ -198,6 +305,22 @@ def precompute(transformer, row_timestep_plan: list) -> dict:
         del projection
 
     transformer._h3opt_adaln_cursor = cursor
+    # Records which turbo state this table was built while observing, purely for
+    # `MiniMaxH3Runner.status()` / `_adaln_precompute_status()` reporting (v2
+    # coexistence) -- NOT used by any correctness-affecting logic. The table is valid
+    # for both turbo=True and turbo=False requests regardless of this value (see this
+    # module's own docstring: the default LoRA format never touches `adaln_proj`, so
+    # this flag is purely informational, not a "which requests can use this table"
+    # gate). Read via `_TurboLoRALinear` presence anywhere else in the transformer
+    # (not restricted to `adaln_proj`, which `_reject_turbo_wrapped_adaln()` already
+    # confirmed is unwrapped by this point) -- a cheap proxy for "was turbo active for
+    # this request" without threading an extra argument through
+    # `call_with_precomputed_adaln()`.
+    from core.runner import _TurboLoRALinear
+
+    transformer._h3opt_adaln_built_with_turbo = any(
+        isinstance(module, _TurboLoRALinear) and module.enabled for module in transformer.modules()
+    )
     torch.cuda.empty_cache()
 
     stats = {
@@ -205,10 +328,12 @@ def precompute(transformer, row_timestep_plan: list) -> dict:
         "blocks": len(transformer.transformer_blocks),
         "table_gb": table_bytes / 1024**3,
         "freed_gb": freed_bytes / 1024**3,
+        "built_with_turbo": transformer._h3opt_adaln_built_with_turbo,
     }
     logger.info(
-        "[h3opt.adaln] cached %d blocks x %d steps: table %.2f GB, freed %.2f GB of weights",
-        stats["blocks"], stats["steps"], stats["table_gb"], stats["freed_gb"],
+        "[h3opt.adaln] cached %d blocks x %d steps: table %.2f GB, freed %.2f GB of weights "
+        "(built_with_turbo=%s)",
+        stats["blocks"], stats["steps"], stats["table_gb"], stats["freed_gb"], stats["built_with_turbo"],
     )
     return stats
 
@@ -225,6 +350,17 @@ def is_precomputed(transformer) -> bool:
     return getattr(transformer, "_h3opt_adaln_cursor", None) is not None
 
 
+def built_with_turbo(transformer) -> bool | None:
+    """Which turbo state the currently-installed precompute table was built while
+    observing (see `precompute()`'s own comment on `_h3opt_adaln_built_with_turbo` --
+    informational only, both turbo states are served correctly off the same table for
+    the default LoRA format). `None` if no table is installed yet.
+    """
+    if not is_precomputed(transformer):
+        return None
+    return bool(getattr(transformer, "_h3opt_adaln_built_with_turbo", False))
+
+
 def enable_adaln_precompute(transformer) -> None:
     """Arm the precompute on `transformer`: it fires on the first denoise step of the
     next request that drives this transformer instance through
@@ -235,6 +371,20 @@ def enable_adaln_precompute(transformer) -> None:
     so the actual precompute work is hung off the first iteration of the loop denoiser
     rather than done here. The cursor is advanced from that same patched call, since it
     is the only place that knows the current step index `i`.
+
+    Coexistence with turbo (v2): deferring to step 0 of the denoise loop also happens to
+    guarantee precompute always runs AFTER `MiniMaxH3Runner.apply_instant_settings()`'s
+    turbo wrap for this request -- `generate()`/`generate_ref2va()` (and their hires-fix
+    counterparts) both call `apply_instant_settings()` once the transformer is confirmed
+    resident and strictly before `denoise_step(pipe, state)` (the call that drives
+    `MiniMaxH3LoopDenoiser.__call__` internally), for every code path (verified by
+    reading all 4 call sites in `core/runner.py`). This ordering is not required for
+    correctness against the default diffusers-native turbo LoRA (it never touches
+    `adaln_proj`, see this module's own docstring, so precompute would give the same
+    table whether it ran before or after that wrap), but it is what makes
+    `_reject_turbo_wrapped_adaln()` (`precompute()`'s own guard) able to see a
+    turbo-wrapped `adaln_proj.linear` at all when the comfy-format LoRA IS in play,
+    instead of racing it.
 
     Idempotent per-process for the *class*-level monkeypatch (`MiniMaxH3LoopDenoiser
     .__call__` is only ever wrapped once, tracked via `_h3opt_patched` on the class
