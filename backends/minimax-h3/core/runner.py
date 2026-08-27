@@ -1064,10 +1064,10 @@ H3_VAE_SMALLCLIP_FIX = os.environ.get("H3_VAE_SMALLCLIP_FIX", "1").strip() == "1
 # `ffmpeg framemd5` exact-match check (see docs/h3-adaln-precompute-20260826.md).
 # Expected saving: bf16 transformer ~66.3GB -> roughly ~42GB resident.
 #
-# v1 scope: bf16 transformer only. Rejected at import time (this block) against
-# H3_TRANSFORMER_QUANT=int8 and any H3_LOWVRAM mode, and rejected per-request (see
-# core/settings.py's validate_instant_settings()) against turbo=True -- both are real
-# structural conflicts, not just unverified combinations:
+# v2 (coexistence, see core/adaln_precompute.py's module docstring for the full
+# verification): bf16 transformer only, still rejected at import time (this block)
+# against H3_TRANSFORMER_QUANT=int8 and any H3_LOWVRAM mode -- both remain real
+# structural conflicts, unrelated to turbo, unchanged from v1:
 #
 #   - int8: torchao's Int8Tensor-backed `adaln_proj.linear` was not verified against
 #     `precompute()`'s own GEMM-per-step + `del`-the-weights shape (the whole point of
@@ -1079,12 +1079,27 @@ H3_VAE_SMALLCLIP_FIX = os.environ.get("H3_VAE_SMALLCLIP_FIX", "1").strip() == "1
 #     that block's own guard above), so this is really the same restriction stated
 #     twice for a clearer error message at whichever flag combination an operator
 #     actually sets.
-#   - turbo (any H3_TURBO_LORA env default, or a per-request turbo=True override): see
-#     core/adaln_precompute.py's module docstring for the full derivation -- the turbo
-#     LoRA checkpoint's `blocks.N.adaln_proj.linear` key wraps the exact same submodule
-#     `precompute()` deletes, and turbo is toggled per-request on an already-resident
-#     transformer (not fixed at load time), which a single frozen precomputed table
-#     cannot serve alongside a turbo=False request off the same table.
+#
+# turbo is NO LONGER blanket-rejected here (v1's H3_TURBO_LORA check is gone): checked
+# key-by-key against every non-comfyui-mirror checkpoint file the default
+# H3_TURBO_LORA_REPO (lightx2v/Minimax-h3-Turbo, diffusers-native/DMD format) ships,
+# none of them touch `adaln_proj`/`norm_out` at all (0 of 312 wrapped Linears each, see
+# core/adaln_precompute.py's module docstring for the full per-file verification) -- so
+# there is no structural conflict for that format, and this project's actual
+# production config (`H3_TURBO_LORA_FILE=minimax_h3_ref2v_turbo_4step_v0.1_bf16.
+# safetensors`, one of the checked files) can run turbo and AdaLN precompute together.
+# Only the comfy-format LoRA (`_TURBO_COMFY_REPOS`, e.g. larryvrh/MiniMax-H3-Turbo-Lora)
+# genuinely conflicts -- its checkpoint DOES carry an `adaln_proj`/`norm_out` delta (51
+# of 259 wrapped Linears, verified against all 3 cached snapshots) -- so THAT specific
+# repo is still rejected here, using the same lightweight repo-name heuristic
+# `turbo_lora_expected_format()` uses elsewhere in this file (that function is defined
+# later in this module and cannot be called yet at this point in module-body
+# execution, hence the inline check rather than a call to it). This is a heuristic on
+# the *configured* repo, checked again for real by `core/adaln_precompute.py`'s
+# `_reject_turbo_wrapped_adaln()` once the actual checkpoint's keys are known (an
+# operator could point H3_TURBO_LORA_REPO/H3_TURBO_LORA_FILE at some other,
+# not-yet-known comfy-format checkpoint under a different repo name, which this
+# heuristic would miss but that later, key-level check would still catch).
 H3_ADALN_PRECOMP = os.environ.get("H3_ADALN_PRECOMP", "0").strip() == "1"
 if H3_ADALN_PRECOMP:
     if H3_TRANSFORMER_QUANT == "int8":
@@ -1093,7 +1108,7 @@ if H3_ADALN_PRECOMP:
             "(int8 は adaln_proj も含め全 Linear を torchao Int8Tensor へ量子化するため、"
             "precompute() の GEMM-per-step + 重み del という前提が torchao の量子化テンソル "
             "に対して未検証です。両者は同じ重み集合を同じ理由で削減対象にしており、"
-            "組み合わせる意味自体が薄いため v1 では明示的に拒否します)。"
+            "組み合わせる意味自体が薄いため明示的に拒否します)。"
             "H3_TRANSFORMER_QUANT=none (既定) で使ってください。"
         )
     if H3_LOWVRAM_ANY:
@@ -1103,21 +1118,23 @@ if H3_ADALN_PRECOMP:
             "しており、上の int8 拒否と同じ理由で未検証です)。H3_LOWVRAM=0 (既定) で "
             "使ってください。"
         )
-    if H3_TURBO_LORA:
+    if H3_TURBO_LORA and H3_TURBO_LORA_REPO in _TURBO_COMFY_REPOS:
         raise RuntimeError(
-            "H3_ADALN_PRECOMP=1 と H3_TURBO_LORA=1 は併用できません (turbo LoRA は "
-            "adaln_proj.linear を _TurboLoRALinear でラップし、しかもそのラップは "
-            "リクエスト単位で on/off がトグルされます -- precompute() は固定スケジュール "
-            "から一度だけテーブルを焼き、adaln_proj 自体を削除してしまうため、同じ常駐 "
-            "transformer で turbo=True と turbo=False の両方に対応できません。詳細は "
-            "core/adaln_precompute.py のモジュール docstring 参照)。H3_TURBO_LORA=0 "
-            "(既定) で使ってください(リクエスト単位の turbo=True override は "
-            "core/settings.py の validate_instant_settings() が別途 400 で拒否します)。"
+            f"H3_ADALN_PRECOMP=1 と H3_TURBO_LORA_REPO={H3_TURBO_LORA_REPO!r} (comfy形式) "
+            "は併用できません (このチェックポイントは adaln_proj.linear/norm_out.linear "
+            "にも LoRA デルタを持つため、precompute() が一度だけ焼くテーブルではこの "
+            "デルタを表現できません。詳細は core/adaln_precompute.py のモジュール "
+            "docstring 参照)。既定の diffusers ネイティブ形式 "
+            "(H3_TURBO_LORA_REPO=lightx2v/Minimax-h3-Turbo、または "
+            "H3_TURBO_LORA_REPO/H3_TURBO_LORA_FILE を未設定のまま) は adaln_proj に "
+            "触れないため AdaLN precompute と併用できます。"
         )
     logger.info(
         "H3_ADALN_PRECOMP=1: AdaLN modulation will be precomputed and adaln_proj "
         "weights freed on every fresh transformer/transformer_ref load (bf16 only, "
-        "~66.3GB -> ~42GB expected resident)."
+        "~66.3GB -> ~42GB expected resident). turbo=%s (repo=%s) -- coexistence "
+        "verified for the diffusers-native LoRA format, see core/adaln_precompute.py.",
+        H3_TURBO_LORA, H3_TURBO_LORA_REPO,
     )
 
 
@@ -2904,6 +2921,28 @@ def _adaln_precompute_status(self: "MiniMaxH3Runner") -> dict:
         "transformer": bool(self._transformer_loaded and is_precomputed(self._pipe.transformer)),
         "transformer_ref": bool(
             self._transformer_ref_loaded and is_precomputed(self._pipe_ref.transformer_ref)
+        ),
+    }
+
+
+def _adaln_precompute_built_with_turbo(self: "MiniMaxH3Runner") -> dict:
+    """`status()` helper (v2 coexistence): which turbo state each currently-installed
+    precompute table was built while observing -- `None` per transformer that has no
+    table installed yet (mirrors `_adaln_precompute_status()`'s own shape/gating, see
+    that function's docstring). Purely informational (`core/adaln_precompute.py`'s
+    `built_with_turbo()` docstring: both turbo states are served correctly off the same
+    table for the default LoRA format), exposed so an operator watching `/api/status`
+    can confirm which state the table was actually built against without needing to
+    correlate it against request logs by hand.
+    """
+    if not H3_ADALN_PRECOMP:
+        return {"transformer": None, "transformer_ref": None}
+    from core.adaln_precompute import built_with_turbo
+
+    return {
+        "transformer": built_with_turbo(self._pipe.transformer) if self._transformer_loaded else None,
+        "transformer_ref": (
+            built_with_turbo(self._pipe_ref.transformer_ref) if self._transformer_ref_loaded else None
         ),
     }
 
@@ -4922,6 +4961,10 @@ class MiniMaxH3Runner:
             # request actually runs a denoise step against that instance.
             "adaln_precomp": H3_ADALN_PRECOMP,
             "adaln_precomp_built": _adaln_precompute_status(self),
+            # v2 coexistence: which turbo state each installed table was built while
+            # observing (informational only -- see `_adaln_precompute_built_with_turbo()`
+            # docstring, both turbo states are served correctly off the same table).
+            "adaln_precomp_built_with_turbo": _adaln_precompute_built_with_turbo(self),
             "gpu": gpu_mem_gb(),
             "ram": ram_gb(),
         }
