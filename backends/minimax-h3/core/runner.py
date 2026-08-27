@@ -1051,6 +1051,75 @@ else:
 # 状態に戻すためのトグル(例外時クリーンアップの実機検証にも使った)。
 H3_VAE_SMALLCLIP_FIX = os.environ.get("H3_VAE_SMALLCLIP_FIX", "1").strip() == "1"
 
+# EXPERIMENTAL, opt-in ("0" default = completely inert, zero behaviour change --
+# `core/adaln_precompute.py` is never imported/called unless this is "1"). Ported from
+# NVIDIA Sol-Engine's `sana-sol-engine` repo (`models/minimax_h3/GB200/adaln.py`,
+# Apache-2.0) -- see that module's own docstring for the full mechanism/rationale.
+# In short: precomputes the whole trajectory's AdaLN modulation table (~1.5GB) once, up
+# front, from the request's fixed sampling schedule, and drops the ~26GB of
+# `adaln_proj` weights that would otherwise sit GPU-resident recomputing the exact same
+# values on every one of the transformer's 50 blocks x every denoising step. Bitwise
+# identical to the uncached path (one GEMM per (block, step) at the reference's own
+# shape -- no batching, no approximation), so this needs no quality gate, only an
+# `ffmpeg framemd5` exact-match check (see docs/h3-adaln-precompute-20260826.md).
+# Expected saving: bf16 transformer ~66.3GB -> roughly ~42GB resident.
+#
+# v1 scope: bf16 transformer only. Rejected at import time (this block) against
+# H3_TRANSFORMER_QUANT=int8 and any H3_LOWVRAM mode, and rejected per-request (see
+# core/settings.py's validate_instant_settings()) against turbo=True -- both are real
+# structural conflicts, not just unverified combinations:
+#
+#   - int8: torchao's Int8Tensor-backed `adaln_proj.linear` was not verified against
+#     `precompute()`'s own GEMM-per-step + `del`-the-weights shape (the whole point of
+#     H3_TRANSFORMER_QUANT=int8 is to shrink `adaln_proj` along with everything else
+#     via quantization, not to also precompute-and-drop it -- the two techniques target
+#     the exact same weights for the exact same reason, combining them is redundant at
+#     best and unverified at worst).
+#   - H3_LOWVRAM/H3_LOWVRAM_GROUP: both require H3_TRANSFORMER_QUANT=int8 already (see
+#     that block's own guard above), so this is really the same restriction stated
+#     twice for a clearer error message at whichever flag combination an operator
+#     actually sets.
+#   - turbo (any H3_TURBO_LORA env default, or a per-request turbo=True override): see
+#     core/adaln_precompute.py's module docstring for the full derivation -- the turbo
+#     LoRA checkpoint's `blocks.N.adaln_proj.linear` key wraps the exact same submodule
+#     `precompute()` deletes, and turbo is toggled per-request on an already-resident
+#     transformer (not fixed at load time), which a single frozen precomputed table
+#     cannot serve alongside a turbo=False request off the same table.
+H3_ADALN_PRECOMP = os.environ.get("H3_ADALN_PRECOMP", "0").strip() == "1"
+if H3_ADALN_PRECOMP:
+    if H3_TRANSFORMER_QUANT == "int8":
+        raise RuntimeError(
+            "H3_ADALN_PRECOMP=1 と H3_TRANSFORMER_QUANT=int8 は併用できません "
+            "(int8 は adaln_proj も含め全 Linear を torchao Int8Tensor へ量子化するため、"
+            "precompute() の GEMM-per-step + 重み del という前提が torchao の量子化テンソル "
+            "に対して未検証です。両者は同じ重み集合を同じ理由で削減対象にしており、"
+            "組み合わせる意味自体が薄いため v1 では明示的に拒否します)。"
+            "H3_TRANSFORMER_QUANT=none (既定) で使ってください。"
+        )
+    if H3_LOWVRAM_ANY:
+        raise RuntimeError(
+            f"H3_ADALN_PRECOMP=1 と H3_LOWVRAM={H3_LOWVRAM_RAW!r} は併用できません "
+            "(H3_LOWVRAM/H3_LOWVRAM_GROUP はどちらも H3_TRANSFORMER_QUANT=int8 を要求 "
+            "しており、上の int8 拒否と同じ理由で未検証です)。H3_LOWVRAM=0 (既定) で "
+            "使ってください。"
+        )
+    if H3_TURBO_LORA:
+        raise RuntimeError(
+            "H3_ADALN_PRECOMP=1 と H3_TURBO_LORA=1 は併用できません (turbo LoRA は "
+            "adaln_proj.linear を _TurboLoRALinear でラップし、しかもそのラップは "
+            "リクエスト単位で on/off がトグルされます -- precompute() は固定スケジュール "
+            "から一度だけテーブルを焼き、adaln_proj 自体を削除してしまうため、同じ常駐 "
+            "transformer で turbo=True と turbo=False の両方に対応できません。詳細は "
+            "core/adaln_precompute.py のモジュール docstring 参照)。H3_TURBO_LORA=0 "
+            "(既定) で使ってください(リクエスト単位の turbo=True override は "
+            "core/settings.py の validate_instant_settings() が別途 400 で拒否します)。"
+        )
+    logger.info(
+        "H3_ADALN_PRECOMP=1: AdaLN modulation will be precomputed and adaln_proj "
+        "weights freed on every fresh transformer/transformer_ref load (bf16 only, "
+        "~66.3GB -> ~42GB expected resident)."
+    )
+
 
 def _patch_vae_smallclip_decode() -> None:
     """`AutoencoderKLMiniMaxH3._decode()` の潜在1-2フレーム境界バグを runner 側から直す。
@@ -2818,6 +2887,27 @@ def ram_gb() -> dict:
     }
 
 
+def _adaln_precompute_status(self: "MiniMaxH3Runner") -> dict:
+    """`status()` helper: whether each currently-resident transformer instance actually
+    has its AdaLN precompute table built yet (see H3_ADALN_PRECOMP's own module comment
+    and `core/adaln_precompute.py`'s `enable_adaln_precompute()` docstring for why this
+    can lag the `H3_ADALN_PRECOMP` flag itself -- precompute is armed at load time but
+    only fires on the first denoise step of the next request against that instance).
+    `False` (not `None`) when H3_ADALN_PRECOMP is off or the transformer is not loaded,
+    so callers never need a three-way None/True/False check.
+    """
+    if not H3_ADALN_PRECOMP:
+        return {"transformer": False, "transformer_ref": False}
+    from core.adaln_precompute import is_precomputed
+
+    return {
+        "transformer": bool(self._transformer_loaded and is_precomputed(self._pipe.transformer)),
+        "transformer_ref": bool(
+            self._transformer_ref_loaded and is_precomputed(self._pipe_ref.transformer_ref)
+        ),
+    }
+
+
 def _log_gpu_tensor_diag(label: str, top_n: int = 20):
     """TEMPORARY diagnostic (opt-in via H3_DEBUG_MEM_DIAG=1): walks `gc.get_objects()` for
     live CUDA tensors and logs the largest ones by byte size, to find what is actually
@@ -3334,9 +3424,28 @@ class MiniMaxH3Runner:
             logger.info("transformer attention backend set to %r", H3_ATTN_BACKEND)
         if H3_CACHE == "fbc" and not H3_TURBO_LORA:
             self._enable_fbc()
+        if H3_ADALN_PRECOMP:
+            # Arms this fresh transformer instance for AdaLN precompute -- the actual
+            # table build happens lazily, on the first denoise step of whichever request
+            # drives this instance next (see core/adaln_precompute.py's
+            # `enable_adaln_precompute()` docstring). Must re-arm on every fresh load,
+            # not just once at process start: this project's default H3_TE_QUANT=
+            # bnb-4bit steady state fully frees and reloads `transformer` around every
+            # request's decode window (`_free_transformer()`/`_restore_decode_steady_
+            # state()` below), which drops `_h3opt_adaln_cursor` along with the rest of
+            # the module -- the freshly-reloaded instance has no precompute state yet.
+            # Ordering against FBC (`_enable_fbc()`, just above) and turbo (already
+            # rejected at import time when this flag is on, see H3_ADALN_PRECOMP's own
+            # guard block) does not matter here: FBC wraps `block.forward` itself via a
+            # HookRegistry hook, precompute only ever replaces the `block.adaln_proj`
+            # submodule attribute that `block.forward` looks up dynamically on every
+            # call -- the two never touch the same callable.
+            from core.adaln_precompute import enable_adaln_precompute
+
+            enable_adaln_precompute(self._pipe.transformer)
         logger.info(
-            "transformer loaded to GPU in %.1fs (quant=%s, turbo_lora=%s). gpu=%s ram=%s",
-            time.time() - t0, H3_TRANSFORMER_QUANT, H3_TURBO_LORA, gpu_mem_gb(), ram_gb(),
+            "transformer loaded to GPU in %.1fs (quant=%s, turbo_lora=%s, adaln_precomp=%s). gpu=%s ram=%s",
+            time.time() - t0, H3_TRANSFORMER_QUANT, H3_TURBO_LORA, H3_ADALN_PRECOMP, gpu_mem_gb(), ram_gb(),
         )
         # フェーズ境界での中断チェック(loading_transformer)。
         interrupt_controller.check()
@@ -3673,9 +3782,24 @@ class MiniMaxH3Runner:
             logger.info("transformer_ref attention backend set to %r", H3_ATTN_BACKEND)
         if H3_CACHE == "fbc":
             self._enable_fbc_ref()
+        if H3_ADALN_PRECOMP:
+            # Mirrors `_ensure_transformer`'s own arming call -- see that method's
+            # comment for the full rationale (re-arm on every fresh load, ordering vs
+            # FBC does not matter). `enable_adaln_precompute()`'s class-level monkeypatch
+            # of `MiniMaxH3LoopDenoiser.__call__` covers `MiniMaxH3Ref2VALoopDenoiser`
+            # too (same bound method by inheritance, neither subclass overrides
+            # `__call__` -- verified against this project's pinned diffusers commit), so
+            # calling `enable_adaln_precompute()` a second time here (already called once
+            # from `_ensure_transformer`, or will be from a future call) is safe: the
+            # class-patch half is a no-op on the second call (`_h3opt_patched` guard),
+            # only the per-instance `_h3opt_adaln_wanted = True` arming actually happens
+            # against this transformer_ref instance.
+            from core.adaln_precompute import enable_adaln_precompute
+
+            enable_adaln_precompute(self._pipe_ref.transformer_ref)
         logger.info(
-            "transformer_ref loaded to GPU in %.1fs (quant=%s). gpu=%s ram=%s",
-            time.time() - t0, H3_TRANSFORMER_QUANT, gpu_mem_gb(), ram_gb(),
+            "transformer_ref loaded to GPU in %.1fs (quant=%s, adaln_precomp=%s). gpu=%s ram=%s",
+            time.time() - t0, H3_TRANSFORMER_QUANT, H3_ADALN_PRECOMP, gpu_mem_gb(), ram_gb(),
         )
         # フェーズ境界での中断チェック(loading_transformer)。
         interrupt_controller.check()
@@ -4789,6 +4913,15 @@ class MiniMaxH3Runner:
             # UI の `syncStepsToTurbo()` が `TURBO_STEPS_DEFAULT === null` で
             # 黙って no-op になり、turbo を ON にしてもステップが 30 のままだった。
             "turbo_steps_default": H3_TURBO_STEPS_DEFAULT,
+            # H3_ADALN_PRECOMP: the env flag itself, plus whether the table has actually
+            # been *built yet* on each currently-resident transformer -- precompute is
+            # armed at load time but only fires lazily on the first denoise step of the
+            # next request that uses it (see core/adaln_precompute.py's
+            # `enable_adaln_precompute()` docstring), so right after a fresh load these
+            # can be `True`/`False`/`False` (flag on, nothing precomputed yet) until a
+            # request actually runs a denoise step against that instance.
+            "adaln_precomp": H3_ADALN_PRECOMP,
+            "adaln_precomp_built": _adaln_precompute_status(self),
             "gpu": gpu_mem_gb(),
             "ram": ram_gb(),
         }
