@@ -801,3 +801,259 @@ H3_TURBO_LORA_FILE=minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors`)を
 への復元は完了している。
 
 git commit は行っていない(タスク指示どおり)。
+
+---
+
+# ref2va エンコード相プロファイリング(2026-08-27)
+
+「エンコード相(固定費のうち denoise/decode を除いた ~100秒)がどこで消費
+されているか」を、推定ではなく実測で特定するタスク。事前に2つの仮説が
+既に反証されていた: (1) 32B TE の prefill が主因(4B TE_PROJ へ置き換えても
+7〜13秒しか短縮しなかった、本ファイル前半節参照)、(2) vision tower が主因
+(粗い FLOP 見積りでは ~85秒を説明できないとされていた)。**結論: 主犯は
+vision tower の中の、さらに1モジュールだけ ── `Qwen3VLVisionPatchEmbed` の
+`nn.Conv3d`(kernel_size==stride のパッチ化畳み込み)であり、sm_120
+(Blackwell)上でこの形状(バッチ=28160、空間ごく小)が病的に遅いカーネルへ
+落ちることが根本原因と実測で確定した。粗い FLOP 見積りが外れていたのは
+「計算量は妥当なのに実行が異常に遅い」というカーネル選択の問題であり、
+FLOP から時間を逆算する手法自体がこの種の不具合を原理的に検出できない
+ため。**
+
+## 手法
+
+`core/runner.py` に `H3_PHASE_TIMING`(既定 `"0"`、無変更)という新しい
+opt-in 環境変数を追加し、以下を計装した(タスク指示の「衛生オプション
+(a): クリーンで小さいので残す」を選択、git commit はしていないがコードは
+そのまま残置):
+
+- `_PhaseTimer`(新クラス): `generate_ref2va()` 本体の主要チェックポイント
+  (entry_lock / setup_step / text_encode / vae_to_gpu / reference_encoder_step /
+  vocal_lock_latents / vae_to_cpu / ensure_transformer_ref / layout系ステップ /
+  force_free_te)に `.mark()` を挿入。各 `.mark()` は `torch.cuda.synchronize()`
+  してからタイムスタンプを取るため、GPU非同期処理の完了が正しくその
+  チェックポイントに帰属する。
+- `_encode_ref2va_prompt()`(`H3_REF_PREFIX_CACHE_SINGLE=0` のときに通る
+  非キャッシュ経路。本タスクの測定条件そのもの)に同様の内訳
+  (`gather_vision_features` / `build_presentation` / `conditioner_forward`)
+  を追加。既存の `_encode_ref2va_prompt_prefix_cached()`(キャッシュ経路)は
+  同等の `t_key`/`t_prefix` ログを既に持っていたが、非キャッシュ経路には
+  無かったため揃えた。
+- `_install_qwen3vl_submodule_timing(text_encoder)`(新関数): TE ロード
+  成功直後に一度だけ呼ばれ、`text_encoder.model`(`Qwen3VLModel`)の
+  `get_image_features`(vision tower 全体)と `language_model.forward`
+  (テキストデコーダ)をランタイムでラップしてタイミングを取る。さらに
+  1段深く、`text_encoder.model.visual`(`Qwen3VLVisionModel`)の
+  `patch_embed.forward`(Conv3d 1回)・27個の `blocks[i].forward` の合計・
+  `merger.forward` も個別に計測する。**diffusers/transformers 本体
+  (venv)は一切変更していない** ── `core/runner.py` からランタイムで
+  bound method を差し替えているだけで、モデルの計算内容・戻り値は無変更。
+- 全ての追加コードは `H3_PHASE_TIMING=0`(既定)のとき単一の早期 return の
+  みで、CUDA sync もログ出力も一切発生しない(ゼロオーバーヘッド)。
+
+計測はゲートウェイ経由で `preset=96gb-int8` +
+`H3_TURBO_LORA_FILE=minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors` +
+`H3_VOCAL_LOCK=1` + `H3_REF_PREFIX_CACHE_SINGLE=0` + `H3_PHASE_TIMING=1` を
+ロードし、同一リクエスト(ref2va、768×448、8秒、turbo=true、seed=777、
+参照は `ref.png`(768×448 の実写風女性ポートレート)+ `ref.wav`)を2回連続
+実行(run1=初回・run2=定常状態)。`nvidia-smi
+--query-gpu=utilization.gpu,memory.used --format=csv,noheader` を1〜2秒間隔で
+バックグラウンドポーリングし、GPU使用率が高い区間かどうかを region 単位で
+突き合わせた。
+
+## 結果: サブフェーズ内訳(run2、定常状態)
+
+| サブフェーズ | 秒数 | CPU/GPU | 全体(~100s)に対する割合 |
+|---|---|---|---|
+| entry_lock(free_transformer+ensure_vaes+load_te+sync) | 0.00s | - | 0% (bnb-4bit常駐、no-op) |
+| setup_step(reference_normalize/resize、PIL LANCZOS) | 0.05〜0.09s | CPU | <0.1% |
+| **text_encode 内訳** | **91〜97s** | **GPU(後述)** | **~92%** |
+| ├─ gather_vision_features(processor: 画像→pixel_values) | 0.13〜0.16s | CPU | <0.2% |
+| ├─ build_presentation(トークナイズ) | 0.00〜0.01s | CPU | ~0% |
+| └─ conditioner_forward(`text_encoder.model(...)` 1回) | 90.4〜96.7s | **GPU** | **~92%** |
+| 　├─ **`get_image_features`(vision tower 全体)** | **90.1〜94.7s** | **GPU** | **~90%** |
+| 　│　├─ **`visual.patch_embed`(Conv3d、kernel==stride)** | **91.9〜94.1s** | **GPU** | **~90%(単体でほぼ全部)** |
+| 　│　├─ `visual.blocks`(27層 self-attn+MLP、合計) | 0.57〜0.59s | GPU | ~0.6% |
+| 　│　└─ `visual.merger` | 0.00s | GPU | ~0% |
+| 　└─ `language_model`(テキストデコーダ、64層、~7300トークン) | 1.92〜2.05s | GPU | ~2% |
+| to_compute_device | 0.00s | - | 0% |
+| vae_to_gpu(VAE CPU→GPU、bnb-4bit専用のフェーズ切替) | 2.05〜6.36s | GPU(小) | ~3% |
+| reference_encoder_step(参照画像のVAEエンコード) | 2.09〜2.40s | GPU(小) | ~2% |
+| vocal_lock_latents(音声VAEエンコード) | 0.04〜0.05s | GPU(小) | ~0% |
+| vae_to_cpu(VAE GPU→CPU) | 3.43〜4.66s | GPU(小) | ~4% |
+| ensure_transformer_ref | 0.00s(定常) / 35〜39s(初回のみ) | - | 定常0%、初回別枠 |
+| layout+condition_latents+latents+ref2va_latents+timesteps | 0.04〜0.05s | CPU/小GPU | <0.1% |
+| **合計(force_free_te込み、denoise開始まで)** | **99〜105s** | - | **100%** |
+
+4回の独立した実行(初回×2、定常×2、うち1回はさらに vision tower 内部の
+サブモジュール分解込み)すべてで同じ内訳が再現し、`visual.patch_embed`
+単体が固定費の 87〜90%(vision tower 自体の 97〜99%)を占めることを確認
+した。実測ログ抜粋(定常状態、run2):
+
+```
+visual.patch_embed (Conv3d, kernel==stride): 94.12s (input=(28160, 1536))
+visual.merger: 0.00s
+visual.blocks (all 27 Qwen3VLVisionBlock, sum): 0.57s
+Qwen3VLModel.get_image_features (vision tower): 94.70s (pixel_values=(28160, 1536), image_grid_thw=[[1, 128, 220]])
+Qwen3VLModel.language_model (text decoder, 64 layers): 1.94s
+```
+
+**GPU使用率の帰属**: `visual.patch_embed` の90秒間、GPU0 は 1〜2秒間隔の
+サンプリングで一貫して **50〜57%使用率**(アイドルではない、CPU律速でも
+ない)、しかし電力は **128.6W**(このカードのTDP ~300Wに対し明確に低い)。
+低電力×中程度使用率×90秒という組み合わせは、「大きな計算をフルスループット
+で回している」のではなく「多数の小さなサブカーネルを逐次発行している」
+ことを示唆する典型的なシグネチャで、後述の完全単離マイクロベンチマークの
+結果と整合する。
+
+## 根本原因の特定
+
+`transformers/models/qwen3_vl/modeling_qwen3_vl.py` の
+`Qwen3VLVisionPatchEmbed`:
+
+```python
+kernel_size = [self.temporal_patch_size, self.patch_size, self.patch_size]  # [2, 16, 16]
+self.proj = nn.Conv3d(self.in_channels, self.embed_dim, kernel_size=kernel_size, stride=kernel_size, bias=True)
+
+def forward(self, hidden_states):
+    hidden_states = hidden_states.view(-1, self.in_channels, self.temporal_patch_size, self.patch_size, self.patch_size)
+    hidden_states = self.proj(hidden_states.to(dtype=target_dtype)).view(-1, self.embed_dim)
+    return hidden_states
+```
+
+これは `/home/animede/diffusers-server/CLAUDE.md` の46番(JoyAI-Image-Edit-Plus
+統合時に発見)が記録している「**kernel_size==stride のパッチ化 Conv3d を
+極小パッチ×大量バッチで叩く形状が、sm_120(Blackwell)上で cuDNN の病的
+カーネルに落ち、1呼び出しで数十秒かかる**」というパターンと寸分違わず一致
+する。本タスクのGPU(RTX PRO 6000 Blackwell Workstation Edition /
+RTX PRO 4000 Blackwell、いずれも `compute_cap 12.0` = sm_120)はまさに
+その対象アーキテクチャ。
+
+参照画像1枚(768×448)を `H3_REF_IMAGE_SHORT_EDGE`(既定2048px)の短辺基準で
+リサイズすると 3520×2048 相当になり、Qwen3-VL の patch_size=16 で
+128×220=28160 パッチ、`Conv3d` の入力は `(28160, 3, 2, 16, 16)`(バッチ
+28160・空間はわずか 2×16×16)という、まさに「極小パッチ×大量バッチ」の
+形状になる。
+
+### 完全単離マイクロベンチマークでの確認
+
+サーバプロセスを一切介さない、単独スクリプト(`torch.nn.Conv3d` を実測と
+同一形状で構築し bf16/cuda に置くだけ)で追試した:
+
+```
+Conv3d single call:            89.961s   (output shape (28160, 1152))
+Linear-equivalent single call:  0.0013s   (output shape (28160, 1152))
+max abs diff: 1.5625e-02   mean abs diff: 6.18e-07
+SPEEDUP: 68942.7x
+```
+
+`kernel_size==stride` の Conv3d は数学的に
+`F.linear(x.flatten(1), conv.weight.reshape(out_ch, -1), conv.bias)` と
+完全等価(CLAUDE.md 46番と同じ変換)。誤差は bf16 丸め誤差の水準
+(mean abs diff 6.18e-07、CLAUDE.md 46番の「3.9e-03 = bf16丸め誤差レベル」と
+同種の整合)で、数値的には別物ではない。**サーバ経由の計測(vision tower
+全体で90〜95秒、うち patch_embed が90〜94秒)と、この完全単離ベンチマーク
+(Conv3d単体90.0秒)が独立に一致した**ことで、原因の特定に高い確信を持てる
+(bnb-4bit・32Bモデルコンテキスト・denoiseループ等、他の要因が一切関与
+しない環境で同じ数十秒の遅延が再現したため)。
+
+### 歴史的ログとの整合性(トークン数に対する線形スケーリング)
+
+過去の `H3_REF_PREFIX_CACHE_SINGLE=1`(キャッシュ)構成での "cache MISS" ログ
+58件を集計すると、プレフィックストークン数とエンコード時間がほぼ完全に
+線形(トークンあたり ~12.6ms、`patch_embed` がバッチサイズ=パッチ数に
+比例する構造と整合):
+
+| プレフィックストークン数 | n | 平均秒数 | ms/1000トークン |
+|---|---|---|---|
+| 1832〜1837 | 19 | 23.1s | 12.6 |
+| 4093〜4109 | 19 | 51.8s | 12.6 |
+| 7309(本タスクの768×448画像相当) | 58 | 95.0s | 13.0 |
+
+この線形性(2次でも定数項が支配的でもない)は、「大きなGEMMの実行効率が
+悪い」のではなく「バッチ要素(パッチ)ごとにほぼ固定のオーバーヘッドを
+持つカーネルが逐次発行されている」という仮説(低電力・中使用率の
+GPUシグネチャとも整合)を裏付ける。
+
+## 109.7秒(cache miss)と66.3秒(cache hit、旧記録)の整合
+
+`gateway/backends.py` の `96gb-int8` プリセット説明文にある「固定費66.3秒
+(参照エンコード~55秒 + VAE往復11.6秒)」は、**`H3_REF_PREFIX_CACHE_SINGLE=1`
+(既定、本番運用値)でのキャッシュ HIT を含む測定**だった。キャッシュ HIT
+時は `_encode_ref2va_prompt_prefix_cached()` が前回リクエストで構築済みの
+KV キャッシュ(プレフィックス = 参照画像由来のビジョンブロック)を再利用し、
+`visual.patch_embed` を含む重い prefill forward を**完全にスキップ**する
+(プロンプト末尾のみを再エンコードする継続呼び出しだけが走る)。
+
+これを裏付ける証拠: 同ログの `cache HIT` ログの `key prep` 時間
+(`_gather_vision_features` + `_build_presentation` のみ、Conv3d 実行を含まない)
+は 0.13〜0.27秒と、本タスクで計測した `gather_vision_features` 単体
+(0.13〜0.16秒)とほぼ一致する。すなわちキャッシュ HIT 時、参照画像側の
+処理はこの「軽い」前処理だけで完結し、90秒の Conv3d 呼び出し自体が
+一度も発生しない。
+
+一方、本タスク(タスク指示に従い `H3_REF_PREFIX_CACHE_SINGLE=0` で測定、
+MV本番は毎回異なる参照画像を使うためキャッシュヒットが実運用を代表しない
+という本ファイル前半節の判断を踏襲)は**リクエストごとに必ずキャッシュ
+MISS**となり、90秒の Conv3d 呼び出しが毎回発生する。「66.3秒」と
+「109.7秒」の差(~43秒)が90秒ちょうどにならないのは、(1) 66.3秒の内訳に
+含まれる「VAE往復11.6秒」相当が両条件で共通に発生する固定費であること、
+(2) キャッシュ HIT でも継続呼び出し(プロンプト末尾のみ、テキストデコーダ
+64層)は毎回走ること、(3) 実際の運用環境・実測日・GPU共有状況が完全には
+同一条件でないこと、による。**結論としては「66.3秒 vs 109.7秒」の差の
+正体は cache hit/miss による「90秒の Conv3d 呼び出しをスキップできるか
+どうか」であり、値そのものの厳密な差し引きが1:1で一致しないのは上記の
+副次的な要因の重ね合わせのため**(この副次要因の精密な切り分けは本タスクの
+範囲外)。
+
+## 修正候補(報告のみ、実装はしていない)
+
+| 候補 | 推定削減効果 | リスク | 備考 |
+|---|---|---|---|
+| **`Qwen3VLVisionPatchEmbed.forward()` をランタイムパッチで linear-equivalent に置換**(`core/runner.py` から transformers 本体は無変更のまま bound method 差し替え、CLAUDE.md 46番と同じ手法) | **~90秒 → ~0.001秒**(定常状態の固定費が ~100秒 → ~10秒程度まで縮む可能性、実測の `SPEEDUP: 68942.7x` に基づく) | **低**(数学的に完全等価、誤差はbf16丸め誤差レベルのみ。既存の `_install_qwen3vl_submodule_timing` と同型のランタイムパッチ機構が既にこのタスクの計装コードとして実証済み) | **最有力候補**。ただし `merge_with_config_defaults`/`capture_outputs` デコレータ済みの `Qwen3VLVisionModel.forward` が呼ぶ内部経路であり、`torch.compile`・deepstack機構等への副作用がないか要検証。本タスクは計測のみで実装はしていない |
+| キャッシュ運用の拡大(`H3_REF_PREFIX_CACHE_SINGLE` の適用条件見直し、例: 同一参照が続く場面だけ自動検出してキャッシュを使う) | 条件が合えば ~90秒削減(既に実証済みの機構の適用範囲拡大) | 低〜中(既存機構の再利用だが、MV本番は「毎回異なる参照画像」なのでヒット率が構造的に低い。本ファイル前半節の判断どおり本番のユースケースには効果が薄い) | 参照画像を使い回す用途(例: 同一キャラクターの複数場面生成)には有効 |
+| `H3_REF_IMAGE_SHORT_EDGE` を下げる(トークン数削減) | 線形スケーリング(12.6ms/token)に従い比例削減。例: 2048→1024 なら概ね半分程度(パッチ数はおおよそ短辺の2乗に比例するため、単純な半減より大きい可能性もある。未実測) | 中(参照の細部再現度が下がる、`core/runner.py` の該当コメントに明記の通りA/B未検証) | Conv3d自体の根本修正ではなく回避策。品質とのトレードオフが必要 |
+| bitsandbytes/transformers のアップグレードでカーネル選択が改善するのを待つ | 不明(このプロジェクトの経緯からは楽観できない、CLAUDE.md 46番の事例は自前パッチで解決している) | 低(何もしないだけ) | 上流(cuDNN/PyTorch/transformers)側の改善を待つ受動的な選択肢。時期不明 |
+
+**推奨は1番目**(ランタイムパッチによる linear-equivalent 置換)。理由:
+(a) 数学的に完全等価(CLAUDE.md 46番で実証済みの手法をそのまま踏襲でき、
+本タスクの計装コード自体が同種のランタイムパッチが問題なく機能することを
+示している)、(b) 効果が実測(単離ベンチマークで68942倍)で確定している、
+(c) MV本番の「毎回異なる参照画像」というキャッシュが効かないユースケースに
+直接効く(2番目の候補と異なり、ヒット率に依存しない)。ただし本タスクは
+「計測して原因を特定する」ことがスコープであり、修正の実装は行っていない
+(タスク指示どおり)。
+
+## 未検証事項
+
+1. 上記パッチ候補を実際に適用した場合の、`Qwen3VLVisionModel.forward()`
+   内の他の経路(`deepstack_merger_list`、`_can_record_outputs` による
+   hidden_states/attentions 記録機構)への影響は未検証。
+2. `H3_REF_IMAGE_SHORT_EDGE` を下げた場合の、パッチ数(≒エンコード時間)の
+   厳密なスケーリング則(短辺の1乗か2乗か)は実測していない(理論上は
+   面積(2乗)に近いはずだが、アスペクト比・32の倍数丸めの影響で単純では
+   ない)。
+3. 動画参照(image ではなく video reference)を持つリクエストでの
+   `pixel_values_videos` 経路(`get_video_features`)は同じ
+   `Qwen3VLVisionPatchEmbed` を共有するため同型の問題を抱えている可能性が
+   高いが、本タスクでは画像参照のみで検証しており動画参照では未検証。
+4. 「66.3秒 vs 109.7秒」の副次的な差(上記「整合」節参照)の精密な内訳は
+   未検証(本タスクの主眼である「vision towerのConv3dが主犯」という結論
+   には影響しない)。
+5. 他のファミリー(t2va/fl2va、`_encode_h3_prompt` 経由)でキーフレーム画像を
+   使う場合も同じ `Qwen3VLVisionPatchEmbed` を通るため同型の問題を抱えて
+   いる可能性が高いが、本タスクは ref2va のみを対象とした(スコープ外)。
+
+## 復元確認
+
+`POST /api/v1/backend/load` で `preset=96gb-int8` + 元の overrides
+(`H3_REF_PREFIX_CACHE_SINGLE=1, H3_VOCAL_LOCK=1,
+H3_TURBO_LORA_FILE=minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors`、
+`H3_PHASE_TIMING` は明示せず既定の `"0"` のまま)を再ロード。`/api/status` で
+`transformer_quant: "int8"`、`text_encoder_loaded: true`、
+`gpu.allocated_gb: 55.04`(検証開始前の初期値と完全一致)を確認。本番設定
+への復元は完了している。
+
+`core/runner.py` の `H3_PHASE_TIMING` 計装コードはそのまま残置している
+(衛生オプション(a)、既定 `"0"` で完全に無効・ゼロオーバーヘッド、
+`git status` は `M backends/minimax-h3/core/runner.py` のみ)。git commit は
+行っていない(タスク指示どおり)。
