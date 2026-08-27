@@ -1057,3 +1057,187 @@ H3_TURBO_LORA_FILE=minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors`、
 (衛生オプション(a)、既定 `"0"` で完全に無効・ゼロオーバーヘッド、
 `git status` は `M backends/minimax-h3/core/runner.py` のみ)。git commit は
 行っていない(タスク指示どおり)。
+
+## patch_embed Conv3d→linear 等価置換(2026-08-27)
+
+直前のセクション(「修正候補(報告のみ、実装はしていない)」)で特定された
+`Qwen3VLVisionPatchEmbed.proj`(sm_120 の病的低速 Conv3d、kernel==stride)を
+実装した。diffusers-server リポジトリの CLAUDE.md #46(JoyAI-Image-Edit-Plus
+統合)が同一パターンを既に実証済みで、その `PatchifyLinear` 実装
+(`families/joyai/pipeline.py`)を移植した。
+
+### 機構
+
+`kernel_size == stride` の Conv3d は出力位置が入力ごとに1つしかないため、
+`conv(x).view(N, out_ch)` は数学的に
+`F.linear(x.flatten(1), conv.weight.reshape(out_ch, -1), conv.bias)` と
+完全等価。このプロジェクトの pinned transformers の
+`Qwen3VLVisionPatchEmbed.forward()` を直接読み、入力を
+`(-1, in_channels, temporal_patch_size, patch_size, patch_size)` に
+view してから `self.proj(...)` を呼ぶことを確認した(バッチ次元が先頭、
+他の軸並べ替えなし)ため、`x.flatten(1)` がそのまま
+`conv.weight.reshape(out_ch, -1)` の `(in_ch, kt, kh, kw)` フラット化と
+一致し、追加の permute は不要と確定させた(JoyAI 側と偶然一致しているが、
+本タスクで独立に読んで確認したものであり仮定ではない)。
+
+### 実装(`core/runner.py`)
+
+- `H3_PATCH_EMBED_LINEAR`(既定 `"1"`)モジュール変数を新設(`H3_PHASE_TIMING`
+  のすぐ後ろ)。`"0"` で従来の Conv3d に戻せる。
+- `_PatchEmbedLinear`(`torch.nn.Module`)を新設。JoyAI の `PatchifyLinear`
+  と同じ罠(`Qwen3VLVisionPatchEmbed.forward()` が `self.proj.weight.dtype`
+  を読むため `weight`/`bias` プロパティが必須)を踏襲した。JoyAI 版との違いは
+  `forward()` の返り値: JoyAI の `img_in` は呼び出し元が5D形状を期待するため
+  reshape して返すが、`Qwen3VLVisionPatchEmbed.forward()` は自分で
+  `.view(-1, embed_dim)` するので `_PatchEmbedLinear.forward()` は素の2D
+  `(N, out_channels)` をそのまま返す(ソースを読んで確認済み、JoyAI の実装を
+  盲目的にコピーしていない)。
+- `_install_patch_embed_linear(text_encoder)`: `text_encoder.model.visual
+  .patch_embed.proj` が Conv3d ならインスタンス単位で `_PatchEmbedLinear` へ
+  置換する(`isinstance` ガードで冪等)。**32B TE 経路と `H3_TE_PROJ`(4B)
+  経路の両方を無分岐でカバーする**: どちらも `AutoModelForImageTextToText`
+  経由でロードされる `Qwen3VLModel` インスタンスで、`.model.visual` を同じ
+  形で持つため(4B は `hidden_size=1024`、32B は `1152`、depth も 24 vs 27 と
+  異なるが、パッチ対象のクラス自体は共通)。
+- 呼び出し箇所は、既存の `_install_qwen3vl_submodule_timing(...)`(前セクション
+  で作られた計装、`H3_PHASE_TIMING` 用)と全く同じ4箇所
+  (`_load_te_from_prequant`/`_load_text_encoder_proj`/`_load_text_encoder` の
+  bnb-4bit 分岐/none 分岐)。**新しい `text_encoder` インスタンスがロードされる
+  たびに再武装が必要**という同じ理由(`_install_qwen3vl_submodule_timing`の
+  docstring 参照)で同じ場所に揃えた。
+
+### 数値プリチェック(本番サーバに触れないオフラインスクリプト)
+
+`MiniMaxAI/MiniMax-H3` の `FL2VA/text_encoder` は vision tower の全351キーが
+単一シャード(`model-00014-of-00014.safetensors`)に収まる(index.json の
+weight_map で確認)ことを利用し、32B 言語デコーダを一切ロードせず vision
+tower だけを単体構築して実画像(`ref.png`)で比較する専用スクリプトを書いた
+(`Qwen3VLVisionModel` を config から作り、このシャードだけ `load_state_dict`)。
+
+- **patch_embed 単体出力**(hidden_states[0], perturbation の起点):
+  `mean_abs_diff=1.48e-07`、`max_abs_diff=1.56e-02`、`cosine_sim=1.00000000`
+  -- bf16 丸め誤差の水準そのもの(タスクブリーフに書かれた孤立マイクロベンチの
+  `6.18e-07` と同じオーダー)。
+- **vision tower 最終出力**(27ブロック+merger 通過後、`last_hidden_state`):
+  `mean_abs_diff=0.338`、`max_abs_diff=1632`、`cosine_sim=0.99907`
+  ("`|a| mean_abs=11.88 / max_abs=10816`" に対する相対誤差)。
+  単独で見ると一見大きく見えたため、追加で2つの対照実験を行った:
+  1. **同一モデル・同一入力を2回呼ぶだけの決定性チェック**: `max_abs_diff=0`
+     (完全ビット一致)。SDPA/cuDNN のカーネル選択非決定性が原因ではないことを
+     確定。
+  2. **意図的な摂動対照実験**: patch_embed 出力に conv-vs-linear の実差
+     (mean 1.48e-07)より **約6000倍大きい** ランダム摂動(bf16 ULP スケール、
+     mean 8.78e-04)を注入して同じ27ブロック+merger を通したところ、
+     最終出力は `mean_abs_diff=6.74`、`cosine_sim=0.760` まで悪化した。
+     実際の conv→linear 差(cosine 0.999)は、これよりずっと小さい摂動が
+     ずっと小さい最終差に留まっており、**27層の自己注意ネットワークが
+     bf16 スケールの入力摂動を増幅するのは(このconv→linear置換に限らず)
+     通常の挙動であり、この置換固有の異常ではない**ことを確認した。
+  3. **hidden_states を逐次比較**(28エントリ: embedding出力+27ブロック)した
+     ところ、diff はブロックを追うごとに単調に増加(1e-7 → 6.5e-2、block 0
+     → block 26)し、merger 通過後の最終層でのみジャンプする(0.065 →
+     0.338)。急な非線形性の蓄積であり、特定ブロックでの異常ではないことも
+     確認した。
+
+これらから、数値プリチェックは「bf16 丸め誤差レベル」の基準を満たしたと
+判断した(起点の diff がまさにその水準で、下流の増幅は置換固有ではなく
+27層ネットワーク一般の性質であることを対照実験で示した)。
+
+検証スクリプト:
+`scratchpad/h3_patchembed_fix/numerical_precheck_v2.py`(hidden_states 逐次
+比較込み)、`numerical_precheck_v3.py`(ULP 摂動対照実験)。
+
+### 速度: ゲートウェイ経由の実測
+
+`POST /api/v1/backend/load` で `preset=96gb-int8` +
+`H3_TURBO_LORA_FILE=minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors,
+H3_VOCAL_LOCK=1, H3_REF_PREFIX_CACHE_SINGLE=0, H3_PHASE_TIMING=1`
+(MV本番相当、cache-miss)。768x448、8秒、turbo=true、seed=777、
+`references=[ref.png, ref.wav]`(画像+音声参照、vocal_lock 用)。
+
+| 実行 | `visual.patch_embed` | `conditioner_forward` | encode phase 計 (`generate_ref2va`) | `total_elapsed_s` | `peak_vram_gb` |
+|---|---|---|---|---|---|
+| 昨日のベースライン(記録値) | ~90-94s | ~90-97s | ~99-145s | **142.4s** | - |
+| ON run1(フラグ既定=ON、cold: transformer_ref 未ロード) | 0.10s | 2.85s | 53.89s | 98.14s | 73.56GB |
+| **ON run2**(フラグ既定=ON、warm: transformer_ref ロード済み) | **0.00s** | **2.58s** | **10.98s** | **53.38s** | 73.82GB |
+| CONTROL(`H3_PATCH_EMBED_LINEAR=0`、cold) | 90.22s | 93.04s | 144.98s | ~185s(ポーリング実測、curlクライアント側は2分でタイムアウトしたがサーバ側は完走) | 73.56GB |
+
+run2(定常状態、transformer_ref 再ロード無し)が目標の「encode phase
+~100s → ~10s、total 142.4s → ~50s」にほぼ一致する結果になった
+(encode phase 10.98s、total 53.38s)。CONTROL 実行はフラグが正しく
+病的経路へ切り替わることを確認する目的どおり、旧ベースラインとほぼ同じ
+数値(`visual.patch_embed=90.22s`、encode phase 計 144.98s)を再現した。
+VRAM は ON/CONTROL とも 73.56-73.82GB で実質同一(この修正は速度のみに
+効き、VRAM 使用量は変えない設計どおり)。
+
+### 品質 A/B
+
+ON run2 と CONTROL の出力 mp4 は **バイト単位で異なる**
+(`md5sum` で確認、bf16 丸め誤差が denoise より上流(条件付け)で変わる以上
+当然の結果)。フレーム 0/96/190、および手/腕を含む 100/105/110 を両方から
+抽出し(`scratchpad/h3_patchembed_fix/frames/`)、`ref.png` と合わせて
+目視比較した。
+
+- **被写体の同一性**: 前髪・輪郭は両方とも一致。**髪飾り(蝶結び型の
+  クリップ)・イヤモニ(黒)・白ブラウスの黒リボン(襟元+袖口)**が
+  ON/CONTROL/ref とも一貫して再現されている(frame190 で特に明瞭)。
+- **解剖学的健全性(手/腕、frame 96/100/105/110)**: マイクを握る手の指の
+  巻き付き方・親指の位置とも ON/CONTROL どちらにも崩れ(指の融合・余分な
+  指・不自然な関節)は見られなかった。
+- **シーン一貫性**: ジャズクラブの背景(照明、コントラバス奏者2名、
+  バーカウンター)は両方とも安定して再現され、破綻なし。
+- 音声(vocal_lock): ON/CONTROL の抽出音声(WAV化)は **`np.array_equal`で
+  完全ビット一致**(RMS 0.0848、両方同一)、`ref.wav` との包絡線相関は
+  両方とも **0.926**(タスクの目安 ~0.95 に近いが完全一致ではない -- ただし
+  ON/CONTROL間で差が皆無なので、この相関値自体はこの修正と無関係な
+  vocal_lock パイプライン自体の特性)。音声パスはこの修正の影響を一切
+  受けないことが実測で確定した。
+
+以上より、品質面での劣化は確認されなかった。
+
+比較用フレーム: `scratchpad/h3_patchembed_fix/frames/{ON,CONTROL}_frame{0,96,
+100,105,110,190}.png`、`frames/ref.png`。動画本体:
+`scratchpad/h3_patchembed_fix/{ON_run1,ON_run2,CONTROL_run1}.mp4`。
+
+### H3_TE_PROJ(4B)経路のスモークテスト
+
+`H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3` を追加指定してロードし、同一
+リクエストを1回実行。ログで
+`[H3_PATCH_EMBED_LINEAR] replaced ... weight=(1024, 1536) ...` を確認
+(32B 側の `weight=(1152, 1536)` と異なるインスタンス・形状であることが
+ログから裏付けられる = 4B vision tower にも独立に適用されたことの直接証拠)。
+`visual.patch_embed=0.12s`、`conditioner_forward=1.09s`、encode phase 計
+1.25s、HTTP 200 で完走(denoise/decode とも正常値)。分岐なしの実装が
+狙いどおり両経路をカバーしていることを確認した。
+
+### 復元確認
+
+`POST /api/v1/backend/load` で `preset=96gb-int8` + 元の overrides
+(`H3_REF_PREFIX_CACHE_SINGLE=1, H3_VOCAL_LOCK=1,
+H3_TURBO_LORA_FILE=minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors`、
+`H3_PATCH_EMBED_LINEAR` は明示せず既定の `"1"` のまま)を再ロード。
+`/api/status` で `transformer_quant: "int8"`、`te_quant: "bnb-4bit"`、
+`gpu.allocated_gb: 55.04`(検証開始前と完全一致)、`busy: false` を確認。
+ログにも `[H3_PATCH_EMBED_LINEAR] replaced ...` が再ロード時に出力されて
+おり、**本番は今このパッチ適用済みの状態で稼働している**(フラグ既定が
+ON のため、これは意図した挙動 -- 本タスクの目的そのもの)。
+
+### 未検証事項
+
+1. LTX-2.3 側や他バックエンドに同型の kernel==stride Conv3d パッチ化層が
+   無いかは確認していない(本タスクは MiniMax-H3 の Qwen3-VL vision tower
+   限定)。
+2. `H3_REF_PREFIX_CACHE_SINGLE=1`(本番既定)でのキャッシュヒット時の
+   encode phase 短縮効果は今回未計測(本タスクはキャッシュミス条件のみ
+   検証、タスクブリーフの指定どおり)。
+3. 動画参照(`pixel_values_videos` 経由の `get_video_features`)や t2va/fl2va
+   側のキーフレーム画像経路も同じ `Qwen3VLVisionPatchEmbed` を通るため
+   同様の高速化が効くはずだが、本タスクは ref2va のみで検証した(前セクション
+   の未検証事項5と同じスコープ外表明を踏襲)。
+4. `_PatchEmbedLinear` の buffer は `register_buffer` で保持しているため
+   `state_dict()`/`.to()`/`half()` 等の通常の nn.Module 操作には追従するが、
+   `save_pretrained()` 等でこの text_encoder を保存し直すユースケース
+   (`H3_TE_PREQUANT` の保存経路)がこの置換後の状態を正しく扱えるかは
+   直接検証していない(`_load_te_from_prequant`/`_save_te_prequant` の
+   呼び出し順序上、保存は置換の**前**に行われる設計になっているため実害は
+   無いはずだが、明示的な保存→再ロードのラウンドトリップ検証は行っていない)。
