@@ -184,6 +184,34 @@ def validate_instant_settings(resolved: dict) -> None:
             "LoRA (lightx2v/Minimax-h3-Turbo) or change the reload-group settings."
         )
 
+    # H3_ADALN_PRECOMP + turbo=True: a real structural conflict, not just an unverified
+    # combination -- see core/adaln_precompute.py's module docstring for the full
+    # derivation. Short version: the turbo LoRA checkpoint wraps every block's
+    # `adaln_proj.linear` in a `_TurboLoRALinear` toggled per-request
+    # (`_TurboLoRALinear.enabled`, see `set_turbo_lora_enabled()`) on an already-resident
+    # transformer instance, while AdaLN precompute bakes one frozen table from a fixed
+    # schedule and deletes `adaln_proj` (including that same `.linear` submodule)
+    # outright -- there is no way for one resident transformer to serve both a
+    # turbo=True and a turbo=False request off the same precomputed table, or to
+    # re-wrap turbo LoRA onto a `PrecomputedModulation` module that no longer has a
+    # `.linear` attribute at all. Checked here (not just at import time against the
+    # H3_TURBO_LORA env default, see runner.py's H3_ADALN_PRECOMP guard block) because
+    # turbo is a per-request instant-apply override: an operator can run with
+    # H3_TURBO_LORA=0 (env default) and H3_ADALN_PRECOMP=1 together (that combination is
+    # NOT rejected at import time) and then send a single request with turbo=True, which
+    # must be caught here instead.
+    if resolved["turbo"] and runner.H3_ADALN_PRECOMP:
+        raise ValueError(
+            "turbo=1 is not supported while H3_ADALN_PRECOMP=1 (this process's env "
+            "config): the turbo LoRA wraps adaln_proj.linear and toggles per-request on "
+            "an already-resident transformer, while AdaLN precompute bakes one frozen "
+            "modulation table from a fixed schedule and deletes adaln_proj entirely -- "
+            "one resident transformer cannot serve both turbo=True and turbo=False "
+            "requests off the same precomputed table. See core/adaln_precompute.py's "
+            "module docstring for the full derivation. Restart the server with "
+            "H3_ADALN_PRECOMP=0 to use turbo, or drop turbo=True from the request."
+        )
+
 
 def validate_instant_settings_for_upscale(resolved: dict, do_upscale: bool) -> None:
     """`upscale=1` (hires-fix) + turbo=1 works and is the recommended way to run
@@ -257,6 +285,12 @@ def current_settings_snapshot() -> dict:
             "turbo_incompatible_with_lowvram_group": True,
             "turbo_incompatible_with_transformer_both_resident": runner.turbo_lora_expected_format() == "comfy",
             "turbo_incompatible_with_upscale": False,
+            # H3_ADALN_PRECOMP (process-wide env flag, not a reload-group field -- see
+            # runner.py's own module comment) unconditionally rejects turbo=True,
+            # regardless of LoRA checkpoint format (see validate_instant_settings()'s
+            # matching guard above for why this one is not format-conditional like the
+            # three above it).
+            "turbo_incompatible_with_adaln_precomp": runner.H3_ADALN_PRECOMP,
             "transformer_both_resident": runner.H3_TRANSFORMER_BOTH_RESIDENT,
             # te_proj (H3_TE_PROJ, 4B+投影) が ON のとき te_quant/te_prune は無効:
             # 32B TE 自体をロードしないため、この2つを変えても何も起きない (適用しても
