@@ -231,6 +231,197 @@ TE_QUANT = os.environ.get("H3_TE_QUANT", "bnb-4bit").strip().lower()
 if TE_QUANT not in ("none", "bnb-4bit"):
     raise ValueError(f"H3_TE_QUANT must be 'none' or 'bnb-4bit', got {TE_QUANT!r}")
 
+# EXPERIMENTAL, opt-in, diagnostic-only (2026-08-27 ref2va encode-phase profiling task).
+# "0" (default) = zero overhead, byte-for-byte identical to pre-this-flag behaviour --
+# every `_PhaseTimer.mark()`/`.report()` call below is a single `if not H3_PHASE_TIMING:
+# return` early-out, no timing, no CUDA sync, no logging. "1" = emits one INFO log line
+# per named checkpoint inside `generate_ref2va()` (and the handful of shared helpers it
+# calls -- `_ensure_vaes`/`_load_text_encoder`/`_vae_to_gpu`/`_vae_to_cpu`/
+# `_ensure_transformer_ref` already have their own unconditional timing logs; this flag
+# only adds NEW checkpoints inside the encode phase those don't cover: reference
+# setup/normalize (PIL resize), vision-tower feature gathering, presentation tokenize,
+# and the 32B/4B conditioner forward itself) with a `torch.cuda.synchronize()`
+# immediately before each timestamp so GPU-async work (the conditioner forward, VAE
+# encode) is attributed to the checkpoint that actually did it rather than bleeding into
+# the next (CPU-only) one. Never changes control flow, return values, or what is
+# computed -- purely additive logging for profiling `docs/h3-adaln-precompute-
+# 20260826.md`'s open question ("~100s of fixed cost, TE-size and vision-tower FLOP
+# estimates both failed to explain it -- where does the time actually go?").
+H3_PHASE_TIMING = os.environ.get("H3_PHASE_TIMING", "0").strip() == "1"
+
+
+class _PhaseTimer:
+    """Tiny opt-in wall-clock breakdown, one instance per `generate_ref2va()` call.
+
+    `mark(label)` records the elapsed time since the previous `mark()` (or since
+    construction, for the first call) under `label`, CUDA-synced first so GPU-async work
+    lands on the checkpoint that issued it rather than the next one. `report()` logs the
+    full breakdown plus a sum-check against the caller-supplied total. A fresh instance
+    per call (rather than a module-level singleton) means concurrent requests -- were
+    this ever called from more than one thread, which today's single `_load_lock`/
+    `generation_lock` structure prevents -- can never interleave their marks; not
+    exercised by this task (H3 serializes generation), but cheap to get right.
+
+    No-op-shaped when `H3_PHASE_TIMING=0`: `mark()`/`report()` both check the flag first
+    and return immediately, so the only cost on the default path is one attribute read
+    per call site plus this object's own (never accessed) construction.
+    """
+
+    __slots__ = ("_t0", "_last", "_marks", "_label")
+
+    def __init__(self, label: str = "ref2va"):
+        self._label = label
+        self._marks: list[tuple[str, float]] = []
+        if not H3_PHASE_TIMING:
+            return
+        torch.cuda.synchronize()
+        self._t0 = self._last = time.time()
+
+    def mark(self, name: str) -> None:
+        if not H3_PHASE_TIMING:
+            return
+        torch.cuda.synchronize()
+        now = time.time()
+        self._marks.append((name, now - self._last))
+        self._last = now
+
+    def report(self, total_hint: float | None = None) -> None:
+        if not H3_PHASE_TIMING:
+            return
+        total = self._last - self._t0
+        breakdown = ", ".join(f"{name}={dt:.2f}s" for name, dt in self._marks)
+        hint = f" (caller total={total_hint:.2f}s)" if total_hint is not None else ""
+        logger.info("[H3_PHASE_TIMING] %s breakdown: %s -- sum=%.2fs%s", self._label, breakdown, total, hint)
+
+
+def _install_qwen3vl_submodule_timing(text_encoder) -> None:
+    """H3_PHASE_TIMING drill-down (2026-08-27 encode-phase profiling task): split
+    `get_qwen3vl_prompt_embeds()`'s single `text_encoder.model(...)` forward call --
+    which `_encode_ref2va_prompt`'s own `conditioner_forward` checkpoint already times as
+    one ~90s black box -- into "vision tower" (`Qwen3VLModel.get_image_features()`, which
+    the model forward calls once per request when `pixel_values is not None`) vs.
+    "language_model / text decoder" (`Qwen3VLModel.language_model(...)`, the 64
+    Qwen3-VL-32B decoder layers run over the full presentation sequence, images-as-tokens
+    included) time. No-op when `H3_PHASE_TIMING=0` (both wrapped methods early-out to the
+    original bound method before doing anything else -- a single attribute check, no
+    timing, no sync).
+
+    Called once per fresh `text_encoder` load (from `_load_text_encoder()`, mirroring
+    `enable_adaln_precompute()`'s own "re-arm on every fresh load" pattern a few call
+    sites away in this file) -- `text_encoder.model` is a new `Qwen3VLModel` instance
+    every time the bnb-4bit TE is (re)quantized from disk, so the patch has to be
+    reapplied, not applied once at import time. Idempotent (`_h3_phase_timing_patched`
+    guard) so calling it again on an already-patched instance is a harmless no-op --
+    relevant because this project's `H3_TE_PROJ` path loads a *different* model class
+    (`AutoModelForImageTextToText` resolving to Qwen3-VL-4B, whose `.model` is a plain
+    `Qwen3VLModel` too, so this patch generalizes to that path for free, in case a future
+    profiling task wants the same drill-down for the 4B TE_PROJ config).
+    """
+    if not H3_PHASE_TIMING:
+        return
+    model = getattr(text_encoder, "model", None)
+    if model is None or getattr(model, "_h3_phase_timing_patched", False):
+        return
+
+    orig_get_image_features = model.get_image_features
+    orig_language_model_forward = model.language_model.forward
+
+    def _timed_get_image_features(pixel_values, image_grid_thw=None, **kwargs):
+        torch.cuda.synchronize()
+        t0 = time.time()
+        result = orig_get_image_features(pixel_values, image_grid_thw=image_grid_thw, **kwargs)
+        torch.cuda.synchronize()
+        grid_str = image_grid_thw.tolist() if image_grid_thw is not None else None
+        logger.info(
+            "[H3_PHASE_TIMING] Qwen3VLModel.get_image_features (vision tower): %.2fs "
+            "(pixel_values=%s, image_grid_thw=%s)",
+            time.time() - t0, tuple(pixel_values.shape), grid_str,
+        )
+        return result
+
+    def _timed_language_model_forward(*args, **kwargs):
+        torch.cuda.synchronize()
+        t0 = time.time()
+        result = orig_language_model_forward(*args, **kwargs)
+        torch.cuda.synchronize()
+        logger.info("[H3_PHASE_TIMING] Qwen3VLModel.language_model (text decoder, 64 layers): %.2fs", time.time() - t0)
+        return result
+
+    model.get_image_features = _timed_get_image_features
+    model.language_model.forward = _timed_language_model_forward
+
+    # One level deeper (2026-08-27, same task): `get_image_features` -> `self.visual(...)`
+    # is `Qwen3VLVisionModel.forward()` -- patch_embed (a `kernel_size==stride` patchify
+    # `nn.Conv3d`, `modeling_qwen3_vl.py`'s `Qwen3VLVisionPatchEmbed.forward`, called once
+    # with a huge batch dim = num_patches and a tiny spatial extent per patch) vs. the 27
+    # `Qwen3VLVisionBlock` self-attention/MLP layers vs. the final `merger`. This exact
+    # "huge-batch x tiny-spatial, kernel==stride Conv3d" shape is the one flagged in the
+    # sibling diffusers-server repo's CLAUDE.md #46 as falling into a pathologically slow
+    # cuDNN kernel on this machine's sm_120 (Blackwell) GPUs -- Qwen3-VL's vision
+    # patch_embed uses the identical pattern, so this drill-down exists to confirm or rule
+    # out the same root cause here. `visual` is `model.visual` (`Qwen3VLVisionModel`);
+    # `blocks` timing is accumulated across all 27 sequential block calls into one number
+    # (individually wrapping each would be noisy for no extra insight -- the hypothesis
+    # under test is "patch_embed alone" vs. "everything else", not per-block variance).
+    visual = getattr(model, "visual", None)
+    if visual is not None:
+        orig_patch_embed_forward = visual.patch_embed.forward
+        orig_merger_forward = visual.merger.forward
+        orig_block_forwards = [blk.forward for blk in visual.blocks]
+        _blocks_total = {"s": 0.0}
+
+        def _timed_patch_embed_forward(hidden_states, *args, **kwargs):
+            torch.cuda.synchronize()
+            t0 = time.time()
+            result = orig_patch_embed_forward(hidden_states, *args, **kwargs)
+            torch.cuda.synchronize()
+            logger.info(
+                "[H3_PHASE_TIMING]   visual.patch_embed (Conv3d, kernel==stride): %.2fs (input=%s)",
+                time.time() - t0, tuple(hidden_states.shape),
+            )
+            return result
+
+        def _timed_merger_forward(*args, **kwargs):
+            torch.cuda.synchronize()
+            t0 = time.time()
+            result = orig_merger_forward(*args, **kwargs)
+            torch.cuda.synchronize()
+            logger.info("[H3_PHASE_TIMING]   visual.merger: %.2fs", time.time() - t0)
+            return result
+
+        def _make_timed_block_forward(orig_fwd):
+            def _timed_block_forward(*args, **kwargs):
+                torch.cuda.synchronize()
+                t0 = time.time()
+                result = orig_fwd(*args, **kwargs)
+                torch.cuda.synchronize()
+                _blocks_total["s"] += time.time() - t0
+                return result
+
+            return _timed_block_forward
+
+        visual.patch_embed.forward = _timed_patch_embed_forward
+        visual.merger.forward = _timed_merger_forward
+        for blk, orig_fwd in zip(visual.blocks, orig_block_forwards):
+            blk.forward = _make_timed_block_forward(orig_fwd)
+
+        orig_visual_forward = visual.forward
+
+        def _timed_visual_forward(*args, **kwargs):
+            _blocks_total["s"] = 0.0
+            result = orig_visual_forward(*args, **kwargs)
+            logger.info(
+                "[H3_PHASE_TIMING]   visual.blocks (all %d Qwen3VLVisionBlock, sum): %.2fs",
+                len(visual.blocks), _blocks_total["s"],
+            )
+            return result
+
+        visual.forward = _timed_visual_forward
+
+    model._h3_phase_timing_patched = True
+    logger.info("[H3_PHASE_TIMING] installed vision-tower/language-model sub-timing on text_encoder.model")
+
+
 # EXPERIMENTAL, opt-in. "0" (default) = text_encoder is built with its checkpoint's
 # native 64 decoder layers, byte-for-byte identical to pre-this-flag behaviour. "1" =
 # the text_encoder is built with only its first 51 decoder layers (the checkpoint's
@@ -2066,6 +2257,16 @@ def _encode_ref2va_prompt(
         get_qwen3vl_prompt_embeds,
     )
 
+    # H3_PHASE_TIMING (2026-08-27 encode-phase profiling task): this is the
+    # `H3_REF_PREFIX_CACHE_SINGLE=0` / no-prefix-cache path -- the one
+    # `_encode_ref2va_prompt_prefix_cached()` falls back to, and the one this task's own
+    # measurement config uses. That sibling function already logs a `t_key`/`t_prefix`
+    # split (see its "single ref-prefix cache MISS" log line); this mirrors the same
+    # split here so the no-cache path gets equivalent visibility. No-op tuple/dict when
+    # the flag is off -- `_PhaseTimer.mark()` is the only thing touched below, and it is
+    # a single early-return in that case.
+    _pt = _PhaseTimer("encode_ref2va_prompt")
+
     step = MiniMaxH3Ref2VATextEncoderStep()
     te_proj = _te_projection_for(components)
     if te_proj is not None:
@@ -2078,6 +2279,7 @@ def _encode_ref2va_prompt(
     vision_inputs, image_token_counts, video_token_counts, video_timestamps = step._gather_vision_features(
         components.processor, normalized_references, components.fps
     )
+    _pt.mark("gather_vision_features")  # processor: PIL/np image -> patchified pixel_values (CPU)
     token_ids, token_tags = step._build_presentation(
         components.tokenizer,
         prompt,
@@ -2088,6 +2290,7 @@ def _encode_ref2va_prompt(
         text_tag=components.text_tag,
         video_tag=components.video_tag,
     )
+    _pt.mark("build_presentation")  # tokenize (CPU, expected tiny)
     if te_proj is not None:
         # H3 固有の特殊トークン (`<d>`/`</d>`) は 4B の語彙に無い -- トークナイザ自体は
         # H3 のものを使い続ける (`components.tokenizer`、通常語彙は 4B とID完全一致)。
@@ -2101,11 +2304,13 @@ def _encode_ref2va_prompt(
         device=device,
         dtype=dtype,
     )
+    _pt.mark("conditioner_forward")  # the 32B/4B forward itself (vision tower + text decoder, GPU)
     if te_proj is not None:
         # 常に1つの自己完結したシーケンス (KVキャッシュ継続なし) なので位置0は本当に
         # シーケンス先頭 -- sink_out 置換込みの `project()` が正しい
         # (`_encode_h3_prompt` の同箇所コメント参照)。
         prompt_embeds = te_proj.project(prompt_embeds, dtype=dtype or prompt_embeds.dtype)
+    _pt.report()
     return prompt_embeds, torch.tensor(token_tags, dtype=torch.long)
 
 
@@ -4466,6 +4671,7 @@ class MiniMaxH3Runner:
             "text_encoder loaded from prequantized cache in %.1fs (%s). gpu=%s",
             time.time() - t0, cache_dir, gpu_mem_gb(),
         )
+        _install_qwen3vl_submodule_timing(self._pipe.text_encoder)  # no-op unless H3_PHASE_TIMING=1
         self._detach_te_if_external()
         # フェーズ境界での中断チェック(loading_text_encoder)。
         interrupt_controller.check()
@@ -4605,6 +4811,7 @@ class MiniMaxH3Runner:
             H3_TE_PROJ_MODEL, f" ({H3_TE_DEVICE})" if self._te_external else "",
             time.time() - t0, gpu_mem_gb(), ram_gb(),
         )
+        _install_qwen3vl_submodule_timing(self._pipe.text_encoder)  # no-op unless H3_PHASE_TIMING=1
         self._detach_te_if_external()
 
         # 投影行列は一度だけロードしてキャッシュする (`self._pipe._te_projection`,
@@ -4696,6 +4903,7 @@ class MiniMaxH3Runner:
             # キャッシュが永遠に作られない (2026-08-20 実機で発症・修正)。
             if H3_TE_PREQUANT:
                 self._save_te_prequant(cache_dir)
+            _install_qwen3vl_submodule_timing(self._pipe.text_encoder)  # no-op unless H3_PHASE_TIMING=1
             self._detach_te_if_external()
             # フェーズ境界での中断チェック(loading_text_encoder)。
             interrupt_controller.check()
@@ -4717,6 +4925,7 @@ class MiniMaxH3Runner:
             "text_encoder%s loaded to GPU in %.1fs. gpu=%s ram=%s",
             prune_suffix, time.time() - t0, gpu_mem_gb(), ram_gb(),
         )
+        _install_qwen3vl_submodule_timing(self._pipe.text_encoder)  # no-op unless H3_PHASE_TIMING=1
         # フェーズ境界での中断チェック(loading_text_encoder)。
         interrupt_controller.check()
 
@@ -6805,6 +7014,11 @@ class MiniMaxH3Runner:
         from diffusers.modular_pipelines.modular_pipeline import PipelineState
 
         t_start = time.time()
+        # H3_PHASE_TIMING (2026-08-27 encode-phase profiling task, see `_PhaseTimer`'s
+        # own docstring): one timer per request, marked at every named checkpoint
+        # between here and the start of denoise. No-op (single flag check per `.mark()`
+        # call) when `H3_PHASE_TIMING=0` (default).
+        _pt = _PhaseTimer("generate_ref2va")
         # Per-request override of `H3_VOCAL_LOCK` (see this parameter's own docstring
         # paragraph above). `None` -> fall back to the module-level env-var default,
         # byte-for-byte identical to today's always-env-var behavior. Every
@@ -6928,6 +7142,7 @@ class MiniMaxH3Runner:
             # cheap and always safe (plain attribute re-assignment of already-loaded
             # modules, see the field comment on `_pipe_ref` in `__init__`).
             self._sync_shared_components_to_ref()
+        _pt.mark("entry_lock(free_transformer+ensure_vaes+load_te+sync)")
 
         # Reset peak stats after loading so the reported peak reflects this generation's
         # encode+denoise+decode, not the (much larger, one-time) model loading peak.
@@ -6988,6 +7203,7 @@ class MiniMaxH3Runner:
         else:
             _, state = setup_step(pipe, state)
         actual_num_frames = state.get("num_frames")
+        _pt.mark("setup_step(reference_normalize/resize)")  # PIL LANCZOS resize to ref_image_short_edge (CPU)
 
         # --- text encode (references' vision blocks + prompt; still has TE on GPU) ---
         if progress:
@@ -7008,7 +7224,9 @@ class MiniMaxH3Runner:
                     device=self._encode_device, dtype=torch.bfloat16,
                 )
             prompt_embeds, text_token_tags = encoded
+        _pt.mark("text_encode(prefix_cache_or_direct)")  # whichever of the two _encode_ref2va_prompt* ran, as one unit -- see its own internal H3_PHASE_TIMING breakdown (gather_vision_features/build_presentation/conditioner_forward) for the split inside this
         prompt_embeds, text_token_tags = self._to_compute_device(prompt_embeds, text_token_tags)
+        _pt.mark("to_compute_device")
         state.set("prompt_embeds", prompt_embeds)
         state.set("text_token_tags", text_token_tags)
         # フェーズ境界での中断チェック(encoding): プロンプト+参照のテキストエンコードが
@@ -7148,18 +7366,23 @@ class MiniMaxH3Runner:
                 self._free_text_encoder(force=True)
                 self._ensure_transformer_ref(progress)
         elif TE_QUANT == "bnb-4bit":
-            self._vae_to_gpu()
+            self._vae_to_gpu()  # already has its own unconditional timing log
+            _pt.mark("vae_to_gpu")
             reference_encoder_step = MiniMaxH3Ref2VAReferenceEncoderStep()
             _, state = reference_encoder_step(pipe, state)
+            _pt.mark("reference_encoder_step(vae_encode_condition_latents)")
             if vocal_lock_effective:
                 # Must run inside this "audio_vae on GPU" window, before `_vae_to_cpu()`
                 # parks it back -- see `_build_vocal_lock_latents()`'s docstring.
                 vocal_lock_latents = _build_vocal_lock_latents(pipe, references, actual_num_frames)
                 if vocal_lock_latents is not None:
                     state.set("audio_latents", vocal_lock_latents)
-            self._vae_to_cpu()
+            _pt.mark("vocal_lock_latents")  # no-op mark (0s) when H3_VOCAL_LOCK=0; else audio_vae encode of ref audio
+            self._vae_to_cpu()  # already has its own unconditional timing log
+            _pt.mark("vae_to_cpu")
             with self._load_lock:
                 self._ensure_transformer_ref(progress)
+                _pt.mark("ensure_transformer_ref")  # no-op mark in int8 both-resident steady state (already has its own timing log when it actually (re)loads)
                 # NOTE: `transformer` (t2va's, freed at this method's entry in
                 # H3_TRANSFORMER_BOTH_RESIDENT mode) is deliberately NOT reloaded here.
                 # ref2va's denoise loop already runs a longer packed sequence than t2va's
@@ -7201,6 +7424,7 @@ class MiniMaxH3Runner:
                         state, state.get("num_audio_latents"), pipe.audio_channels
                     )
                 _, state = timesteps_step(pipe, state)
+            _pt.mark("layout+condition_latents+latents+ref2va_latents+timesteps")
         else:
             # `none` mode: TE's job is done -- free it and bring in transformer_ref
             # (vae is already permanently resident in this mode, so `_vae_to_gpu()` is a
@@ -7298,6 +7522,8 @@ class MiniMaxH3Runner:
         if force_free_te:
             with self._load_lock:
                 self._free_text_encoder(force=True)
+        _pt.mark("force_free_te")  # no-op mark (0s) in int8/H3_TRANSFORMER_BOTH_RESIDENT mode (force_free_te=False)
+        _pt.report(total_hint=time.time() - t_start)  # full encode-phase breakdown; sum should equal t_denoise - t_start below
 
         # --- denoise loop, instrumented for progress polling (mirrors generate()'s
         # non-upscale path exactly, against transformer_ref instead of transformer) ---
