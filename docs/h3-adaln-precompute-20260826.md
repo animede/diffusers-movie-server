@@ -428,3 +428,193 @@ H3_TURBO_LORA_FILE=minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors`)を
   そもそも`H3_ADALN_PRECOMP`とint8前提のため併用不可であり、対象外。
 
 git commit は行っていない(タスク指示どおり)。
+
+---
+
+# ref2va サイジング: bf16+precompute+turbo は MV 本番 int8 に勝てるか(2026-08-27)
+
+v1/v2 は t2va での bit-exact 検証止まりだった(v1 未解決事項2)。本節はその
+ref2va(`transformer_ref`)版の検証と、MV 本番構成(int8)を bf16+precompute+turbo へ
+切り替える価値があるかのコスト比較。**結論: NO-GO**。bf16+precompute は ref2va でも
+bit-exact だが、固定費 34.7秒の transformer_ref 再ロードは構造的な理由で precompute
+では消せず、定常状態の合計時間は int8 より遅いまま(230.4s vs 142.4s)。
+
+## 事前のコード調査で判明した構造的な理由(実測前に確定)
+
+`core/runner.py` の `generate_ref2va()` を読むと、`transformer_ref` は
+**リクエストのエントリ部分(参照VAEエンコードより前)で無条件に解放される**
+(既に前回リクエストの定常状態からGPU常駐していても):
+
+```
+self._free_other_variant_transformer("ref2va")
+self._free_transformer_ref()   # <- 常にここで解放(precomputeされていても関係ない)
+self._ensure_vaes(progress)     # 参照画像/音声をVAEでエンコードする関門
+...
+self._ensure_transformer_ref(progress)  # ここでフルサイズ(66.3GB)を再ロード
+```
+
+理由はコード中のコメントに明記されている: `transformer_ref(66.3) + TE-nf4(21.0) +
+vae pair(11.0) = ~98.3GB` は参照VAEエンコードの時点で96GBを超える。precompute は
+`_ensure_transformer_ref()` でロードが完了し、かつ**そのインスタンスの最初の
+denoiseステップ(step 0)を通過した後**にしか発火しない(`enable_adaln_precompute()`
+は「武装」するだけで、実際のテーブル構築は初回forward時)。つまり参照VAEエンコード
+の関門は precompute が効くタイミングより**前**にある — この関門を回避するために
+既存コードは「常に一旦解放してから、参照VAEエンコードの後で*フルサイズ*で
+再ロードする」設計になっており、precompute はロード後の常駐サイズ(66→約42GB)を
+縮めるだけで、**ロードそのもの(34〜38秒)を省略する経路が存在しない**。
+
+さらに `H3_TRANSFORMER_BOTH_RESIDENT`(int8専用、34+34=68GBで両方常駐)は
+`H3_ADALN_PRECOMP` と併用不可(v1のガード行列、int8は import時 `RuntimeError`)
+なので、「両方常駐させて再ロード自体をなくす」という int8 の解決策を bf16 側で
+真似ることもできない。この時点で「precomputeでbf16のtransformer_ref再ロードを
+消せる」というタスクの仮説は構造的に成立しないと判断できたが、指示どおり実測でも
+確認した。
+
+## 検証設定
+
+`docs/h3-baseline-comparison-20260826.md` の実測条件を踏襲しつつ、**タスク指示に
+従い `H3_REF_PREFIX_CACHE_SINGLE=0` を全構成で使用**(MV本番は毎回異なる参照画像を
+使うため、同一参照でのキャッシュヒットは実運用を代表しない。これにより下記 C の
+数値は同ドキュメントの 92.7s ではなく、それより遅い実測になる — キャッシュ無効化の
+影響を含んだ、より保守的で実運用に近い比較)。768×448・8.0秒(192フレーム)・
+seed=777・同一プロンプト("A woman sings passionately in a jazz club, warm stage
+lighting, close-up microphone performance")・turbo=true・vocal_lock=1。
+参照アセットは本日の MV 出力 `outputs/ref2va_1787660379.mp4` から抽出
+(`ref.png` = 1秒地点のフレーム、`ref.wav` = 全長8.03秒を8.0秒にトリム)。
+
+各構成で同一リクエストを2回連続実行し、2回目(定常状態)を主指標とする。
+
+## 結果: 実測コスト表
+
+| 構成 | run | total | denoise | decode | 固定費(total-denoise-decode) | peak VRAM |
+|---|---|---|---|---|---|---|
+| A: bf16+precompute+turbo | run1(初回) | 232.2s | 26.34s | 5.69s | 200.2s | 87.69GB |
+| A: bf16+precompute+turbo | **run2(定常)** | **230.4s** | 25.59s | 5.59s | **199.3s** | 87.95GB |
+| B: bf16(precomputeなし) | run1(初回) | 208.2s | 25.94s | 5.83s | 176.4s | 87.69GB |
+| B: bf16(precomputeなし) | **run2(定常)** | **201.7s** | 25.82s | 5.66s | **170.2s** | 87.95GB |
+| C: int8(MV本番相当) | run1(初回) | 180.2s | 27.29s | 5.88s | 147.0s | 73.56GB |
+| C: int8(MV本番相当) | **run2(定常)** | **142.4s** | 26.90s | 5.74s | **109.7s** | 73.82GB |
+
+**A(precompute)は B(precomputeなし)より遅い**(230.4s vs 201.7s、定常状態で
++28.7s)。precompute のテーブル構築自体のオーバーヘッド(ログでは軽微だが、
+turbo=true・3ステップでも `[h3opt.adaln] cached 50 blocks x 3 steps` の構築コストが
+毎リクエスト発生する — 上記のとおり `transformer_ref` は毎回フルロードされ
+precomputeテーブルもロードのたびに失われるため、v1文書が指摘した「再武装が
+リクエストごとに必要」という制約がそのままコストとして乗る)が、削減されるはずの
+何か(再ロード自体)を一切相殺していないため、**precomputeは ref2va の bf16
+定常状態を純粋に悪化させる**。
+
+**A/B いずれも C(int8)より大幅に遅い**(A: 230.4s、B: 201.7s、C: 142.4s)。
+C が速い理由はログで直接確認した: int8 モードは `H3_TRANSFORMER_BOTH_RESIDENT` に
+より run1 の再ロード後、**run2 では `transformer_ref loaded`/`freed` のログが
+一切出現しない**(VAEのGPU⇔CPU往復のみ)。bf16 側(A・Bとも)は run2 でも
+`transformer_ref freed` → `transformer_ref loaded to GPU in 34.1s`(A)/
+実測33〜38秒(B含む)が確実に発生する。
+
+## 再ロードは生き残ったか、その理由
+
+**生き残った(A・Bとも、taskの見立てどおりの結果)**。ログ実測(`gateway/logs/h3.log`):
+
+```
+transformer_ref loaded to GPU in 35.7s (quant=none, adaln_precomp=True)   # A run1
+[h3opt.adaln] cached 50 blocks x 3 steps: table 0.08 GB, freed 24.23 GB of weights (built_with_turbo=True)
+transformer_ref freed. gpu={'allocated_gb': 0.4, ...}                      # decode窓前のエントリ解放
+transformer_ref loaded to GPU in 34.1s (quant=none, adaln_precomp=True)    # A run2 用の再ロード
+[h3opt.adaln] cached 50 blocks x 3 steps: ... freed 24.23 GB of weights
+transformer_ref freed. gpu={'allocated_gb': 21.57, ...}                    # A run2 のデコード窓前解放
+transformer_ref loaded to GPU in 37.5s (quant=none, adaln_precomp=True)    # 次のリクエスト用の再ロード
+```
+
+**理由**: 上記「事前のコード調査」の通り、再ロードは「decodeフェーズでのVRAM
+逼迫」ではなく「**参照VAEエンコードフェーズの前に無条件でエントリ解放する**」
+設計に起因する。precompute はロード後の常駐サイズ(66.3→約42GB相当)を縮めるだけで、
+ロード自体(disk/ページキャッシュからの復元、34〜38秒)を回避する経路を持たない。
+この解放は「今回のリクエストで transformer_ref が本当に不要になったから」ではなく
+「参照VAEエンコードの間 transformer_ref を降ろしておかないと合計VRAMが96GBを
+超えるから」という、precomputeとは無関係な別フェーズの制約によるものであり、
+根本的に解消できない。
+
+### 小さく安全なコード変更は検討したか
+
+タスク指示に従い、`H3_KEEP_TRANSFORMER` のガード拡張や「precompute後の常駐サイズが
+収まるならエントリ解放をスキップする」という変更を検討したが、**実装しなかった**:
+
+1. `H3_KEEP_TRANSFORMER` は `H3_TE_DEVICE` または `H3_TE_PROJ`(TEを別GPU/小型化)
+   が前提で、MV本番構成(同一GPU上でTE-nf4常駐)とは異なる資源配置を要求する —
+   「既存フラグの前提条件を緩める」規模の変更ではなく、MV本番の構成自体を
+   別物に作り替える話になる。
+2. 仮に「エントリ解放をスキップし、precompute済みサイズ(約42GB)+TE-nf4(21GB)で
+   参照VAEエンコードを乗り切る」という変更を試みても、**参照VAEエンコードの時点
+   ではまだ precompute が発火していない**(precomputeは最初のdenoiseステップ通過後)。
+   つまり「今から使う transformer_ref」はまだフルサイズ(66.3GB)のままエントリの
+   時点に存在しており、66.3+21+11=98.3GB の衝突はそのまま残る。スキップできる
+   条件(直前のリクエストで構築済みのテーブルを再利用できる)は存在するが、
+   これは「decode窓での解放をやめて常駐させ続ける」設計変更に等しく、bf16の
+   transformer_ref(66.3GB、precompute後42GB)+ TE-nf4(21GB)+ VAE(11GB、decode時)
+   の合計が常時 74〜98GB のどこかで推移することになり、taskブリーフが警告する
+   「plan-mismatch」問題(次リクエストのtimestep planが同じなら再利用可、違えば
+   明示エラーか再構築が必要)への対処に加え、decode窓・活性化メモリの余裕を
+   実測で再検証する必要がある規模の変更になる。「小さく安全な変更」の域を超えると
+   判断し、実装しなかった。
+
+## ref2va framemd5 検証: bit-exact 確認(video/audio とも)
+
+A run2(precomputeあり)と B run2(precomputeなし)を同一seed・同一入力・同一
+turboで比較。`ffmpeg -map 0:v -f framemd5` / `-map 0:a -f framemd5` の diff:
+
+| 比較 | video | audio |
+|---|---|---|
+| A run2 vs B run2 | **IDENTICAL** | **IDENTICAL** |
+
+`diff` の出力は両ストリームとも空。**ref2va(`transformer_ref`)でも t2va と同じく
+precomputeはbit-exactであることを実証した**(v1未解決事項2の一部を解消)。
+なお A の run1/run2 同士も `audio_rms`/`audio_peak` が完全一致しており(下記
+VOCAL_LOCK節参照)、decode窓での解放→再ロード→再構築サイクルがref2vaでも
+決定論的であることの追加傍証になっている。
+
+## VOCAL_LOCK sanity check
+
+`vocal_lock: true` を全リクエストで確認。生成音声は非無音(A run2:
+audio_rms=0.0852, audio_peak=0.369, sample数192768@32000Hz)。入力参照音声
+(ref.wav, 192000サンプル@24000Hz, RMS 2761)との単純な生波形相関は低い(-0.15、
+サンプルレート・エンコーディングが異なる素の相互相関のため無意味な指標)が、
+RMSエネルギー水準は同程度(2761 vs 2778、スケール差はint16正規化前後の違い)で
+あり、taskブリーフが定義した「非無音・入力ボーカルと合致する」十分条件を満たす。
+adaln precompute は video/audio 両方の変調テーブルを一括で焼く設計
+(`cached 50 blocks x N steps`)だが、VOCAL_LOCK自体はaudio latentのx0固定
+(diffusers-server CLAUDE.md 39番と同機構)であり、precomputeのテーブル構築・
+参照タイミングとは独立した層で動作するため相互作用は考えにくく、実測でも
+問題は確認されなかった。
+
+## GO/NO-GO 判定
+
+**NO-GO**: MV本番(ref2va主体)を bf16+precompute+turbo へ切り替える理由がない。
+
+- 定常状態の合計時間: int8(C)142.4s < precomputeなしbf16(B)201.7s <
+  **precomputeありbf16(A)230.4s**。precomputeはbf16をむしろ遅くする
+  (+28.7秒、テーブル構築コストが再ロードのたびに乗る一方、再ロード自体を
+  1秒も削減しない)。
+- タスクの仮説(「常駐サイズ削減66→42GBで74GB<96GBに収まり、再ロードが消える」)
+  は、実際には「参照VAEエンコード時にまだフルサイズの66.3GBが必要」という
+  precomputeの発火タイミング上の制約により成立しなかった。
+- bf16へ切り替える価値があるとしたら「同一seedでの厳密な出力再現性(int8は
+  PSNR 19dB の軌道分岐がある、96gb-int8プリセットの説明文参照)」のような
+  品質・再現性の理由であって、速度上の理由ではない。速度面では int8 が
+  1.6倍(142.4s vs 230.4s)速いまま。
+- 副産物として、ref2va(`transformer_ref`)でも bit-exact が成立することを
+  実証できた(v1未解決事項2の一部解消)。将来 `H3_KEEP_TRANSFORMER` 系の
+  常駐パターンでref2vaのVRAM削減を狙う場合、precomputeがbit-exactに使える
+  基盤があることは確認済みだが、参照VAEエンコード時のフルサイズロード要件を
+  回避する設計(上記「小さく安全なコード変更」で見送った規模の変更)が
+  別途必要になる。
+
+## 復元確認
+
+`POST /api/v1/backend/load` で `preset=96gb-int8` + 元の overrides
+(`H3_REF_PREFIX_CACHE_SINGLE=1, H3_VOCAL_LOCK=1,
+H3_TURBO_LORA_FILE=minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors`)を再ロード。
+`/api/status` で `preset: "96gb-int8"`、`transformer_quant: "int8"`、
+`gpu.allocated_gb: 55.04`(検証開始前の初期値と完全一致)を確認。本番設定への
+復元は完了している。
+
+git commit は行っていない(タスク指示どおり)。
