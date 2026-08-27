@@ -244,3 +244,187 @@ H3_TURBO_LORA_FILE=minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors`)を
   `turbo_incompatible_with_adaln_precomp` 追加)
 
 git commit は行っていない(タスク指示どおり)。
+
+---
+
+# turbo LoRA との共存(v2、2026-08-27 追記)
+
+上記 v1 の「turbo との組み合わせが構造的に不可能」という結論(§「turbo との
+組み合わせが構造的に不可能な理由」、未解決事項1)を、実際のチェックポイントの
+キーを直接調べ直すことで覆した。結論: **本番構成(既定の diffusers ネイティブ
+turbo LoRA)では構造的な衝突は存在せず、v1 のガードは根拠を誤認していた**。
+comfy形式(Ostris版)だけが本当に衝突する。
+
+## 前提の再検証(v1が見落としていた点)
+
+v1 の拒否理由は「turbo LoRA チェックポイントは各ブロックの `adaln_proj.linear`
+を `_TurboLoRALinear` でラップする」という記述だったが、これは
+`_turbo_lora_key_map()`(comfy形式専用のキーマップ関数)のdocstringだけを見て
+「turbo」全体に一般化した誤りだった。実際にキャッシュ済みの safetensors を
+直接読んで確認したところ:
+
+| チェックポイント | 形式 | 適用関数 | 総Linear数 | `adaln_proj`/`norm_out` 数 |
+|---|---|---|---|---|
+| `lightx2v/Minimax-h3-Turbo` の5ファイル全て(t2va/fl2va、4/8step、v0.1/v1.0/v1.1) | diffusers ネイティブ | `apply_diffusers_turbo_lora()` | 312 | **0** |
+| `larryvrh/MiniMax-H3-Turbo-Lora`(3スナップショット全て) | comfy(Ostris版) | `apply_turbo_lora()` | 259 | **51**(50ブロック分 + final_layer) |
+
+`H3_TURBO_LORA_REPO` の既定値、かつ本番構成が実際に使っている
+`H3_TURBO_LORA_FILE=minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors` は表の
+1行目(diffusersネイティブ、0 adaln keys)に含まれる。つまり**本番が使う
+turbo LoRA は adaln_proj に一切触れない**。`apply_diffusers_turbo_lora()` の
+キー抽出コード自体(`paths = sorted({k.rsplit(".lora_", 1)[0] ...})`、
+チェックポイントの実キーをそのまま読む実装)を見ても、これは手作りキーマップの
+記載漏れではなく、チェックポイントそのものが adaln に対する LoRA デルタを
+一切学習していないことの裏付けになる。
+
+## 設計方針: per-request rebuild ではなく「無条件で共存」
+
+タスクブリーフは (a) per-request rebuild、(b) host-RAM 上の重み保持による
+再構築、のいずれかを想定していたが、上記の再検証の結果、**どちらも不要**と
+判明した: turbo は adaln_proj を一切変更しないため、`precompute()` が
+`block.adaln_proj` を(turboで他のモジュールがラップされていようがいまいが)
+そのまま読んで焼いたテーブルは、turbo=True/False のどちらのリクエストに対しても
+無改造でbit-exactになる。テーブルの使い回しに一切の条件分岐が要らない。
+
+実際には本プロジェクトの `H3_TE_QUANT=bnb-4bit` 定常状態が「decode窓の前後で
+transformer を丸ごと解放・再ロードする」設計のため(v1から変更なし)、
+precomputeテーブル自体はどのみちリクエストごとに再構築される(turbo有無に
+関わらず、v1と全く同じ理由・同じ頻度)。これは本タスクで新設した仕組みでは
+なく、v1が既に持っていた「フルリロードのたびに再武装」という挙動がそのまま
+turboリクエストにも適用されるだけ。ホストRAM上に重みを保持する設計
+(タスクブリーフの選択肢 b)は実装していない -- 不要だったため。
+
+## 実装した変更
+
+- `core/adaln_precompute.py`:
+  - モジュールdocstringに v2 節を追加(上記の検証結果、
+    `_reject_turbo_wrapped_adaln()` の設計根拠)。
+  - `_reject_turbo_wrapped_adaln(transformer)` を新設: `precompute()` の冒頭で
+    各ブロックの `block.adaln_proj.linear` が `_TurboLoRALinear` で
+    ラップ済みでないかを確認し、ラップ済みなら `RuntimeError`。comfy形式が
+    万一ここまで到達した場合の最終防衛線(`projection.linear.parameters()` は
+    `_TurboLoRALinear` の `.weight`/`.bias` エイリアスプロパティ経由で
+    エラーなく成功してしまうため、この明示チェックがないと LoRA デルタを
+    黙って握りつぶす=誤った結果を出す危険がある)。
+  - `precompute()` 完了時に `transformer._h3opt_adaln_built_with_turbo`
+    (このテーブル構築時に turbo が有効だったか、情報用途のみ)を記録し、
+    ログにも `built_with_turbo=` を追加。
+  - `built_with_turbo(transformer)` ヘルパーを新設(`status()` 用)。
+- `core/runner.py`:
+  - `H3_ADALN_PRECOMP` の import時ガードから `H3_TURBO_LORA` の無条件拒否を
+    削除。代わりに `H3_TURBO_LORA and H3_TURBO_LORA_REPO in _TURBO_COMFY_REPOS`
+    のときだけ拒否(int8/lowvramガードは無変更)。
+  - `_adaln_precompute_built_with_turbo()` ヘルパーを追加、`status()` の
+    `adaln_precomp_built_with_turbo` フィールドとして公開。
+- `core/settings.py`:
+  - `validate_instant_settings()` の turbo+adaln_precomp ガードを、
+    `runner.turbo_lora_expected_format() == "comfy"` の場合のみに縮小
+    (無条件拒否を撤廃)。
+  - `current_settings_snapshot()` の `constraints.
+    turbo_incompatible_with_adaln_precomp` も同条件に変更(UIのグレーアウトが
+    comfy形式のときだけ効くようにした)。
+
+## 単体検証(GPU不要、import/バリデーションロジックのみ)
+
+| ケース | 結果 |
+|---|---|
+| `H3_ADALN_PRECOMP=1` + `H3_TURBO_LORA=1`(既定repo=lightx2v) | import成功(v1は拒否していた) |
+| `H3_ADALN_PRECOMP=1` + `H3_TURBO_LORA_REPO=larryvrh/...`(comfy) | import時 `RuntimeError`(意図どおり維持) |
+| `H3_ADALN_PRECOMP=1` + `H3_TRANSFORMER_QUANT=int8` | import時 `RuntimeError`(無変更) |
+| `H3_ADALN_PRECOMP=1`(既定repo)+ リクエスト `turbo=true` | `resolve_instant_settings()` が例外なく通る(v1は400) |
+| `H3_ADALN_PRECOMP=1` + comfy repo + リクエスト `turbo=true` | `ValueError`(400相当、意図どおり） |
+
+## 実機検証(gateway経由、RTX PRO 6000 96GB共有、GPU0)
+
+手順はタスクブリーフのverification matrixに準拠。
+
+1. **開始時の本番設定を記録**: `preset=96gb-int8`、
+   `env_extra={H3_TRANSFORMER_QUANT: int8, H3_REF_PREFIX_CACHE_SINGLE: 1,
+   H3_VOCAL_LOCK: 1, H3_TURBO_LORA_FILE:
+   minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors}`。常駐VRAM 55.04GB。
+2. **テスト構成をロード**: `POST /api/v1/backend/load
+   {"backend":"h3","preset":"96gb","gpus":"0",
+   "overrides":{"H3_ADALN_PRECOMP":"1"}}`(turboファイルの上書きなし、
+   既定の `minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors` = 上記表の
+   1行目、0 adaln keysのファイルがそのまま使われる)。preload完了後
+   `text_encoder_loaded: true` を確認。
+3. **run1**(`turbo=true`、768x768、5.0s、seed=12345、同一プロンプト):
+   `turbo_lora: true`、`num_inference_steps: 4`、`peak_vram_gb: 88.69`、
+   出力 `t2va_1787795343.mp4`。ログで
+   `[h3opt.adaln] cached 50 blocks x 3 steps: table 0.05 GB, freed 24.23 GB
+   of weights (built_with_turbo=True)` を確認(precomputeが実際に発火し、
+   turbo有効を正しく記録)。
+4. **run2**(`cache=none&turbo=false`、同条件): `turbo_lora: false`、
+   `num_inference_steps: 30`、`peak_vram_gb: 87.85`、出力
+   `t2va_1787795448.mp4`。ログで `built_with_turbo=False` を確認。
+5. **run3**(`turbo=true` 再度、同条件): `turbo_lora: true`、
+   `peak_vram_gb: 88.95`、出力 `t2va_1787795626.mp4`。ログで
+   `built_with_turbo=True` を確認(トグル戻しでも正しく再構築)。
+
+### framemd5 検証結果(video/audioストリーム別)
+
+| 比較 | video | audio |
+|---|---|---|
+| run1 vs `t2va_1787735652.mp4`(r3、turbo・precompute無しの本日基準) | **IDENTICAL** | **IDENTICAL** |
+| run2 vs `t2va_1787735332.mp4`(r1、non-turbo基準) | **IDENTICAL** | **IDENTICAL** |
+| run3 vs run1(トグル戻し安定性) | **IDENTICAL** | **IDENTICAL** |
+
+`ffmpeg -map 0:v -f framemd5` / `-map 0:a -f framemd5` の出力を `diff` した
+結果、3件とも差分ゼロ。**turbo=True と turbo=False の両方でbit-exactという
+タスクの中核claimを実証した。**
+
+### VRAM(全リクエストで一貫)
+
+各リクエストのログに `freed 24.23 GB of weights` が記録され(旧v1の
+`freed 24.23 GB` と同水準、turbo有無で差なし)、削減メカニズム自体は
+turbo状態に非依存で機能していることを確認した。`peak_vram_gb` は
+v1のドキュメント済みの理由(bnb-4bit定常状態のreset時点がprecompute前の
+フロアを含むため)によりレスポンス上は削減を直接反映しないが、これも
+v1から変わらない既知の制約であり、今回のturbo対応による新たな制約ではない。
+
+### ホストRAM
+
+`ram.swap_used_gb` は検証全体を通じて `8.39GB` で一定(既存のswap、
+このマシンが常に持っている分。CLAUDE.md/README記載の既知の値)。
+run1〜run3の一連の生成でswap増加は観測されなかった。ホストRAM上に
+新規の重み保持機構を実装していない(上記「設計方針」参照)ため、
+33番([diffusers-server]CLAUDE.mdの丸ごとCPUスワップ禁止事故)に相当する
+リスクはそもそも導入していない。
+
+### 復元確認
+
+`POST /api/v1/backend/load` で `preset=96gb-int8` + 元の overrides
+(`H3_REF_PREFIX_CACHE_SINGLE=1, H3_VOCAL_LOCK=1,
+H3_TURBO_LORA_FILE=minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors`)を
+再ロード。`/api/status` で `preset: "96gb-int8"`、
+`transformer_quant: "int8"`、`text_encoder_loaded: true`、
+`transformer_loaded: true` を確認、本番設定への復元完了。
+
+## v1からの結論の変更点まとめ
+
+- v1: 「turbo と adaln precompute は構造的に併用不可」→ **誤り**(comfy形式に
+  限った制約を turbo 全体に誤って一般化していた)。
+- v2: 本番が実際に使う diffusers ネイティブ turbo LoRA(lightx2v配布の
+  全5ファイル)は adaln_proj に一切触れないため、precomputeテーブルは
+  turbo=True/False どちらのリクエストにもそのまま使い回せる(実測で
+  bit-exactを確認)。comfy形式(larryvrh配布)だけは引き続き構造的に
+  衝突するため、明示的に拒否する(import時のrepo名ヒューリスティック +
+  `precompute()` 実行時のキー単位チェックの2段構え)。
+- host-RAM上の重み保持による再構築という設計(タスクブリーフの選択肢 b)は
+  不要と判明したため実装していない。既存のper-request transformer
+  解放+再ロードサイクル(bnb-4bit定常状態、v1から無変更)がそのまま
+  turboリクエストにも正しく機能する。
+
+## 未解決事項(v2でも残るもの)
+
+- v1の未解決事項1〜4のうち、1(turbo併用不可)は本タスクで解消した。
+  2〜4(`H3_KEEP_TRANSFORMER=1`等の別常駐パターンでの`peak_vram_gb`反映、
+  int8/lowvramとの併用、FBCのbit-exact検証範囲)は引き続き未検証のまま。
+- comfy形式turbo LoRA自体をadaln precomputeと併用したい場合の設計
+  (turbo on/off両方のテーブルを保持し`_TurboLoRALinear.enabled`に応じて
+  切り替える)は、v1の未解決事項1が示唆していた案のままで、今回も
+  着手していない(本番が使わない形式のため優先度が低いと判断)。
+- 96GB機(共有)での検証のみ実施。48GB級カード(`H3_LOWVRAM`系)は
+  そもそも`H3_ADALN_PRECOMP`とint8前提のため併用不可であり、対象外。
+
+git commit は行っていない(タスク指示どおり)。
