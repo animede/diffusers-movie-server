@@ -618,3 +618,186 @@ H3_TURBO_LORA_FILE=minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors`)を再ロ
 復元は完了している。
 
 git commit は行っていない(タスク指示どおり)。
+
+---
+
+# 投影TE(4B) ref2va 測定(2026-08-27)
+
+MV本番の ref2va 主コスト(参照プレフィックスの32B TEエンコード)を、
+`H3_TE_PROJ`(Qwen3-VL-4B-Instruct + 学習済み線形投影で32B TEを代替)へ
+差し替えて速度・品質を実測した。コード変更なし、測定のみ。
+
+## 構成・ガード確認
+
+- `core/runner.py` に `H3_TE_PROJ` + ref2va の**ハードガードは無い**
+  (`te_quant`/`te_prune` との排他は `core/settings.py` の再ロードAPIにあるが、
+  int8/turbo/ref2va との組み合わせは禁止されていない)。ただし該当箇所
+  (`_encode_ref2va_prompt` / `_encode_ref2va_prompt_prefix_cached`)に
+  `"H3_TE_PROJ + ref2va (reference) path is UNVERIFIED -- the projection
+  matrix was only checked against 4B text hidden states, not vision tower
+  features."` という明示的な未検証警告が実装されている。本タスクはこの
+  警告が指す品質リスクを実測で検証するもの。
+- `H3_REF_PREFIX_CACHE_SINGLE=1` は `H3_TE_PROJ` 指定時に自動で無効化される
+  (`H3_TE_PROJ` がTEを恒久常駐させるため、キャッシュが二度と解放されず
+  危険という理由。`core/runner.py` 1258行目)。今回は元々 `SINGLE=0` を
+  使うので無関係。
+- **ハマった点(タスクブリーフの誤り)**: `H3_TE_PROJ` は真偽値フラグでは
+  なく、**投影行列の HF リポジトリID/ローカルパスそのもの**を格納する
+  変数(`H3_TE_PROJ = os.environ.get("H3_TE_PROJ", "").strip()`、truthy な
+  文字列で有効化)。ブリーフの例示どおり `"H3_TE_PROJ":"1"` を渡すと、
+  `hf_hub_download("1", "mmh3-4b-ClipProj.safetensors")` として解決を試み
+  リポジトリ `"1"` への404を起こし、`preload_all()` が例外で失敗して
+  `text_encoder_loaded=True` のまま `_te_projection` が未設定という不整合
+  状態になった(`/api/status` の `te_proj_tap: null` で検知可能)。この
+  状態で ref2va を呼ぶと `_te_encoder_layer_for()` が投影なしのフォール
+  バック(32Bの層50)を使い、4B(36層)に対し
+  `MiniMax-H3 conditions on hidden_states[50] ... but text_encoder has 36`
+  で400になった。**正しい指定は
+  `"H3_TE_PROJ":"NicoLab28/ClipProj-MiniMax-H3"`**(`H3_TE_PROJ_DEFAULT_REPO`
+  と同じ値)。再ロード後 `/api/status` の `te_proj_tap: 24` を確認できれば
+  投影行列が正しくロードされている。
+
+## 測定条件
+
+`docs/h3-baseline-comparison-20260826.md` / 本ファイル前半セクションと同一の
+実測条件を踏襲: `H3_REF_PREFIX_CACHE_SINGLE=0`、768×448・8.0秒(192フレーム)・
+seed=777・同一プロンプト("A woman sings passionately in a jazz club, warm
+stage lighting, close-up microphone performance")・turbo=true・vocal_lock=1。
+参照アセットは前半セクションと同じ `ref.png`/`ref.wav`
+(`outputs/ref2va_1787660379.mp4` から抽出)。
+
+構成D: `preset=96gb-int8` + `H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3` +
+`H3_TURBO_LORA_FILE=minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors` +
+`H3_VOCAL_LOCK=1` + `H3_REF_PREFIX_CACHE_SINGLE=0`。
+
+比較対象は前半セクションの構成C(int8、32B TE、同一条件)の実測値
+(`run2`: total 142.4s / denoise 26.9s / decode 5.74s / 固定費 109.7s /
+peak 73.82GB、mp4: `outputs/ref2va_1787799387.mp4`)をそのまま流用。
+
+## 結果: 時間・VRAM
+
+| 構成 | run | total | denoise | decode | 固定費 | peak VRAM |
+|---|---|---|---|---|---|---|
+| C: int8(32B TE、基準) | run2(定常) | 142.4s | 26.90s | 5.74s | 109.7s | 73.82GB |
+| D: int8+TE_PROJ(4B) | run1(初回) | 168.0s | 27.21s | 5.86s | 134.9s | 55.67GB |
+| D: int8+TE_PROJ(4B) | **run2(定常)** | **128.8s** | 26.69s | 5.76s | **96.3s** | **55.93GB** |
+
+**D run1 が run2 より遅い理由**: run1 は `transformer_ref` がまだ
+GPU非常駐で、encode完了後に35.2秒のロードが発生する(D run1 のポーリング
+ログで `loading_transformer` フェーズが t=91.2〜125.7s に出現)。int8の
+both-resident機構により run2 以降はこのロードが消え(Cのrun2と同じ
+挙動)、以後は定常状態として扱える。
+
+## encode フェーズの内訳(タスクの主眼)
+
+`/api/progress` を1秒間隔でポーリングし、フェーズ遷移のタイムスタンプを
+記録した(D)。C は同じ機構のログ(リクエスト受信〜`vae/audio_vae -> GPU`
+=参照音声のVocal Lockエンコード開始、を「encode完了」の境界として使用)
+から同等の窓を逆算した。
+
+| 構成 | encode窓の測定法 | 所要時間 |
+|---|---|---|
+| C(32B TE) | ログ: run1完了(11:56:21.760)→`vae→GPU`(11:58:01.681) | **99.9s** |
+| D(4B TE_PROJ) | `/api/progress`ポーリング: encoding開始(t=1.22s)→denoising開始(t=87.66s) | **86.4s** |
+| D(4B TE_PROJ) | ログ: run1完了(12:23:47.238)→`vae→GPU`(12:25:19.995)、参考(HTTP経由の余剰込み) | 92.8s |
+
+**TE_PROJ による encode 短縮は 7〜13秒程度**(99.9s → 86.4〜92.8s、
+相対で 7〜13%)。「32B→4B、大幅高速化」という仮説どおりの規模には
+遠く届かなかった。理由は主に、encodeフェーズの大半が参照**画像**の
+vision tower 処理(`H3_REF_IMAGE_SHORT_EDGE=2048` の高解像度参照を
+Qwen3-VL の vision encoder に通す処理、テキスト側より遥かに支配的)で
+占められており、text decoder 層自体(32層→24層 tap 相当)の縮小効果は
+相対的に小さいためと推測される(vision tower のFLOPsはテキスト本体
+サイズに比例しないため、4B化してもvision側の計算コストはほぼ変わらない)。
+
+## 全体時間への影響
+
+固定費: C 109.7s → D(定常) 96.3s(**-13.4秒、-12%**)。
+total: C 142.4s → D(定常) 128.8s(**-13.6秒、-9.5%**)。
+peak VRAM: C 73.82GB → D 55.93GB(**-17.9GB、-24%**、TEが32B→4Bへ縮小した
+直接効果でVRAM側は encode 側より明確に効いている)。
+
+## 品質評価: 音声(Vocal Lock)
+
+D run2 の生成音声を `ref.wav` と比較(10ms窓RMSエンベロープの相互相関、
+タスクブリーフ指定の粗い指標):
+
+| 比較 | RMS | エンベロープ相関 vs ref |
+|---|---|---|
+| C run2 音声 | 0.08467(正規化float) | 0.9536 |
+| D run2 音声 | 0.08467(正規化float) | 0.9536 |
+| D vs C(音声同士) | - | **1.0000(bit-identical)** |
+
+**D と C の生成音声は完全に一致した**(RMS・エンベロープ相関とも同値、
+D vs C の相互相関が1.0)。Vocal Lock(音声latentのx0固定、CLAUDE.md
+39番と同機構)はテキストエンコーダの実体(32B/4B)に依存しない独立層で
+動作しており、TE_PROJ化による音声側への副作用は皆無と実証できた。
+入力参照音声(ref.wav)とのエンベロープ相関 0.9536 は C/D 共通で、
+「入力ボーカルに追従している」という十分条件を満たす。
+
+## 品質評価: 映像(アイデンティティ保持) -- 主要な否定的所見
+
+start/mid/end(frame 0/96/190)を抽出し目視比較した。
+
+- **frame 0(start)**: D は参照(ref.png)の特徴(ヘアクリップ・イヤモニ・
+  白ブラウス+黒リボン・両手でマイクを包む構図)を良好に再現。顔つきも
+  近い。ただし背景がジャズクラブ風の演者(コントラバス奏者)ではなく
+  ワインボトルの並ぶバー背景+ギタリストに変化(Cはジャズクラブの
+  コントラバス奏者2名)。
+- **frame 190(end)**: D はヘアクリップ・イヤモニとも正しく再現され、
+  参照に近い構図に復帰。
+- **frame 96(mid)で重大な破綻を検出**: 右腕/右手が**解剖学的に破綻した
+  第二の腕**として描画され、指の関節が渦巻き状・繊維状のテクスチャで
+  異常伸長している(マイクを持つ左手とは別に、画面右側に不自然な
+  腕状オブジェクトが出現)。frame 80/88 は正常、**frame 96〜112(約17
+  フレーム、24fpsで約0.7秒)にわたり同一系統の破綻したアーム/手首
+  アーティファクトが persist**(96で最も顕著、104/112でも縮小した
+  同種の歪みが残存)、frame 140 では完全に正常な両手表現へ復帰した。
+  **同一フレーム番号(96/104/112)で C(基準、32B TE)を確認したところ、
+  いずれも完全にクリーン**(参照どおりの単手マイク保持、異常なし)。
+  この破綻が TE_PROJ(4B投影)固有であり、seed/プロンプト由来の
+  一般的な不安定性ではないことを同条件比較で確認した。
+- 画像: `scratchpad/h3_te_proj_test/` に `ref.png`(参照)、
+  `D_frame{1,2,3}.png`(D の0/96/190)、`C_frame{1,2,3}.png`(C の
+  0/96/190、比較用)、`D_extra{1..6}.png`(D の80/88/96/104/112/140)、
+  `C_extra{1,2,3}.png`(C の96/104/112、比較用)。
+
+## 結論・所見(暫定、最終判断は親セッション/ユーザーに委ねる)
+
+- **速度**: TE_PROJ は encode フェーズを 7〜13秒(7〜13%)短縮するのみで、
+  「32B→4B」という縮小率から期待される大幅高速化は実現しなかった。
+  encode コストの大半は参照画像の vision tower 処理が占めており、
+  text decoder の縮小効果は限定的と推測される。固定費ベースで -12%、
+  total で -9.5%(142.4s→128.8s)。
+- **VRAM**: -24%(73.82GB→55.93GB)と明確な削減効果があり、これは
+  32B→4B化の直接効果として速度より大きく効いている。
+- **音声品質**: Vocal Lock 経由の生成音声は C と bit-identical。
+  リスクなし。
+- **映像品質**: **明確な懸念あり**。frame 96 前後で通常のフレームには
+  見られない解剖学的な破綻(第二の腕/手首の異常テクスチャ)を検出した。
+  同一 seed・同一条件の C(32B TE)ではこの破綻が一切発生しないため、
+  TE_PROJ 固有の劣化である可能性が高い。`core/runner.py` 自身が
+  記していた「投影行列は4Bのテキスト隠れ状態に対してのみ検証済みで、
+  vision tower の特徴に対しては未検証」という警告と整合する結果と
+  言える(参照画像=vision入力の条件付けが、テキストのみの場合より
+  劣化しやすい可能性を示唆)。1回の実行(1 seed)のみの観測であり、
+  複数 seed / 複数参照画像での再現率は未確認。
+- **総合**: 現状の実測(1試行)では、TE_PROJ を MV 本番(ref2va主体)へ
+  投入する根拠は乏しい。速度メリットが小さい(-9.5%)一方、映像
+  アイデンティティ保持に無視できない劣化リスク(破綻したアーム
+  アーティファクト)が観測された。VRAM削減(-24%)は魅力的だが、
+  MV本番運用は現行構成(int8、73.82GB)で十分収まっており、VRAM
+  逼迫の解消が主目的でない限り、品質リスクとのトレードオフに見合わない。
+  採用するなら、複数 seed・複数参照画像での破綻再現率の追加検証が
+  前提になる。
+
+## 復元確認
+
+`POST /api/v1/backend/load` で `preset=96gb-int8` + 元の overrides
+(`H3_REF_PREFIX_CACHE_SINGLE=1, H3_VOCAL_LOCK=1,
+H3_TURBO_LORA_FILE=minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors`)を
+再ロード。`/api/status` で `te_proj: false`、`transformer_quant: "int8"`、
+`gpu.allocated_gb: 55.04`(検証開始前の初期値と完全一致)を確認。本番設定
+への復元は完了している。
+
+git commit は行っていない(タスク指示どおり)。
