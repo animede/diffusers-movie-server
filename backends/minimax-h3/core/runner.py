@@ -422,6 +422,126 @@ def _install_qwen3vl_submodule_timing(text_encoder) -> None:
     logger.info("[H3_PHASE_TIMING] installed vision-tower/language-model sub-timing on text_encoder.model")
 
 
+# "1" (default) = replace `Qwen3VLVisionPatchEmbed.proj` (a `kernel_size==stride`
+# `nn.Conv3d(in_channels=3, embed_dim=1152, kernel_size=[2,16,16], stride=[2,16,16],
+# bias=True)`) with a mathematically-equivalent `nn.functional.linear` on every fresh
+# `text_encoder` load. "0" = stock Conv3d, unchanged behaviour (escape hatch).
+#
+# Why: on this box's sm_120 (Blackwell) GPUs, cuDNN picks a pathologically slow kernel
+# for this exact shape -- huge batch dim (num_patches, 28,160 for the profiled
+# 768x448/8s ref2va request logged in `_install_qwen3vl_submodule_timing`'s own
+# `visual.patch_embed` checkpoint) x tiny spatial extent (2x16x16 = one "patch" worth of
+# voxels, matching kernel_size exactly so there is only ever one output position per
+# input). This is the identical pathology diffusers-server's CLAUDE.md #46 (JoyAI
+# integration) already found and fixed for JoyImageEditPlusTransformer3DModel's
+# `img_in` (same class of Conv3d) AND for this exact `Qwen3VLVisionPatchEmbed` in that
+# repo's `families/joyai/pipeline.py` (`PatchifyLinear`) -- ~146x speedup there. Isolated
+# microbench with THIS process's exact real shapes (`scratchpad/probe_patchify_conv3d.py`,
+# run on this box 2026-08-27): Conv3d call = 87-91s *per call* (not a one-time cuDNN
+# algo-search cost -- 3 repeated calls at the same shape averaged 90.8s/call), the
+# reshape+linear form = 0.0007-0.005s, mean abs diff 6.4e-07 / max abs diff 1.56e-2
+# (bf16 rounding-level; consistent with CLAUDE.md #46's own 6.18e-07 for JoyAI).
+#
+# For `kernel_size == stride` and no padding, a Conv3d degenerates to exactly one output
+# position per input window, so `conv(x).view(N, out_ch)` is bit-identical (up to
+# floating-point summation order, which bf16 rounds away) to
+# `F.linear(x.flatten(1), conv.weight.reshape(out_ch, -1), conv.bias)` -- verified against
+# THIS repo's pinned transformers `Qwen3VLVisionPatchEmbed.forward()`
+# (`transformers/models/qwen3_vl/modeling_qwen3_vl.py`), which reshapes its input to
+# exactly `(-1, in_channels, temporal_patch_size, patch_size, patch_size)` before calling
+# `self.proj(...)` -- i.e. batch dim first, no other axis reordering, so `x.flatten(1)`
+# on that same 5D tensor lines up with `conv.weight.reshape(out_ch, -1)`'s
+# `(in_ch, kt, kh, kw)` -> flat layout with no extra permute needed (this project's
+# layout was independently re-derived and confirmed here, not assumed to match JoyAI's
+# transformer -- the two use different upstream input tensor orderings in general, but
+# for THIS class they happen to already agree since `forward()` does the `.view()`
+# itself right before the conv call, batch-dim-first).
+H3_PATCH_EMBED_LINEAR = os.environ.get("H3_PATCH_EMBED_LINEAR", "1").strip() == "1"
+
+
+class _PatchEmbedLinear(torch.nn.Module):
+    """Drop-in replacement for a `kernel_size==stride` `nn.Conv3d` patchify layer.
+
+    Ported from diffusers-server's `families/joyai/pipeline.py::PatchifyLinear`
+    (CLAUDE.md #46) with the mechanism kept verbatim -- only the class name and this
+    module's own call site are new. `weight`/`bias` properties are required because
+    `Qwen3VLVisionPatchEmbed.forward()` reads `self.proj.weight.dtype` (to cast its
+    input) before calling `self.proj(...)` -- a plain buffer without the alias would
+    make that line raise `AttributeError` (the exact bug CLAUDE.md #46 records hitting
+    and fixing on its first attempt at this same pattern for JoyAI's `img_in`).
+    """
+
+    def __init__(self, conv: torch.nn.Conv3d):
+        super().__init__()
+        self.out_channels = conv.out_channels
+        self.register_buffer("_weight_flat", conv.weight.reshape(conv.out_channels, -1))
+        self.register_buffer("_bias", conv.bias if conv.bias is not None else None)
+
+    @property
+    def weight(self):
+        return self._weight_flat
+
+    @property
+    def bias(self):
+        return self._bias
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # `Qwen3VLVisionPatchEmbed.forward()` passes in the already-5D
+        # `(N, in_channels, temporal_patch_size, patch_size, patch_size)` tensor and
+        # itself does `.view(-1, embed_dim)` on this call's return value, so returning
+        # the plain 2D `(N, out_channels)` linear output (rather than reshaping back to
+        # 5D the way `PatchifyLinear.forward()` does for JoyAI's `img_in`, whose caller
+        # expects a 5D shape back) is correct here -- confirmed by reading
+        # `Qwen3VLVisionPatchEmbed.forward()` itself, not assumed from the JoyAI
+        # precedent.
+        return torch.nn.functional.linear(x.flatten(1), self._weight_flat, self._bias)
+
+
+def _install_patch_embed_linear(text_encoder) -> None:
+    """Replace `text_encoder.model.visual.patch_embed.proj` with `_PatchEmbedLinear` on
+    a freshly-loaded `text_encoder` (no-op if `H3_PATCH_EMBED_LINEAR=0`, or if this
+    instance's vision tower is missing/already patched).
+
+    Must be re-armed on every fresh `text_encoder` load, same reasoning as
+    `_install_qwen3vl_submodule_timing` a few call sites away in this file (each
+    (re)quantization/reload of the bnb-4bit TE, or each `H3_TE_PROJ` 4B load, produces a
+    brand new `Qwen3VLModel`/`Qwen3VLVisionModel` instance with its own fresh
+    `nn.Conv3d`) -- called from the same 4 `_load_text_encoder*` call sites, right next
+    to the existing `_install_qwen3vl_submodule_timing(...)` calls. Idempotent per
+    instance (`isinstance(..., _PatchEmbedLinear)` guard), so calling it again on an
+    already-patched instance is a harmless no-op.
+
+    Covers both the 32B TE path (`H3_TE_QUANT=none`/`bnb-4bit`, `.model.visual` is
+    `Qwen3VLModel.visual`) and the `H3_TE_PROJ` 4B path (`AutoModelForImageTextToText`
+    resolving to Qwen3-VL-4B-Instruct, same `Qwen3VLVisionPatchEmbed` class, same
+    pathological shape family just with fewer patches) for free -- both are plain
+    `Qwen3VLModel` instances exposing `.model.visual.patch_embed.proj`, no branching on
+    which load path called this needed.
+    """
+    if not H3_PATCH_EMBED_LINEAR:
+        return
+    model = getattr(text_encoder, "model", None)
+    visual = getattr(model, "visual", None) if model is not None else None
+    patch_embed = getattr(visual, "patch_embed", None) if visual is not None else None
+    if patch_embed is None:
+        return
+    proj = getattr(patch_embed, "proj", None)
+    if proj is None or isinstance(proj, _PatchEmbedLinear):
+        return  # already patched, or not the Conv3d-based patchify this targets
+
+    device = next(proj.parameters()).device
+    n_params_before = sum(p.numel() for p in proj.parameters())
+    replacement = _PatchEmbedLinear(proj).to(device)
+    patch_embed.proj = replacement
+    logger.info(
+        "[H3_PATCH_EMBED_LINEAR] replaced Qwen3VLVisionPatchEmbed.proj (Conv3d, "
+        "kernel==stride) with reshape+linear on %s (weight=%s, params=%d) -- "
+        "sm_120 pathological-kernel avoidance, CLAUDE.md #46 lineage. "
+        "Set H3_PATCH_EMBED_LINEAR=0 to revert to stock Conv3d.",
+        device, tuple(replacement.weight.shape), n_params_before,
+    )
+
+
 # EXPERIMENTAL, opt-in. "0" (default) = text_encoder is built with its checkpoint's
 # native 64 decoder layers, byte-for-byte identical to pre-this-flag behaviour. "1" =
 # the text_encoder is built with only its first 51 decoder layers (the checkpoint's
@@ -4671,6 +4791,7 @@ class MiniMaxH3Runner:
             "text_encoder loaded from prequantized cache in %.1fs (%s). gpu=%s",
             time.time() - t0, cache_dir, gpu_mem_gb(),
         )
+        _install_patch_embed_linear(self._pipe.text_encoder)  # no-op unless H3_PATCH_EMBED_LINEAR=0
         _install_qwen3vl_submodule_timing(self._pipe.text_encoder)  # no-op unless H3_PHASE_TIMING=1
         self._detach_te_if_external()
         # フェーズ境界での中断チェック(loading_text_encoder)。
@@ -4811,6 +4932,7 @@ class MiniMaxH3Runner:
             H3_TE_PROJ_MODEL, f" ({H3_TE_DEVICE})" if self._te_external else "",
             time.time() - t0, gpu_mem_gb(), ram_gb(),
         )
+        _install_patch_embed_linear(self._pipe.text_encoder)  # no-op unless H3_PATCH_EMBED_LINEAR=0
         _install_qwen3vl_submodule_timing(self._pipe.text_encoder)  # no-op unless H3_PHASE_TIMING=1
         self._detach_te_if_external()
 
@@ -4903,6 +5025,7 @@ class MiniMaxH3Runner:
             # キャッシュが永遠に作られない (2026-08-20 実機で発症・修正)。
             if H3_TE_PREQUANT:
                 self._save_te_prequant(cache_dir)
+            _install_patch_embed_linear(self._pipe.text_encoder)  # no-op unless H3_PATCH_EMBED_LINEAR=0
             _install_qwen3vl_submodule_timing(self._pipe.text_encoder)  # no-op unless H3_PHASE_TIMING=1
             self._detach_te_if_external()
             # フェーズ境界での中断チェック(loading_text_encoder)。
@@ -4925,6 +5048,7 @@ class MiniMaxH3Runner:
             "text_encoder%s loaded to GPU in %.1fs. gpu=%s ram=%s",
             prune_suffix, time.time() - t0, gpu_mem_gb(), ram_gb(),
         )
+        _install_patch_embed_linear(self._pipe.text_encoder)  # no-op unless H3_PATCH_EMBED_LINEAR=0
         _install_qwen3vl_submodule_timing(self._pipe.text_encoder)  # no-op unless H3_PHASE_TIMING=1
         # フェーズ境界での中断チェック(loading_text_encoder)。
         interrupt_controller.check()
