@@ -331,11 +331,20 @@ def build_ltx25_request(mode: str, params: dict[str, Any], extra: dict[str, Any]
     elif mode == "a2v":
         if len(audio_assets) != 1:
             raise ModeError("a2v(ltx25)は音声アセットちょうど1件が必要です")
-        if len(image_assets) > 1 or len(video_assets) > 0:
-            raise ModeError("a2v(ltx25)は音声1件 + 任意の先頭フレーム画像1件のみです")
+        # 2026-08-31拡張: 末尾フレーム画像(2枚目)も受け付ける(バックエンド
+        # ltx2_5 e063d2f で index=-1 の画像条件が解禁済み)。asset_ids の画像順は
+        # [先頭フレーム, 末尾フレーム]。実測: 音声同期を保ったまま両端が参照画像に
+        # 錨止めされ、遷移はマッチディゾルブになる(mv_studio_V3 の
+        # docs/HANDOFF.md「FLF長尺連鎖」プローブ参照)。従来の画像0〜1枚は完全互換。
+        if len(image_assets) > 2 or len(video_assets) > 0:
+            raise ModeError(
+                "a2v(ltx25)は音声1件 + 任意の先頭フレーム画像1件"
+                "(+任意の末尾フレーム画像1件)のみです")
         body["audio_asset_id"] = audio_assets[0]["id"]
         if image_assets:
             conditions = [_cond(image_assets[0], index=0)]
+        if len(image_assets) == 2:
+            conditions.append(_cond(image_assets[1], index=-1))
 
     # extra.conditions で index/strength を上書き(asset_ids と同順の dict 配列)
     if conditions_override:
