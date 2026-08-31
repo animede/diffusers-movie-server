@@ -194,8 +194,22 @@ class GenerateRequest(BaseModel):
         if self.mode == "a2v":
             if not self.audio_asset_id:
                 raise ValueError("a2v mode requires an audio asset")
-            if len(self.conditions) > 1 or any(c.kind != "image" or c.index != 0 for c in self.conditions):
-                raise ValueError("a2v mode accepts at most one first-frame image")
+            # 2026-08-31 拡張(mv_studio_V3 の FLF長尺連鎖プローブ): 末尾フレーム
+            # (index=-1)の画像条件も受け付ける。generator.py の a2v 実装は
+            # 「音声凍結フックを通常パイプラインへ被せ、conditions は素通し」の
+            # 構造で flf2v と同じ条件経路に乗るため、スキーマ緩和だけで
+            # 「a2v(音声同期)+先頭/末尾フレーム条件」が成立する見込み。
+            # 従来の画像0〜1枚(index=0)は完全後方互換。
+            a2v_allowed = {("image", 0), ("image", -1)}
+            a2v_got = [(c.kind, c.index) for c in self.conditions]
+            if (
+                len(self.conditions) > 2
+                or any(pair not in a2v_allowed for pair in a2v_got)
+                or len(set(a2v_got)) != len(a2v_got)
+            ):
+                raise ValueError(
+                    "a2v mode accepts at most a first-frame (index 0) and a last-frame (index -1) image condition"
+                )
         if len({item.id for item in self.loras}) != len(self.loras):
             raise ValueError("the same LoRA cannot be selected more than once")
         return self
