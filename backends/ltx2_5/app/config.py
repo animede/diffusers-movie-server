@@ -29,6 +29,19 @@ class Settings(BaseSettings):
     ltx25_decoder: str = "diffusion"
     # libx264 CRF for all output videos (lower = higher quality). Env: LTX25_VIDEO_CRF
     ltx25_video_crf: int = 18
+    # mp4 encoder: "nvenc" (h264_nvenc p7/tune hq, GPU; default -- measured
+    # PSNR 43.8dB vs x264 crf18 on identical frames, 1024x576x121f encode
+    # 3.3s -> 1.9s / 1536x896 6.9s -> 4.4s, falls back to x264 automatically
+    # when NVENC is unavailable) or "x264" (libx264 preset=slower, CPU).
+    # Env: LTX25_VIDEO_ENCODER
+    ltx25_video_encoder: str = "nvenc"
+    # Diffusion-decoder tiling: "auto" (single tile when free VRAM allows --
+    # ~1.23x faster and seam-free; falls back to default tiles otherwise),
+    # "on" (always single tile), "off" (always default 768^2x80f tiles).
+    # Probe (probes/probe_decode_tiling.py, 1024x576x121f): default 9.67s /
+    # single 7.85s, decode activations ~0.34GB per Mpixel of output volume.
+    # Env: LTX25_DECODE_SINGLE_TILE
+    ltx25_decode_single_tile: str = "auto"
     # Transformer weights: "nf4" (bnb 4bit, default), "fp8" (bf16-equivalent
     # quality via layerwise casting storage=fp8_e4m3fn / compute=bf16, resident
     # ~18GB / peak ~29GB, for 48GB-class GPUs; requires the ~38GB bf16

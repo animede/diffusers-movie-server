@@ -363,6 +363,71 @@ class LTXGenerator:
                 pass
         return {"freed": freed, "allocated_gb": allocated_gb}
 
+    def _configure_decode_tiling(self, num_frames: int, height: int, width: int) -> None:
+        """decode 直前にタイル構成を決める(ジョブごと、decoder は常駐共有のため毎回設定)。
+
+        既定タイル(768^2x80f / stride 704^2x56f)は 24GB 級を想定した保守値で、
+        大出力ではタイル数と重複(オーバーラップ)計算が膨らむ(1536x896x121f で
+        12 タイル・重複 約1.4x)。ここでは **空き VRAM の範囲で最大のタイル**
+        (最小の分割数)を選ぶ: 分割は幅→高さ→フレームの順に増やし、
+        タイル体積 <= 予算(空きVRAM / 0.34GB/Mpx / 1.25 マージン、
+        probes/probe_decode_tiling.py の実測係数)を満たす最初の構成を採る。
+        1024x576x121f では単一タイルになり decode 9.6s -> 7.9s(継ぎ目も消える)。
+        LTX25_DECODE_SINGLE_TILE: auto(既定)/ on(常に単一タイル、VRAM検査なし)/
+        off(常に既定タイル)。"""
+        import torch
+
+        decoder = self._diffusion_decode_pipe.diffusion_decoder
+        mode = self.config.ltx25_decode_single_tile
+        if mode == "off":
+            decoder.enable_tiling()  # 既定値へ戻す
+            return
+
+        OVERLAP_PX = 64   # 既定タイルと同じ空間オーバーラップ(768-704)
+        OVERLAP_F = 8     # 時間方向(既定24は保守的すぎるため最小の8n)
+        free_gb = torch.cuda.mem_get_info()[0] / 1024**3
+        budget_mpx = free_gb / (0.34 * 1.25) * 1e6
+
+        def tile_dims(nw: int, nh: int, nf: int) -> tuple[int, int, int]:
+            tw = -(-width // nw) + (OVERLAP_PX if nw > 1 else 0)
+            th = -(-height // nh) + (OVERLAP_PX if nh > 1 else 0)
+            tf = -(-num_frames // nf) + (OVERLAP_F if nf > 1 else 0)
+            return tw, th, tf
+
+        # 幅→高さ→フレームの順で分割を増やし、予算に収まる最初の構成を採用
+        candidates = [(1, 1, 1), (2, 1, 1), (2, 2, 1), (3, 2, 1), (2, 2, 2),
+                      (3, 2, 2), (3, 3, 2), (4, 3, 2)]
+        chosen = None
+        for nw, nh, nf in candidates:
+            tw, th, tf = tile_dims(nw, nh, nf)
+            if mode == "on" or tw * th * tf <= budget_mpx:
+                chosen = (nw, nh, nf, tw, th, tf)
+                break
+        if chosen is None:
+            decoder.enable_tiling()
+            print(
+                f"[ltx25] decode tiling: default tiles (budget {budget_mpx/1e6:.0f}Mpx "
+                f"too small for {width}x{height}x{num_frames}f)",
+                flush=True,
+            )
+            return
+        nw, nh, nf, tw, th, tf = chosen
+        # stride は「各次元の刻み = ceil(dim/n)」。オーバーラップは tile_min 側にだけ
+        # 足してあるため、分割数1の次元では引かない(引くと2タイル化してしまう)。
+        decoder.enable_tiling(
+            tile_sample_min_height=th,
+            tile_sample_min_width=tw,
+            tile_sample_min_num_frames=tf,
+            tile_sample_stride_height=th - (OVERLAP_PX if nh > 1 else 0),
+            tile_sample_stride_width=tw - (OVERLAP_PX if nw > 1 else 0),
+            tile_sample_stride_num_frames=tf - (OVERLAP_F if nf > 1 else 0),
+        )
+        print(
+            f"[ltx25] decode tiling: {nw}x{nh}x{nf} tiles of {tw}x{th}x{tf}f "
+            f"(free {free_gb:.1f}GB, budget {budget_mpx/1e6:.0f}Mpx)",
+            flush=True,
+        )
+
     def load_diffusion_decoder(self):
         """Lazily load the LTX-2.5 diffusion decoder pipeline (~0.83GB, kept resident)."""
         if self._diffusion_decode_pipe is not None:
@@ -716,6 +781,9 @@ class LTXGenerator:
                 if use_diffusion_decoder:
                     progress(0.85)
                     decode_pipe = self.load_diffusion_decoder()
+                    self._configure_decode_tiling(
+                        num_frames, request.height * 2, request.width * 2
+                    )
                     decode_generator = torch.Generator(device="cpu").manual_seed(request.seed)
                     video = decode_pipe(
                         latents=video.to("cuda"),
@@ -1017,6 +1085,7 @@ class LTXGenerator:
         }
         if request.mode == "a2v":
             args["audio_latents"] = input_audio_latents
+        stage_t0 = time.time()
         try:
             video, audio = pipe(**args)
         except Exception:
@@ -1032,6 +1101,8 @@ class LTXGenerator:
             # Auto-duration returns unpacked video latents [B, C, latent_F, H, W].
             generated_num_frames = (video.shape[2] - 1) * pipe.vae_temporal_compression_ratio + 1
         if use_refine:
+            print(f"[ltx25] stage timing: base denoise {time.time() - stage_t0:.1f}s", flush=True)
+            stage_t0 = time.time()
             pixel_reference_latents = video.detach().clone() if request.upscale_method == "pixel" else None
             progress(0.58)
             if request.upscale:
@@ -1059,6 +1130,8 @@ class LTXGenerator:
                 )[0]
                 generated_num_frames = (generated_num_frames - 1) * 2 + 1
             progress(0.64)
+            print(f"[ltx25] stage timing: latent upsample {time.time() - stage_t0:.1f}s", flush=True)
+            stage_t0 = time.time()
             stage2_span = 0.14 if use_diffusion_decoder else 0.32
             restore_stage2_prepare = None
             if request.upscale_method == "pixel":
@@ -1160,6 +1233,7 @@ class LTXGenerator:
             finally:
                 if restore_stage2_prepare is not None:
                     pipe.prepare_latents = restore_stage2_prepare
+            print(f"[ltx25] stage timing: stage2 refine {time.time() - stage_t0:.1f}s", flush=True)
         if restore_audio_prepare is not None:
             pipe.prepare_audio_latents = restore_audio_prepare
             pipe.audio_scheduler = previous_audio_scheduler
@@ -1169,6 +1243,11 @@ class LTXGenerator:
             audio_wave = self._decode_audio(pipe, audio)[0].float().cpu()
             progress(0.80)
             decode_pipe = self.load_diffusion_decoder()
+            self._configure_decode_tiling(
+                generated_num_frames,
+                effective_height * (2 if request.upscale else 1),
+                effective_width * (2 if request.upscale else 1),
+            )
             decode_generator = torch.Generator(device="cpu").manual_seed(request.seed)
             decode_start = time.time()
             with _ProgressRamp(progress, 0.80, 0.955, tau_s=90.0), torch.no_grad():
@@ -1186,6 +1265,7 @@ class LTXGenerator:
             audio_wave = input_audio_wave
         target.parent.mkdir(parents=True, exist_ok=True)
         encode_target = target.with_suffix(".edit-generated.mp4") if request.mode in {"retake", "extend"} else target
+        encode_t0 = time.time()
         encode_video_crf(
             video[0],
             fps=final_fps,
@@ -1193,7 +1273,9 @@ class LTXGenerator:
             audio_sample_rate=sample_rate,
             output_path=encode_target,
             crf=self.config.ltx25_video_crf,
+            encoder=self.config.ltx25_video_encoder,
         )
+        print(f"[ltx25] stage timing: mp4 encode {time.time() - encode_t0:.1f}s", flush=True)
         if request.mode == "retake":
             self._finish_retake(source_edit_path, encode_target, target, request)
             encode_target.unlink(missing_ok=True)
