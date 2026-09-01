@@ -367,10 +367,10 @@ def _validate_combination(backend_name: str, env: dict[str, str]) -> None:
                     "(または gpus 省略)にしてください")
     if backend_name == "ltx25":
         precision = env.get("LTX25_TRANSFORMER_PRECISION")
-        if precision is not None and precision not in ("nf4", "fp8", "bf16"):
+        if precision is not None and precision not in ("nf4", "fp8", "bf16", "nvfp4"):
             raise ValidationError(
                 f"LTX25_TRANSFORMER_PRECISION の値が不正です: {precision!r}"
-                "(有効: nf4 / fp8 / bf16)")
+                "(有効: nf4 / fp8 / bf16 / nvfp4)")
 
 
 def catalog() -> list[dict]:
