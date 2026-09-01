@@ -196,6 +196,15 @@ LTX25_PRESETS = {
         description="bf16 リリース重み全常駐(オフロードなし)。96GB級向け。",
         vram_hint="transformer ~38GB + TE/VAE",
     ),
+    "nvfp4-fast": Preset(
+        name="nvfp4-fast",
+        # 公式 NVFP4 蒸留 transformer(Blackwell ネイティブ FP4)。sm_120 専用。
+        # FP4 テンサーコア GEMM(torch._scaled_mm)で denoise の Linear が
+        # bf16 比 ~1.8倍(活性化量子化コスト込み、GEMM 素は ~3.4倍)。
+        env={"LTX25_TRANSFORMER_PRECISION": "nvfp4", "OFFLOAD_MODE": "none"},
+        description="公式 NVFP4 蒸留 transformer + FP4 GEMM 全常駐。sm_120(Blackwell)専用・速度最優先。",
+        vram_hint="transformer ~19GB + TE/VAE(全常駐)",
+    ),
 }
 
 # app/config.py の Settings フィールド由来のキーのみ許可(pydantic-settings は
@@ -205,7 +214,7 @@ LTX25_ALLOWED_KEYS = {
     "OFFLOAD_MODE", "OUTPUT_DIR", "INPUT_DIR", "LORA_DIR",
     "MAX_UPLOAD_SIZE_MB", "MAX_QUEUE_SIZE", "HISTORY_DB",
     "LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL", "LLM_TIMEOUT_SECONDS",
-    "LTX25_PORT",
+    "LTX25_PORT", "LTX25_TRANSFORMER_PRECISION", "LTX25_NVFP4_CKPT",
 }
 
 LTX25 = BackendDef(
