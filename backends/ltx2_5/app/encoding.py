@@ -19,11 +19,18 @@ def encode_video_crf(
     output_path: Path | str,
     crf: int = 18,
     preset: str = "slower",
+    encoder: str = "x264",
 ) -> None:
     """Encode frames (F, H, W, 3) — float in [0, 1] or uint8 — to H.264 mp4 with audio.
 
     Mirrors diffusers.utils.encode_video (yuv420p + aac mux) but with controllable
     x264 quality options.
+
+    encoder="nvenc" switches to h264_nvenc (GPU encode). NVENC has no CRF; we map
+    the same numeric value to VBR constant-quality (`cq`) with the slowest NVENC
+    preset p7 + tune hq. At cq18/p7 perceptual quality is close to x264 crf18 while
+    encoding is an order of magnitude faster (PyAV 16 bundles nvenc; verified on
+    this venv/GPU).
     """
     import av
     from diffusers.utils.export_utils import _prepare_audio_stream, _write_audio
@@ -32,11 +39,29 @@ def encode_video_crf(
         frames = (np.clip(frames, 0, 1) * 255).round().astype(np.uint8)
 
     container = av.open(str(output_path), mode="w")
-    stream = container.add_stream("libx264", rate=int(round(fps)))
+    codec = "h264_nvenc" if encoder == "nvenc" else "libx264"
+    try:
+        stream = container.add_stream(codec, rate=int(round(fps)))
+    except Exception:
+        if codec == "libx264":
+            raise
+        # NVENC が使えない環境(PyAV ビルド差・セッション上限等)は x264 へ退避
+        print("[encoding] h264_nvenc unavailable; falling back to libx264", flush=True)
+        encoder = "x264"
+        stream = container.add_stream("libx264", rate=int(round(fps)))
     stream.width = frames.shape[2]
     stream.height = frames.shape[1]
     stream.pix_fmt = "yuv420p"
-    stream.options = {"crf": str(int(crf)), "preset": preset}
+    if encoder == "nvenc":
+        stream.options = {
+            "rc": "vbr",
+            "cq": str(int(crf)),
+            "preset": "p7",
+            "tune": "hq",
+            "b:v": "0",
+        }
+    else:
+        stream.options = {"crf": str(int(crf)), "preset": preset}
     audio_stream = _prepare_audio_stream(container, audio_sample_rate)
     for frame_array in frames:
         frame = av.VideoFrame.from_ndarray(frame_array, format="rgb24")
