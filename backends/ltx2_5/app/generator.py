@@ -258,6 +258,36 @@ class LTXGenerator:
                     f"in {time.time() - fp8_t0:.1f}s, resident weights {resident_gb:.1f}GB)",
                     flush=True,
                 )
+            elif self.config.ltx25_transformer_precision == "nvfp4":
+                # Official Blackwell-native FP4 distilled transformer (single-file
+                # ComfyUI format). Loaded straight onto the GPU by app/nvfp4.py:
+                # quantized Linears become NVFP4Linear (torch._scaled_mm FP4 GEMM,
+                # ~3.4x raw / ~1.8x per-layer vs bf16 incl. activation-quant cost).
+                # The bnb transformer_dir is only used for its config.json (same
+                # architecture); its weights are not read.
+                import json as _json
+
+                from .nvfp4 import load_nvfp4_transformer
+
+                nvfp4_ckpt = self.config.ltx25_nvfp4_ckpt
+                if not nvfp4_ckpt:
+                    from huggingface_hub import hf_hub_download
+
+                    nvfp4_ckpt = hf_hub_download(
+                        "Lightricks/LTX-2.5",
+                        "diffusion_models/ltx-2.5-22b-distilled-transformer-nvfp4.safetensors",
+                    )
+                with open(transformer_dir / "config.json") as fh:
+                    nvfp4_cfg = _json.load(fh)
+                nvfp4_t0 = time.time()
+                transformer = load_nvfp4_transformer(
+                    str(nvfp4_ckpt), nvfp4_cfg, torch.device("cuda")
+                )
+                print(
+                    f"[ltx25] transformer precision=nvfp4 loaded in "
+                    f"{time.time() - nvfp4_t0:.1f}s (FP4 GEMM, resident ~19GB)",
+                    flush=True,
+                )
             else:
                 transformer = LTX2VideoTransformer3DModel.from_pretrained(
                     transformer_dir, dtype=torch.bfloat16

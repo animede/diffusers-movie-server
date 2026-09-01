@@ -33,8 +33,15 @@ class Settings(BaseSettings):
     # quality via layerwise casting storage=fp8_e4m3fn / compute=bf16, resident
     # ~18GB / peak ~29GB, for 48GB-class GPUs; requires the ~38GB bf16
     # transformer shards in the HF cache) or "bf16" (release weights, ~38GB,
-    # for 96GB-class GPUs). Env: LTX25_TRANSFORMER_PRECISION
+    # for 96GB-class GPUs) or "nvfp4" (official Blackwell-native FP4 distilled
+    # transformer, resident ~19GB, FP4 tensor-core matmul via torch._scaled_mm;
+    # requires sm_120+. See app/nvfp4.py). Env: LTX25_TRANSFORMER_PRECISION
     ltx25_transformer_precision: str = "nf4"
+    # Optional local path to the ComfyUI-format nvfp4 checkpoint. When unset,
+    # hf_hub_download("Lightricks/LTX-2.5", "diffusion_models/ltx-2.5-22b-
+    # distilled-transformer-nvfp4.safetensors") resolves it (18.7GB, cached).
+    # Env: LTX25_NVFP4_CKPT
+    ltx25_nvfp4_ckpt: str | None = None
 
 
 settings = Settings()
