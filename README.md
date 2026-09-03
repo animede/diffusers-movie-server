@@ -110,6 +110,28 @@ curl -X POST http://127.0.0.1:8630/api/v1/backend/unload             # 停止
 同時にアクティブなのは1バックエンドのみ。別バックエンドの load は自動で
 旧 stop → 新 start(排他切替)。生成中(busy)の load/unload/generate は 409。
 
+### バックエンドを手動起動したときは PID ファイルも書く(409 の原因になる)
+
+バックエンドは gateway が `subprocess.Popen` で起動・管理する。`run.sh` を直接叩いて
+手動起動すると、gateway からは**管理外のリスナー**に見えるため、
+`procman.py` の `_start_locked()` がポート使用中を検出して `ForeignListenerError`
+→ **`/api/v1/generate` が常に 409** になる(2026-09-02 に実際に発生)。
+
+gateway は起動時の `adopt_orphans()` でのみ既存プロセスを引き取れる。条件は
+**`gateway/run/{backend}.pid` があり、その PID が生きていて、ポートが listen 中**の3つ。
+手動起動するなら PID ファイルもセットで書き、gateway を再起動して adopt させること:
+
+```bash
+# 例: 手動起動した h3 を gateway に引き取らせる
+echo <PID> > gateway/run/h3.pid     # backend 名は h3 / ltx25
+kill -TERM <gateway PID> && ./run.sh   # 起動時に adopt_orphans() が走る
+```
+
+`/api/v1/status` で `process_alive: true` かつ `adopted: true` になれば成功
+(gateway のログにも「孤児プロセスを adopt しました」が出る)。
+なお adopt されたプロセスは preset が `(adopted: 不明)` になる。素直に
+`POST /api/v1/backend/load` で gateway に起動させる方が状態は綺麗。
+
 ## プリセット表(想定VRAM は実測ベース)
 
 ### h3(MiniMax-H3)
@@ -123,6 +145,14 @@ curl -X POST http://127.0.0.1:8630/api/v1/backend/unload             # 停止
 
 - トグル: `turbo`(`H3_TURBO_LORA=1`)。int8 量子化・`H3_LOWVRAM=group` とは併用不可(400)
 - overrides は `H3_` プレフィックスのみ許可
+- **MV 本番の既定値は `backends/minimax-h3/run.sh` が持つ**(2026-09-02 に追加)。
+  `H3_TURBO_LORA_FILE`(= ref2v 専用蒸留 `minimax_h3_ref2v_turbo_4step_v0.1_bf16`。
+  2026-08-26 の A/B で採用、commit 025e0c0)・`H3_VOCAL_LOCK=1`・
+  `H3_REF_PREFIX_CACHE_SINGLE=1` の3つで、いずれも `core/runner.py` の既定とは異なる。
+  以前はプロセスの環境変数にしか無く、再起動のたびに失われていた。
+  すべて `${VAR:-...}` なので preset/トグル/手動 export で上書きできる。
+  **`H3_TRANSFORMER_QUANT` は run.sh に書かないこと** — `96gb` が `env={}`(bf16)、
+  `96gb-int8` だけが int8 を渡す設計なので、既定値を与えると `96gb` が黙って int8 になる
 - `H3_KEEP_TRANSFORMER=1` は `H3_TE_DEVICE`(または `H3_TE_PROJ`)+
   `H3_VIDEO_VAE_FP16=1` が前提(満たさないと 400。単独GPU構成の既定プリセットには含めていない)
 
