@@ -20,9 +20,17 @@ PORT="${H3_PORT:-8631}"
 # 呼び出し側 (gateway のプリセット/トグル、手動 export) が明示すればそちらが勝つ。
 #
 #   H3_TURBO_LORA_FILE          core/runner.py の既定は fl2v v1.0 768p。
-#                               ref2v 専用蒸留は 2026-08-26 に A/B して採用
-#                               (seed 9999 の二重露光が解消・品質同等以上)。
-#                               commit 025e0c0 / docs/upstream-survey-20260826.md
+#                               ref2v 専用蒸留を 2026-08-26 に A/B して採用
+#                               (seed 9999 の二重露光が解消。commit 025e0c0)。
+#                               2026-09-03 追記: ref2v v1.0(8step・768p)が公開され
+#                               A/B で「顔部分の品質向上が分かる」判定を得たが、
+#                               denoise 約2倍のため**フリート既定は v0.1 のまま**とし、
+#                               v1.0 は MV の生成品質セレクタ「バランス」として
+#                               キャンバス単位で選ぶ(mv_studio_V3 genbackend の
+#                               H3_TURBO_TIER_TABLE が overrides で FILE/STEPS を送る)。
+#   H3_TURBO_STEPS_DEFAULT      turbo 時の既定ステップ数。LoRA の蒸留 step と必ず
+#                               ペアで変えること(v0.1=4 / v1.0=8。不一致は
+#                               off-distribution で品質劣化)。
 #   H3_VOCAL_LOCK               生成音声行の凍結。リップシンクのずれ対策 (commit 7faab45)
 #   H3_REF_PREFIX_CACHE_SINGLE  参照 prefix キャッシュを1件に絞る
 #
@@ -30,6 +38,7 @@ PORT="${H3_PORT:-8631}"
 # `96gb` が env={} (bf16)、`96gb-int8` だけが int8 を渡す設計になっている。
 # ここで既定値を与えると `96gb` を選んでも黙って int8 になってしまう。
 export H3_TURBO_LORA_FILE="${H3_TURBO_LORA_FILE:-minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors}"
+export H3_TURBO_STEPS_DEFAULT="${H3_TURBO_STEPS_DEFAULT:-4}"
 export H3_VOCAL_LOCK="${H3_VOCAL_LOCK:-1}"
 export H3_REF_PREFIX_CACHE_SINGLE="${H3_REF_PREFIX_CACHE_SINGLE:-1}"
 # ---------------------------------------------------------------------------
