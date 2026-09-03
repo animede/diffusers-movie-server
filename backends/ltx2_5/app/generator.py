@@ -546,6 +546,26 @@ class LTXGenerator:
         if result.returncode != 0:
             raise RuntimeError(f"Extend media merge failed: {result.stderr.strip()[-500:]}")
 
+    def _get_mel_transform_16k(self, device):
+        """a2v 条件付け用 MelSpectrogram(16kHz 固定パラメータ)のデバイス別キャッシュ。
+
+        毎リクエストの構築(フィルタバンク計算 + .to(device))を省く(高速化②-2)。
+        パラメータは従来のインライン構築と完全同一。
+        """
+        cache = getattr(self, "_mel_transform_cache", None)
+        if cache is None:
+            cache = {}
+            self._mel_transform_cache = cache
+        key = str(device)
+        if key not in cache:
+            import torchaudio
+            cache[key] = torchaudio.transforms.MelSpectrogram(
+                sample_rate=16000, n_fft=1024, win_length=1024, hop_length=160,
+                f_min=0.0, f_max=8000.0, n_mels=64, center=True, pad_mode="reflect",
+                power=1.0, mel_scale="slaney", norm="slaney",
+            ).to(device)
+        return cache[key]
+
     @staticmethod
     def _decode_audio_file(source: Path, sample_rate: int, start: float, duration: float):
         """Decode a selected region to stereo float32 with ffmpeg."""
@@ -993,13 +1013,27 @@ class LTXGenerator:
             if len(matches) != 1:
                 raise ValueError("Audio input asset not found")
             audio_source = matches[0]
-            probe = subprocess.run(
-                ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(audio_source)],
-                capture_output=True, text=True,
-            )
-            if probe.returncode != 0:
-                raise ValueError("Input audio duration could not be read")
-            remaining = float(probe.stdout.strip()) - request.audio_start
+            # 高速化②-1: 尺の取得は torchaudio.info(メタデータのみ・subprocess なし)を
+            # 優先し、読めないコンテナだけ従来の ffprobe(プロセス起動 ~40ms)へ落とす。
+            # デコード本体は従来どおり ffmpeg のまま(リサンプラを替えると a2v の
+            # 条件付け mel が数値的に変わるため、意図的に触らない)。
+            total_duration = None
+            try:
+                import torchaudio as _ta
+                _info = _ta.info(str(audio_source))
+                if _info.num_frames > 0 and _info.sample_rate > 0:
+                    total_duration = _info.num_frames / float(_info.sample_rate)
+            except Exception:
+                total_duration = None
+            if total_duration is None:
+                probe = subprocess.run(
+                    ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(audio_source)],
+                    capture_output=True, text=True,
+                )
+                if probe.returncode != 0:
+                    raise ValueError("Input audio duration could not be read")
+                total_duration = float(probe.stdout.strip())
+            remaining = total_duration - request.audio_start
             requested_duration = request.audio_duration or min(remaining, 20.0)
             if remaining < 1 or requested_duration > remaining + 0.05:
                 raise ValueError("Selected audio range exceeds the input audio")
@@ -1013,12 +1047,10 @@ class LTXGenerator:
                                         request.audio_start, actual_duration)
             )
             waveform = torch.from_numpy(audio_16k).unsqueeze(0).to(pipe._execution_device)
-            import torchaudio
-            mel_transform = torchaudio.transforms.MelSpectrogram(
-                sample_rate=16000, n_fft=1024, win_length=1024, hop_length=160,
-                f_min=0.0, f_max=8000.0, n_mels=64, center=True, pad_mode="reflect",
-                power=1.0, mel_scale="slaney", norm="slaney",
-            ).to(waveform.device)
+            # 高速化②-2: MelSpectrogram はパラメータ固定なのでプロセス内で1回だけ
+            # 構築してデバイス別にキャッシュする(毎リクエストの module 構築+
+            # フィルタバンク計算+.to(device) を省く。数値は同一 module の再利用なので不変)。
+            mel_transform = self._get_mel_transform_16k(waveform.device)
             mel = torch.log(torch.clamp(mel_transform(waveform), min=1e-5)).permute(0, 1, 3, 2)
             with torch.no_grad():
                 posterior = pipe.audio_vae.encode(mel.to(pipe.audio_vae.dtype), return_dict=False)[0]
@@ -1085,7 +1117,11 @@ class LTXGenerator:
             "audio_modality_scale": 1.0,
             "enable_prompt_enhancement": request.enhance_prompt,
             "generator": generator,
-            "output_type": "latent" if use_refine else "np",
+            # 非refine(リアルタイム)経路は "pt" で受ける(2026-09-03 高速化①):
+            # postprocess 済み (B,F,C,H,W)・GPU 上の float [0,1] が返るので、
+            # uint8 化を GPU で行ってから CPU へ下ろす(従来の "np" は float32
+            # ~190MB を CPU へ転送して numpy で clip/mul/round していた。実測 0.20s)。
+            "output_type": "latent" if use_refine else "pt",
             "return_dict": False,
             "callback_on_step_end": progress_callback(
                 0.0, 0.55 if use_refine else 0.96, len(DISTILLED_SIGMA_VALUES)
@@ -1132,6 +1168,33 @@ class LTXGenerator:
                 f"[ltx25] STAGE_DEBUG pipe_total {time.time() - stage_t0:.3f}s ({_parts})",
                 flush=True,
             )
+        if not use_refine:
+            # 高速化①: uint8 変換を GPU で実行(output_type="pt" とセット)。
+            # (B,F,C,H,W) float [0,1] → (B,F,H,W,3) uint8 numpy。値は従来の
+            # np.clip*255→round(半数偶数丸め)→astype と bit 一致する
+            # (torch.round も half-to-even、float32 演算は IEEE で同一)。
+            # 以降の video の使われ方(video[0] を encode へ)は従来の "np" と
+            # 同じレイアウトなので下流は無変更。encode_video_crf 側の uint8
+            # 変換は dtype==uint8 のため素通りになる。
+            _cvt_t0 = time.time()
+            with torch.no_grad():
+                # .float() が必須: "pt" は VAE 出力の dtype(bf16)のまま返るが、
+                # 従来の "np" 経路は numpy 変換時に float32 へキャストしてから
+                # *255/round していた。bf16 のまま演算すると丸めが変わり
+                # framemd5 が一致しない(実測で確認)。float32 に揃えると
+                # 旧経路と同一の IEEE 演算列になる。
+                video = (
+                    video.permute(0, 1, 3, 4, 2)
+                    .float()
+                    .clamp(0.0, 1.0)
+                    .mul(255.0)
+                    .round()
+                    .to(torch.uint8)
+                    .cpu()
+                    .numpy()
+                )
+            if _stage_debug:
+                print(f"[ltx25] STAGE_DEBUG gpu_uint8_convert {time.time() - _cvt_t0:.3f}s", flush=True)
         generated_num_frames = effective_num_frames
         if generated_num_frames is None:
             # Auto-duration returns unpacked video latents [B, C, latent_F, H, W].
@@ -1301,28 +1364,46 @@ class LTXGenerator:
             audio_wave = input_audio_wave
         target.parent.mkdir(parents=True, exist_ok=True)
         encode_target = target.with_suffix(".edit-generated.mp4") if request.mode in {"retake", "extend"} else target
-        encode_t0 = time.time()
-        encode_video_crf(
-            video[0],
-            fps=final_fps,
-            audio=audio_wave,
-            audio_sample_rate=sample_rate,
-            output_path=encode_target,
-            crf=self.config.ltx25_video_crf,
-            encoder=self.config.ltx25_video_encoder,
-        )
-        print(f"[ltx25] stage timing: mp4 encode {time.time() - encode_t0:.1f}s", flush=True)
-        if request.mode == "retake":
-            self._finish_retake(source_edit_path, encode_target, target, request)
-            encode_target.unlink(missing_ok=True)
-        elif request.mode == "extend":
-            self._finish_extend(
-                source_edit_path, encode_target, target, request.extend_direction,
-                extend_context_duration, extend_duration,
+
+        def _encode_and_finalize():
+            encode_t0 = time.time()
+            encode_video_crf(
+                video[0],
+                fps=final_fps,
+                audio=audio_wave,
+                audio_sample_rate=sample_rate,
+                output_path=encode_target,
+                crf=self.config.ltx25_video_crf,
+                encoder=self.config.ltx25_video_encoder,
             )
-            encode_target.unlink(missing_ok=True)
-        progress(1.0)
+            print(f"[ltx25] stage timing: mp4 encode {time.time() - encode_t0:.1f}s", flush=True)
+            if request.mode == "retake":
+                self._finish_retake(source_edit_path, encode_target, target, request)
+                encode_target.unlink(missing_ok=True)
+            elif request.mode == "extend":
+                self._finish_extend(
+                    source_edit_path, encode_target, target, request.extend_direction,
+                    extend_context_duration, extend_duration,
+                )
+                encode_target.unlink(missing_ok=True)
+
+        # 高速化④: 基本モードの mp4 encode(実測 0.6s、CPU+NVENC のみで VRAM 不使用)は
+        # ジョブワーカーへ closure として返し、次ジョブの denoise と重ねられるようにする
+        # (jobs.py 側の encode 専用スレッドが実行し、完了時に completed へ遷移させる)。
+        # retake/extend は encode 後にファイル差し替えの後処理があるため従来どおり同期。
+        # LTX25_ASYNC_ENCODE=0 で従来の同期動作へ戻る。
+        defer_encode = (
+            os.getenv("LTX25_ASYNC_ENCODE", "1").strip() == "1"
+            and request.mode in {"t2v", "a2v", "i2v", "flf2v"}
+        )
         peak_vram_gb = torch.cuda.max_memory_allocated() / (1024**3)
+        if defer_encode:
+            gc.collect()
+            torch.cuda.empty_cache()
+            # progress(1.0) は encode 完了時に jobs 側が立てる(ここではまだ完了ではない)。
+            return {"peak_vram_gb": peak_vram_gb, "deferred_encode": _encode_and_finalize}
+        _encode_and_finalize()
+        progress(1.0)
         gc.collect()
         torch.cuda.empty_cache()
         return {"peak_vram_gb": peak_vram_gb}

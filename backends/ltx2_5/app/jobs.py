@@ -6,6 +6,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -61,6 +62,9 @@ class JobManager:
         self._queue: queue.Queue[str] = queue.Queue(maxsize=config.max_queue_size)
         self._lock = threading.Lock()
         self._init_db()
+        # 高速化④: mp4 encode(CPU+NVENC、VRAM不使用)を denoise と重ねるための
+        # 専用スレッド。max_workers=1 なので encode 同士は投入順に直列実行される。
+        self._encode_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ltx-encode")
         self._worker = threading.Thread(target=self._run, daemon=True, name="ltx-worker")
         self._worker.start()
 
@@ -201,6 +205,7 @@ class JobManager:
             # 前回ジョブの中断要求が残っていて今回のジョブが即死しないよう、開始時に
             # 必ずクリアする(core/runner.py 側の同名パターンと同じ理由)。
             interrupt_controller.begin(job.id)
+            deferred_submitted = False
             try:
                 still_prefix = STILL_IMAGE_PREFIXES.get(job.request.mode)
                 target = self.config.output_dir / (
@@ -208,14 +213,41 @@ class JobManager:
                 )
                 started = time.monotonic()
                 metrics = self.generator.generate(job.request, target, lambda value: self._update_progress(job, value))
-                job.generation_seconds = time.monotonic() - started
+                deferred_encode = metrics.pop("deferred_encode", None) if metrics else None
                 if metrics:
                     job.peak_vram_gb = metrics.get("peak_vram_gb")
-                if still_prefix:
-                    job.image_url = f"/outputs/{target.name}"
+                if deferred_encode is not None:
+                    # 高速化④: encode を専用スレッドへ回し、ワーカーは次のジョブの
+                    # denoise へ進む。ジョブは encode 完了まで running のまま
+                    # (video_url も completed もファイルが実在してから立てる —
+                    # クライアントの「completed を見てからダウンロード」契約を保つ)。
+                    # unload/delete の「running 中は拒否」ガードもそのまま効く。
+                    # レース対策: running 状態をここで永続化してから submit し、
+                    # 下の finally は deferred_submitted を見て _save をスキップする
+                    # (encode スレッドが先に completed を書いた後に finally が
+                    # running で上書きする競合を防ぐ)。
+                    def _finish_encode(job=job, deferred=deferred_encode, started=started):
+                        try:
+                            deferred()
+                            job.generation_seconds = time.monotonic() - started
+                            job.video_url = f"/outputs/{job.id}.mp4"
+                            job.progress = 1.0
+                            job.status = "completed"
+                        except Exception as exc:  # noqa: BLE001
+                            job.error = str(exc)
+                            job.status = "failed"
+                        finally:
+                            self._save(job)
+                    self._save(job)
+                    self._encode_pool.submit(_finish_encode)
+                    deferred_submitted = True
                 else:
-                    job.video_url = f"/outputs/{job.id}.mp4"
-                job.status = "completed"
+                    job.generation_seconds = time.monotonic() - started
+                    if still_prefix:
+                        job.image_url = f"/outputs/{target.name}"
+                    else:
+                        job.video_url = f"/outputs/{job.id}.mp4"
+                    job.status = "completed"
             except GenerationInterrupted as exc:
                 job.error = str(exc)
                 job.status = "interrupted"
@@ -224,5 +256,6 @@ class JobManager:
                 job.status = "failed"
             finally:
                 interrupt_controller.end()
-                self._save(job)
+                if not deferred_submitted:
+                    self._save(job)
                 self._queue.task_done()
