@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import copy
 import math
+import os
 import subprocess
 import threading
 import time
@@ -982,6 +983,11 @@ class LTXGenerator:
             restore_prepare_latents = original_prepare_latents
             pipe.prepare_latents = types.MethodType(prepare_extend, pipe)
 
+        # LTX25_STAGE_DEBUG=1: リアルタイム経路の未計測区間を分解する一時計測
+        # (2026-09-03 調査、既定OFFで挙動不変)。a2v 前処理は ffprobe + ffmpeg×2 の
+        # subprocess 3回 + MelSpectrogram 毎回構築 + audio_vae.encode を含む。
+        _stage_debug = os.getenv("LTX25_STAGE_DEBUG", "0").strip() == "1"
+        _a2v_prep_t0 = time.time()
         if request.mode == "a2v":
             matches = list(input_dir.glob(f"{request.audio_asset_id}.*"))
             if len(matches) != 1:
@@ -1052,6 +1058,8 @@ class LTXGenerator:
             previous_audio_scheduler = pipe.audio_scheduler
             pipe.prepare_audio_latents = types.MethodType(prepare_frozen_audio, pipe)
             pipe.audio_scheduler = frozen_scheduler
+            if _stage_debug:
+                print(f"[ltx25] STAGE_DEBUG a2v_prep {time.time() - _a2v_prep_t0:.3f}s", flush=True)
 
         decoder_kind = request.decoder or self.config.ltx25_decoder
         use_refine = request.upscale or request.temporal_upscale
@@ -1085,6 +1093,26 @@ class LTXGenerator:
         }
         if request.mode == "a2v":
             args["audio_latents"] = input_audio_latents
+        # LTX25_STAGE_DEBUG=1: pipe() 内部のコンポーネント別時間を計測する一時フック
+        # (text_encoder / video VAE decode / audio VAE decode / vocoder)。
+        # instance 属性で forward/decode を差し替え、finally で必ず原状復帰する。
+        _dbg_acc: dict = {}
+        _dbg_restore: list = []
+        if _stage_debug:
+            def _dbg_wrap(obj, attr, name):
+                orig = getattr(obj, attr)
+                def timed(*a, **k):
+                    t0 = time.time()
+                    try:
+                        return orig(*a, **k)
+                    finally:
+                        _dbg_acc[name] = _dbg_acc.get(name, 0.0) + (time.time() - t0)
+                setattr(obj, attr, timed)
+                _dbg_restore.append((obj, attr, orig))
+            _dbg_wrap(pipe.text_encoder, "forward", "text_encode")
+            _dbg_wrap(pipe.vae, "decode", "video_vae_decode")
+            _dbg_wrap(pipe.audio_vae, "decode", "audio_vae_decode")
+            _dbg_wrap(pipe.vocoder, "forward", "vocoder")
         stage_t0 = time.time()
         try:
             video, audio = pipe(**args)
@@ -1096,6 +1124,14 @@ class LTXGenerator:
         finally:
             if restore_prepare_latents is not None:
                 pipe.prepare_latents = restore_prepare_latents
+            for _obj, _attr, _orig in _dbg_restore:
+                setattr(_obj, _attr, _orig)
+        if _stage_debug:
+            _parts = " ".join(f"{k}={v:.3f}s" for k, v in _dbg_acc.items())
+            print(
+                f"[ltx25] STAGE_DEBUG pipe_total {time.time() - stage_t0:.3f}s ({_parts})",
+                flush=True,
+            )
         generated_num_frames = effective_num_frames
         if generated_num_frames is None:
             # Auto-duration returns unpacked video latents [B, C, latent_F, H, W].

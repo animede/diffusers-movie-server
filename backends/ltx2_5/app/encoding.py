@@ -35,8 +35,17 @@ def encode_video_crf(
     import av
     from diffusers.utils.export_utils import _prepare_audio_stream, _write_audio
 
+    # LTX25_STAGE_DEBUG=1: mp4 encode 内部の時間分解(2026-09-03 調査、既定OFFで挙動不変)
+    import os as _os
+    import time as _time
+    _dbg = _os.getenv("LTX25_STAGE_DEBUG", "0").strip() == "1"
+    _t = _time.time()
+
     if frames.dtype != np.uint8:
         frames = (np.clip(frames, 0, 1) * 255).round().astype(np.uint8)
+    if _dbg:
+        print(f"[ltx25] STAGE_DEBUG mp4.uint8_convert {_time.time() - _t:.3f}s", flush=True)
+        _t = _time.time()
 
     container = av.open(str(output_path), mode="w")
     codec = "h264_nvenc" if encoder == "nvenc" else "libx264"
@@ -63,11 +72,19 @@ def encode_video_crf(
     else:
         stream.options = {"crf": str(int(crf)), "preset": preset}
     audio_stream = _prepare_audio_stream(container, audio_sample_rate)
+    if _dbg:
+        print(f"[ltx25] STAGE_DEBUG mp4.container_setup {_time.time() - _t:.3f}s", flush=True)
+        _t = _time.time()
     for frame_array in frames:
         frame = av.VideoFrame.from_ndarray(frame_array, format="rgb24")
         for packet in stream.encode(frame):
             container.mux(packet)
     for packet in stream.encode():
         container.mux(packet)
+    if _dbg:
+        print(f"[ltx25] STAGE_DEBUG mp4.video_encode {_time.time() - _t:.3f}s", flush=True)
+        _t = _time.time()
     _write_audio(container, audio_stream, audio, audio_sample_rate, av)
     container.close()
+    if _dbg:
+        print(f"[ltx25] STAGE_DEBUG mp4.audio_mux_close {_time.time() - _t:.3f}s", flush=True)
