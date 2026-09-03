@@ -77,6 +77,15 @@ class GenerateRequest(BaseModel):
     fps: float = Field(default=24.0, ge=8.0, le=60.0)
     steps: int = Field(default=30, ge=1, le=100)
     guidance_scale: float = Field(default=3.0, ge=0.0, le=20.0)
+    # a2v のリップシンク調整ノブ(2026-09-03 追加、既定 None = 従来どおり 1.0 固定)。
+    # 蒸留8step経路では guidance_scale=1.0 固定だが、実写系参照で「音声条件より
+    # 画像の静止状態が勝って口が動かない」症状の対策として、音声側の条件付け強度
+    # だけをリクエスト単位で上げられるようにする。
+    # - audio_modality_scale > 1.0: 音声モダリティの寄与を直接スケール
+    # - audio_guidance_scale > 1.0: 音声CFGを有効化(パイプラインが CFG バッチ
+    #   (torch.cat([latents]*2))になる点に注意 — 蒸留モデルへのCFGは品質もA/B必須)
+    audio_guidance_scale: float | None = Field(default=None, ge=0.0, le=15.0)
+    audio_modality_scale: float | None = Field(default=None, ge=0.0, le=15.0)
     seed: int = Field(default=42, ge=0, le=2**63 - 1)
     enhance_prompt: bool = False
     conditions: list[ConditionInput] = Field(default_factory=list, max_length=8)
