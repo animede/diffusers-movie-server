@@ -1017,14 +1017,19 @@ class LTXGenerator:
             # 優先し、読めないコンテナだけ従来の ffprobe(プロセス起動 ~40ms)へ落とす。
             # デコード本体は従来どおり ffmpeg のまま(リサンプラを替えると a2v の
             # 条件付け mel が数値的に変わるため、意図的に触らない)。
+            # 注意: torchaudio.info はこの venv の torchaudio には存在しない
+            # (AttributeError、2026-09-03 実機確認)。PCM wav なら標準 wave モジュールで
+            # ヘッダから正確な尺が取れる(依存ゼロ・subprocess ゼロ)。
             total_duration = None
-            try:
-                import torchaudio as _ta
-                _info = _ta.info(str(audio_source))
-                if _info.num_frames > 0 and _info.sample_rate > 0:
-                    total_duration = _info.num_frames / float(_info.sample_rate)
-            except Exception:
-                total_duration = None
+            if audio_source.suffix.lower() == ".wav":
+                try:
+                    import wave as _wave
+                    with _wave.open(str(audio_source), "rb") as _w:
+                        _n, _sr = _w.getnframes(), _w.getframerate()
+                    if _n > 0 and _sr > 0:
+                        total_duration = _n / float(_sr)
+                except Exception:
+                    total_duration = None
             if total_duration is None:
                 probe = subprocess.run(
                     ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(audio_source)],
@@ -1110,11 +1115,17 @@ class LTXGenerator:
             "frame_rate": effective_fps,
             "sigmas": DISTILLED_SIGMA_VALUES,
             "guidance_scale": 1.0,
-            "audio_guidance_scale": 1.0,
+            # リップシンク調整ノブ(schemas.GenerateRequest の同名フィールド参照)。
+            # None(既定)なら従来どおり 1.0 固定 = 完全互換。
+            "audio_guidance_scale": (
+                request.audio_guidance_scale if request.audio_guidance_scale is not None else 1.0
+            ),
             "stg_scale": 0.0,
             "audio_stg_scale": 0.0,
             "modality_scale": 1.0,
-            "audio_modality_scale": 1.0,
+            "audio_modality_scale": (
+                request.audio_modality_scale if request.audio_modality_scale is not None else 1.0
+            ),
             "enable_prompt_enhancement": request.enhance_prompt,
             "generator": generator,
             # 非refine(リアルタイム)経路は "pt" で受ける(2026-09-03 高速化①):
