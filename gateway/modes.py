@@ -84,8 +84,9 @@ LTX25_EXTRA_KEYS = {
     "retake_start", "retake_end", "regenerate_video", "regenerate_audio",
     "extend_direction", "extend_seconds", "extend_context_seconds",
     "audio_start", "audio_duration",
-    # a2v リップシンク調整ノブ(2026-09-03、backends/ltx2_5/app/schemas.py 参照)
-    "audio_guidance_scale", "audio_modality_scale",
+    # a2v リップシンク調整ノブ(2026-09-03 追加、09-04 訂正: 実効があるのは映像側
+    # modality_scale。audio_* は a2v では no-op — backends/ltx2_5/app/schemas.py 参照)
+    "modality_scale", "audio_guidance_scale", "audio_modality_scale",
     "loras", "strength", "frame_position", "session_number",
     "conditions",  # ConditionInput の index/strength 上書き(asset_ids と同順の dict 配列)
 }
