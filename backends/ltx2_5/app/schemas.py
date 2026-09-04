@@ -6,6 +6,10 @@ from pydantic import BaseModel, Field, model_validator
 class ConditionInput(BaseModel):
     asset_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     kind: Literal["image", "video"]
+    # 注意: index は diffusers LTX-2.5 の条件付けの流儀どおり「latent インデックス」
+    # (ピクセルフレーム ÷ 8、-1 は最終 latent)。ピクセルフレーム番号ではない。
+    # 例: 121 フレーム動画は latent 0〜15、中央付近は index=7(≒フレーム56)。
+    # le=60 は 481 フレーム(20秒上限)の最終 latent に対応する。
     index: int = Field(default=0, ge=-1, le=60)
     strength: float = Field(default=1.0, ge=0.0, le=1.0)
 
@@ -196,8 +200,21 @@ class GenerateRequest(BaseModel):
             self.temporal_upscale = False
             self.decoder = "vae"
         if self.mode == "extend":
-            if len(self.conditions) != 1 or self.conditions[0].kind != "video":
-                raise ValueError("extend mode requires one source video")
+            extend_videos = [c for c in self.conditions if c.kind == "video"]
+            extend_images = [c for c in self.conditions if c.kind == "image"]
+            if len(extend_videos) != 1:
+                raise ValueError("extend mode requires exactly one source video condition")
+            # 任意の画像キーフレーム(2026-09-05 追加、シーンMVのドリフト再アンカー/
+            # 延長区間内カット用): index は「生成窓(context+延長)の latent インデックス」、
+            # -1 = 最終 latent(終端アンカー)。index 0 は context 先頭を上書きして
+            # しまう(first-frame conditioning 意味論)ため禁止。context 区間内への
+            # 指定は generator 側で検出してエラーにする。
+            if any(c.index == 0 for c in extend_images):
+                raise ValueError(
+                    "extend image keyframes must use index -1 (terminal anchor) or a "
+                    "positive latent index inside the extension region (index 0 would "
+                    "overwrite the context start)"
+                )
             self.upscale = False
             self.upscale_method = "latent"
             self.temporal_upscale = False
