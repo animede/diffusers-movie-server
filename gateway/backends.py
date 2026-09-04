@@ -201,8 +201,13 @@ LTX25_PRESETS = {
         # 公式 NVFP4 蒸留 transformer(Blackwell ネイティブ FP4)。sm_120 専用。
         # FP4 テンサーコア GEMM(torch._scaled_mm)で denoise の Linear が
         # bf16 比 ~1.8倍(活性化量子化コスト込み、GEMM 素は ~3.4倍)。
-        env={"LTX25_TRANSFORMER_PRECISION": "nvfp4", "OFFLOAD_MODE": "none"},
-        description="公式 NVFP4 蒸留 transformer + FP4 GEMM 全常駐。sm_120(Blackwell)専用・速度最優先。",
+        # NVENC p4(2026-09-04): このプリセットはリアルタイム用途専用のため
+        # mp4 encode も速度側へ倒す(低画素では画質差軽微)。プリセットに
+        # 焼き込むことで「クライアントが override を付け忘れると p7 に戻る」
+        # 状態を防ぐ(MV が使う nf4-fast 等は従来どおり既定 p7 = 最終出力品質)。
+        env={"LTX25_TRANSFORMER_PRECISION": "nvfp4", "OFFLOAD_MODE": "none",
+             "LTX25_NVENC_PRESET": "p4"},
+        description="公式 NVFP4 蒸留 transformer + FP4 GEMM 全常駐 + NVENC p4。sm_120(Blackwell)専用・速度最優先。",
         vram_hint="transformer ~19GB + TE/VAE(全常駐)",
     ),
 }
