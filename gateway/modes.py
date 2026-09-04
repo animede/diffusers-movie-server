@@ -321,10 +321,27 @@ def build_ltx25_request(mode: str, params: dict[str, Any], extra: dict[str, Any]
         if len(image_assets) != 1 or len(backend_assets) != 1:
             raise ModeError("refine_image(ltx25)は画像アセットちょうど1件が必要です")
         conditions = [_cond(image_assets[0], index=0)]
-    elif mode in ("extend", "retake"):
+    elif mode == "retake":
         if len(video_assets) != 1 or len(backend_assets) != 1:
-            raise ModeError(f"{mode}(ltx25)は動画アセットちょうど1件が必要です")
+            raise ModeError("retake(ltx25)は動画アセットちょうど1件が必要です")
         conditions = [_cond(video_assets[0], index=0)]
+    elif mode == "extend":
+        # 2026-09-05拡張: ソース動画1件に加え、任意の画像キーフレームアンカーを
+        # 受け付ける(ltx2_5 b0c4c9b で解禁。シーンMVのドリフト再アンカー用)。
+        # 画像の既定は index=-1(終端アンカー)・strength=1.0。位置・強さは
+        # extra.conditions(asset_ids と同順)で上書きする。index は latent
+        # インデックス(フレーム÷8)で、index=0 と context 区間内はバックエンドが
+        # 明示エラーにする。
+        if len(video_assets) != 1:
+            raise ModeError("extend(ltx25)はソース動画アセットちょうど1件が必要です")
+        if len(audio_assets) > 0:
+            raise ModeError("extend(ltx25)は音声アセットを受け付けません")
+        if len(image_assets) > 2:
+            raise ModeError("extend(ltx25)の画像キーフレームアンカーは最大2件です")
+        # extra.conditions の上書き契約(asset_ids と同順)を守るため並び順を保持する
+        conditions = [
+            _cond(a, index=0 if a["kind"] == "video" else -1) for a in backend_assets
+        ]
     elif mode == "iclora":
         if len(visual_assets) != 1:
             raise ModeError("iclora(ltx25)は画像/動画アセットちょうど1件が必要です(参照)")
