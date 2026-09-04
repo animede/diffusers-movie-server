@@ -1122,7 +1122,10 @@ class LTXGenerator:
             ),
             "stg_scale": 0.0,
             "audio_stg_scale": 0.0,
-            "modality_scale": 1.0,
+            # 映像側 modality_scale がリップシンクの実効ノブ(schemas の訂正コメント参照)
+            "modality_scale": (
+                request.modality_scale if request.modality_scale is not None else 1.0
+            ),
             "audio_modality_scale": (
                 request.audio_modality_scale if request.audio_modality_scale is not None else 1.0
             ),
