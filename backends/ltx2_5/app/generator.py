@@ -876,10 +876,13 @@ class LTXGenerator:
             if len(matches) != 1:
                 raise ValueError(f"Input asset not found: {condition.asset_id}")
             source = matches[0]
-            if request.mode in {"retake", "extend"}:
+            if request.mode in {"retake", "extend"} and condition.kind == "video":
                 source_edit_path = source
                 source_frames = load_video(str(source))
                 continue
+            # extend の画像条件はキーフレームアンカー(schemas.py の extend 分岐参照)。
+            # 通常の LTX2VideoCondition として下の共通経路へ流し、prepare_extend 側で
+            # context ロックとマージする(index は生成窓の latent インデックス)。
             if condition.kind == "image" and source.suffix.lower() in image_suffixes:
                 frames = load_image(str(source))
                 if request.mode == "iclora":
@@ -985,6 +988,28 @@ class LTXGenerator:
             extend_context_duration = context_intervals / effective_fps
             extend_duration = extension_intervals / effective_fps
 
+            # 画像キーフレームアンカーの位置検証(2026-09-05): index は生成窓の
+            # latent インデックス。context 区間(latent 0..context_end)への指定は
+            # ロック済み領域と衝突するため拒否し、窓外も黙殺(pipeline 側は warning
+            # でスキップする)ではなく明示エラーにする。
+            last_latent = (effective_num_frames - 1) // 8
+            context_end_latent = context_intervals // 8 if request.extend_direction == "end" else -1
+            for _c in request.conditions:
+                if _c.kind != "image":
+                    continue
+                resolved_idx = _c.index if _c.index >= 0 else last_latent
+                if resolved_idx > last_latent:
+                    raise ValueError(
+                        f"extend image keyframe latent index {_c.index} exceeds the "
+                        f"generation window (last latent {last_latent})"
+                    )
+                if request.extend_direction == "end" and resolved_idx <= context_end_latent:
+                    raise ValueError(
+                        f"extend image keyframe latent index {_c.index} falls inside the "
+                        f"locked context region (latents 0..{context_end_latent}); use a "
+                        f"larger index or -1"
+                    )
+
             pixels = pipe.video_processor.preprocess_video(
                 context_frames, height=effective_height, width=effective_width
             ).to(device=pipe._execution_device, dtype=pipe.vae.dtype)
@@ -994,7 +1019,14 @@ class LTXGenerator:
             original_prepare_latents = pipe.prepare_latents
 
             def prepare_extend(this, *args, **kwargs):
-                latents, _mask, _clean, coords = original_prepare_latents(*args, **kwargs)
+                # 元の prepare_latents は画像キーフレーム条件を処理済みの
+                # (latents, mask, clean, coords) を返す(キーフレームは base 系列の
+                # 後ろに追加トークンとして連結される)。旧実装は mask/clean を
+                # 丸ごと自前のものに差し替えていたため条件が無効化されていた。
+                # 2026-09-05: base 区間(先頭 base_len トークン)だけ context ロックを
+                # 適用し、キーフレーム由来の mask/clean/coords は温存するマージ方式へ
+                # 変更(キーフレーム無しなら従来と同値)。
+                latents, orig_mask, orig_clean, coords = original_prepare_latents(*args, **kwargs)
                 normalized_context = this._normalize_latents(
                     context_latents, this.vae.latents_mean, this.vae.latents_std, this.vae.config.scaling_factor
                 ).to(device=latents.device, dtype=latents.dtype)
@@ -1016,8 +1048,13 @@ class LTXGenerator:
                 mask = this._pack_latents(
                     keep, this.transformer_spatial_patch_size, this.transformer_temporal_patch_size
                 )
-                latents = latents * (1 - mask) + clean * mask
-                return latents, mask, clean, coords
+                base_len = mask.shape[1]
+                latents[:, :base_len] = latents[:, :base_len] * (1 - mask) + clean * mask
+                merged_mask = orig_mask.clone()
+                merged_mask[:, :base_len] = torch.maximum(orig_mask[:, :base_len], mask)
+                merged_clean = orig_clean.clone()
+                merged_clean[:, :base_len] = orig_clean[:, :base_len] * (1 - mask) + clean * mask
+                return latents, merged_mask, merged_clean, coords
 
             restore_prepare_latents = original_prepare_latents
             pipe.prepare_latents = types.MethodType(prepare_extend, pipe)
