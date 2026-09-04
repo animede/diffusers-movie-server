@@ -35,6 +35,10 @@ class Settings(BaseSettings):
     # when NVENC is unavailable) or "x264" (libx264 preset=slower, CPU).
     # Env: LTX25_VIDEO_ENCODER
     ltx25_video_encoder: str = "nvenc"
+    # NVENC のエンコードプリセット(p1=最速 .. p7=最遅・最高品質)。既定 p7 は
+    # MV 等の最終出力品質を優先した値。リアルタイム用途(低画素・短尺)では
+    # LTX25_NVENC_PRESET=p4 で mp4 encode を ~0.1-0.15s 短縮できる(2026-09-04)。
+    ltx25_nvenc_preset: str = "p7"
     # Diffusion-decoder tiling: "auto" (single tile when free VRAM allows --
     # ~1.23x faster and seam-free; falls back to default tiles otherwise),
     # "on" (always single tile), "off" (always default 768^2x80f tiles).

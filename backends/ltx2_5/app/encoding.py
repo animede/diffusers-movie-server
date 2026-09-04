@@ -20,6 +20,7 @@ def encode_video_crf(
     crf: int = 18,
     preset: str = "slower",
     encoder: str = "x264",
+    nvenc_preset: str = "p7",
 ) -> None:
     """Encode frames (F, H, W, 3) — float in [0, 1] or uint8 — to H.264 mp4 with audio.
 
@@ -65,7 +66,7 @@ def encode_video_crf(
         stream.options = {
             "rc": "vbr",
             "cq": str(int(crf)),
-            "preset": "p7",
+            "preset": nvenc_preset,
             "tune": "hq",
             "b:v": "0",
         }
