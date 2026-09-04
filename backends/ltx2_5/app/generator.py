@@ -175,6 +175,25 @@ class _InterruptController:
 interrupt_controller = _InterruptController()
 
 
+
+def _subsample_distilled_sigmas(sigmas, steps):
+    """蒸留σ列の間引き(steps<len のときのみ。先頭・末尾を含む等間隔選択)。"""
+    try:
+        steps = int(steps or 0)
+    except (TypeError, ValueError):
+        return sigmas
+    n = len(sigmas)
+    if steps <= 0 or steps >= n:
+        return sigmas
+    if steps == 1:
+        picked = [sigmas[0]]
+    else:
+        idx = [round(i * (n - 1) / (steps - 1)) for i in range(steps)]
+        picked = [sigmas[i] for i in idx]
+    print(f"[ltx25] distilled sigma subsample: {steps}/{n} steps -> {picked}", flush=True)
+    return picked
+
+
 class LTXGenerator:
     """Lazily loads the gated model so health checks remain cheap."""
 
@@ -1113,7 +1132,12 @@ class LTXGenerator:
             "min_seconds": request.min_seconds,
             "max_seconds": request.max_seconds,
             "frame_rate": effective_fps,
-            "sigmas": DISTILLED_SIGMA_VALUES,
+            # 蒸留8σスケジュール。steps<8 を明示されたときだけ間引く(2026-09-04、
+            # リアルタイム高速化)。従来 request.steps はこの経路で黙殺されており
+            # 「4steps 指定」は効いていなかった。間引きは先頭・末尾を必ず含む
+            # 等間隔インデックス(例 4steps: idx 0,2,5,7)。蒸留の学習分布外に
+            # なるため品質は A/B 前提。steps>=8・未指定は従来どおり8σ固定。
+            "sigmas": _subsample_distilled_sigmas(DISTILLED_SIGMA_VALUES, request.steps),
             "guidance_scale": 1.0,
             # リップシンク調整ノブ(schemas.GenerateRequest の同名フィールド参照)。
             # None(既定)なら従来どおり 1.0 固定 = 完全互換。
@@ -1389,6 +1413,7 @@ class LTXGenerator:
                 output_path=encode_target,
                 crf=self.config.ltx25_video_crf,
                 encoder=self.config.ltx25_video_encoder,
+                nvenc_preset=self.config.ltx25_nvenc_preset,
             )
             print(f"[ltx25] stage timing: mp4 encode {time.time() - encode_t0:.1f}s", flush=True)
             if request.mode == "retake":
