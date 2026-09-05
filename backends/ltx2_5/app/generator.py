@@ -1478,6 +1478,13 @@ class LTXGenerator:
             torch.cuda.empty_cache()
             # progress(1.0) は encode 完了時に jobs 側が立てる(ここではまだ完了ではない)。
             return {"peak_vram_gb": peak_vram_gb, "deferred_encode": _encode_and_finalize}
+        # 同期エンコード(retake/extend 等)も NVENC を開く**前**に torch の予約
+        # キャッシュを返す(2026-09-06)。従来はエンコード後にしか empty_cache して
+        # おらず、直前の大きいジョブでキャッシュが育っていると NVENC の
+        # avcodec_open2 が VRAM を確保できず失敗した(実機: 1024×576×361f の
+        # i2v 連発後の extend で "avcodec_open2(h264_nvenc)" エラー)。
+        gc.collect()
+        torch.cuda.empty_cache()
         _encode_and_finalize()
         progress(1.0)
         gc.collect()
