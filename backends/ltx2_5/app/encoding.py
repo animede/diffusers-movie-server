@@ -32,7 +32,41 @@ def encode_video_crf(
     preset p7 + tune hq. At cq18/p7 perceptual quality is close to x264 crf18 while
     encoding is an order of magnitude faster (PyAV 16 bundles nvenc; verified on
     this venv/GPU).
+
+    NVENC 失敗時は libx264 で自動リトライする(2026-09-06)。従来のフォールバックは
+    `add_stream()` 例外しか拾っていなかったが、実際の失敗は `avcodec_open2` が
+    エンコード開始時に走る段階でも起きる(実機: VRAM 逼迫時に
+    "Generic error in an external library: 'avcodec_open2(h264_nvenc)'" でジョブが
+    落ちた)。エンコード全体を try で包み、NVENC 起因の失敗なら出力を消して
+    libx264 でやり直す。
     """
+    if encoder == "nvenc":
+        try:
+            return _encode_video_crf_impl(
+                frames, fps, audio, audio_sample_rate, output_path,
+                crf=crf, preset=preset, encoder="nvenc", nvenc_preset=nvenc_preset,
+            )
+        except Exception as exc:
+            print(f"[encoding] h264_nvenc encode failed ({exc}); retrying with libx264", flush=True)
+            Path(output_path).unlink(missing_ok=True)
+            encoder = "x264"
+    return _encode_video_crf_impl(
+        frames, fps, audio, audio_sample_rate, output_path,
+        crf=crf, preset=preset, encoder=encoder, nvenc_preset=nvenc_preset,
+    )
+
+
+def _encode_video_crf_impl(
+    frames: np.ndarray,
+    fps: float,
+    audio: torch.Tensor,
+    audio_sample_rate: int,
+    output_path: Path | str,
+    crf: int = 18,
+    preset: str = "slower",
+    encoder: str = "x264",
+    nvenc_preset: str = "p7",
+) -> None:
     import av
     from diffusers.utils.export_utils import _prepare_audio_stream, _write_audio
 
