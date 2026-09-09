@@ -205,9 +205,13 @@ LTX25_PRESETS = {
         # mp4 encode も速度側へ倒す(低画素では画質差軽微)。プリセットに
         # 焼き込むことで「クライアントが override を付け忘れると p7 に戻る」
         # 状態を防ぐ(MV が使う nf4-fast 等は従来どおり既定 p7 = 最終出力品質)。
+        # CUDA Graph(2026-09-09): transformer.forward 全体を capture/replay して
+        # denoise のカーネル起動律速を潰す(app/cudagraph.py、実測 denoise 3.8x・
+        # 出力 bit 一致)。OFFLOAD_MODE=none のこのプリセットに焼き込む
+        # (他プリセットは従来どおり eager。LoRA ジョブは自動で eager に落ちる)。
         env={"LTX25_TRANSFORMER_PRECISION": "nvfp4", "OFFLOAD_MODE": "none",
-             "LTX25_NVENC_PRESET": "p4"},
-        description="公式 NVFP4 蒸留 transformer + FP4 GEMM 全常駐 + NVENC p4。sm_120(Blackwell)専用・速度最優先。",
+             "LTX25_NVENC_PRESET": "p4", "LTX25_CUDA_GRAPH": "1"},
+        description="公式 NVFP4 蒸留 transformer + FP4 GEMM 全常駐 + NVENC p4 + CUDA Graph denoise。sm_120(Blackwell)専用・速度最優先。",
         vram_hint="transformer ~19GB + TE/VAE(全常駐)",
     ),
 }
