@@ -69,6 +69,15 @@ class Settings(BaseSettings):
     # 1 shape あたり静的入出力バッファ+graph 中間メモリ(共有 mempool)を保持する。
     # Env: LTX25_CUDA_GRAPH_MAX_CAPTURES
     ltx25_cuda_graph_max_captures: int = 8
+    # 【実験的・非推奨】transformer_blocks の per-block torch.compile
+    # (app/compileblocks.py のモジュール docstring の結論を必ず読むこと)。
+    # "off"(既定)/ "islands" / "fusion"。probe では graph 単体に勝つが、
+    # サーバ E2E では同 shape で誤差範囲・リアルタイム小 shape では退行
+    # (2.39s vs 1.83s)のため本番では使わない。品質面も eager と bit 一致しない
+    # (軌道差、ユーザー判定では同等)。nvfp4 + LTX25_CUDA_GRAPH=1 +
+    # OFFLOAD_MODE=none が前提(それ以外は警告して無効)。
+    # Env: LTX25_COMPILE_BLOCKS
+    ltx25_compile_blocks: str = "off"
 
 
 settings = Settings()

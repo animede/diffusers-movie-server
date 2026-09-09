@@ -354,6 +354,29 @@ class LTXGenerator:
                 upsample_pipe.enable_model_cpu_offload()
                 if temporal_upsample_pipe is not None:
                     temporal_upsample_pipe.enable_model_cpu_offload()
+            if self.config.ltx25_compile_blocks != "off":
+                # per-block torch.compile(app/compileblocks.py)。CUDA Graph の
+                # install より前に適用する(graph は compile 済みブロックの呼び出しを
+                # capture する必要がある)。compiled eager 単体は素の eager より遅い
+                # ため、graph 無効時・nvfp4 以外・offload 有効時は適用しない。
+                _cb = self.config.ltx25_compile_blocks
+                if (
+                    self.config.ltx25_transformer_precision == "nvfp4"
+                    and self.config.ltx25_cuda_graph
+                    and self.config.offload_mode == "none"
+                ):
+                    from .compileblocks import apply_block_compile
+
+                    apply_block_compile(pipe.transformer, _cb)
+                else:
+                    print(
+                        f"[ltx25] LTX25_COMPILE_BLOCKS={_cb} ignored: requires "
+                        "precision=nvfp4 + LTX25_CUDA_GRAPH=1 + OFFLOAD_MODE=none "
+                        f"(got precision={self.config.ltx25_transformer_precision!r}, "
+                        f"cuda_graph={self.config.ltx25_cuda_graph}, "
+                        f"offload={self.config.offload_mode!r})",
+                        flush=True,
+                    )
             if self.config.ltx25_cuda_graph:
                 # transformer.forward 全体の CUDA Graph 化(app/cudagraph.py 参照)。
                 # OFFLOAD_MODE=none 限定: model/sequential offload は重みのデバイスが
