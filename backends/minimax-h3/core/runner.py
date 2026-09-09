@@ -1352,10 +1352,12 @@ if H3_TURBO_LORA and H3_LOWVRAM_GROUP:
     )
 
 # スケジューラの exponential shift の上書き (既定は空 = 触らない)。H3 の既定は
-# video 12.0 / audio 3.0 (scheduler_config.json) で、turbo v0.1・8step v1.0 も同じ格子で
-# 蒸留されているため通常は不要。**turbo 4step v1.0 768p だけは video shift 6 で蒸留**
-# されており (上流 ModelTC/Minimax-H3-Turbo の Model specs 表: Training shifts 6 / 3)、
-# その LoRA を使うときは `H3_VIDEO_SHIFT=6` を併せて指定しないとサンプリング格子が
+# video 12.0 / audio 3.0 (scheduler_config.json)。lightx2v turbo LoRA の訓練 shift は
+# **fl2v 系の `_768p` バリアントだけが video shift 6** で、それ以外 (fl2v 非768p、
+# ref2v 系は 768p 表記を含め全て) は基底と同じ 12 / 3
+# (上流 ModelTC/Minimax-H3-Turbo の Model specs 表 + ref2v 8step v1.0 768p は
+# HF discussions/51 の公式推奨 "video shift 12 / audio shift 3" で確認。2026-09-09)。
+# fl2v 768p 系を使うときは `H3_VIDEO_SHIFT=6` を併せて指定しないとサンプリング格子が
 # 蒸留時とずれる。適用箇所は `_ensure_vaes` のスケジューラロード直後 (プロセスに1回。
 # scheduler は _pipe/_pipe_ref で同一オブジェクトを共有するため1箇所で足りる)。
 H3_VIDEO_SHIFT = os.environ.get("H3_VIDEO_SHIFT", "").strip()
@@ -1369,13 +1371,18 @@ H3_AUDIO_SHIFT = os.environ.get("H3_AUDIO_SHIFT", "").strip()
 # ごとに on/off できる) なので、shift もそれに追従する必要がある (固定してしまうと
 # turbo=0 のリクエストが誤った格子で走る)。
 # 解決規則: 明示指定があればその値を最優先。空なら
-# H3_TURBO_LORA_FILE のファイル名に `_768p` を含むかどうかで自動判定する
-# (768p 系だけ video shift 6 で蒸留されている -- 上の H3_VIDEO_SHIFT のコメント参照)。
-# 該当しなければ「切替なし」(turbo=1 でも配布既定/H3_VIDEO_SHIFT のまま)。
+# H3_TURBO_LORA_FILE のファイル名が「fl2v 系かつ `_768p`」のときだけ 6 に切り替える
+# (video shift 6 で蒸留されているのは fl2v の 768p バリアントだけ -- 上の
+# H3_VIDEO_SHIFT のコメント参照)。該当しなければ「切替なし」(turbo=1 でも
+# 配布既定/H3_VIDEO_SHIFT のまま)。
+# 【2026-09-09 修正】旧規則は `_768p` だけを見ていたため、ref2v 8step v1.0 768p
+# (訓練/推奨 shift 12) に shift 6 を誤適用していた (gateway ログ 2026-09-03 21:52:11
+# で実害を確認 -- mv_studio_V3 の balance tier がこの誤 shift で走っていた)。
+# A/B 実測は outputs/ab_8step4_20260909/README.md 参照。
 H3_TURBO_VIDEO_SHIFT_RAW = os.environ.get("H3_TURBO_VIDEO_SHIFT", "").strip()
 if H3_TURBO_VIDEO_SHIFT_RAW:
     H3_TURBO_VIDEO_SHIFT: float | None = float(H3_TURBO_VIDEO_SHIFT_RAW)
-elif "_768p" in H3_TURBO_LORA_FILE:
+elif "_fl2v_" in H3_TURBO_LORA_FILE and "_768p" in H3_TURBO_LORA_FILE:
     H3_TURBO_VIDEO_SHIFT = 6.0
 else:
     H3_TURBO_VIDEO_SHIFT = None
@@ -4494,9 +4501,10 @@ class MiniMaxH3Runner:
 
         No-op entirely when `H3_TURBO_VIDEO_SHIFT` (module-level, resolved from either
         the env var or the configured turbo LoRA file's name -- see its own module
-        comment) is `None`: this happens for every non-`_768p` turbo LoRA file (v0.1,
-        8step v1.0), which were both distilled at the same shift the base model already
-        defaults to, so there is nothing to switch between turbo=1 and turbo=0 for.
+        comment) is `None`: this happens for every LoRA file that is not an fl2v
+        `_768p` variant (fl2v non-768p, and all ref2v files including the `_768p`-named
+        ref2v 8step v1.0), which were all distilled at the same shift the base model
+        already defaults to, so there is nothing to switch between turbo=1 and turbo=0.
         Also effectively unreachable when `H3_TURBO_LORA=0` (LoRA disabled for this
         process): callers only invoke this after `settings.resolve_instant_settings()`,
         and `turbo_effective` can only be True if `H3_TURBO_LORA=1` unless a request
