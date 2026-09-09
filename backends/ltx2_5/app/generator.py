@@ -203,6 +203,7 @@ class LTXGenerator:
         self._upsample_pipe = None
         self._temporal_upsample_pipe = None
         self._diffusion_decode_pipe = None
+        self._graph_runner = None
         self._load_lock = threading.Lock()
 
     def load(self):
@@ -353,6 +354,30 @@ class LTXGenerator:
                 upsample_pipe.enable_model_cpu_offload()
                 if temporal_upsample_pipe is not None:
                     temporal_upsample_pipe.enable_model_cpu_offload()
+            if self.config.ltx25_cuda_graph:
+                # transformer.forward 全体の CUDA Graph 化(app/cudagraph.py 参照)。
+                # OFFLOAD_MODE=none 限定: model/sequential offload は重みのデバイスが
+                # リクエスト間で動き、capture 済み graph が焼き込んだアドレスと
+                # 食い違って黙って壊れるため適用しない。
+                if self.config.offload_mode == "none":
+                    from .cudagraph import ForwardGraphRunner
+
+                    self._graph_runner = ForwardGraphRunner(
+                        pipe.transformer,
+                        max_captures=self.config.ltx25_cuda_graph_max_captures,
+                    )
+                    self._graph_runner.install()
+                    print(
+                        "[ltx25] CUDA graph capture enabled for transformer.forward "
+                        f"(max_captures={self.config.ltx25_cuda_graph_max_captures})",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        "[ltx25] LTX25_CUDA_GRAPH=1 ignored: requires OFFLOAD_MODE=none "
+                        f"(got {self.config.offload_mode!r})",
+                        flush=True,
+                    )
             self._pipe = pipe
             self._upsample_pipe = upsample_pipe
             self._temporal_upsample_pipe = temporal_upsample_pipe
@@ -366,6 +391,13 @@ class LTXGenerator:
         Callers must ensure no job is running (app.main checks before calling)."""
         freed = []
         with self._load_lock:
+            if self._graph_runner is not None:
+                # capture 済み graph は transformer の重み・mempool を参照し続けるため、
+                # パイプライン参照を落とす前に破棄しないと VRAM が返らない。
+                self._graph_runner.reset()
+                self._graph_runner.uninstall()
+                self._graph_runner = None
+                freed.append("cuda_graphs")
             for attr in ("_pipe", "_upsample_pipe", "_temporal_upsample_pipe",
                          "_diffusion_decode_pipe"):
                 if getattr(self, attr) is not None:
@@ -628,6 +660,14 @@ class LTXGenerator:
         pipe = self.load()
         adapter_names = []
         lora_root = self.config.lora_dir.resolve()
+        # LoRA を載せるジョブ(job loras / pixel upscale の IC-LoRA)は CUDA graph 不可:
+        # capture は重みテンソルのアドレスを焼き込むため、adapter の付け外しをまたぐ
+        # replay は stale な重みを黙って使う。eager に落とし、ジョブ後に capture を捨てる。
+        _graph_lora_guard = self._graph_runner is not None and (
+            bool(request.loras) or request.upscale_method == "pixel"
+        )
+        if _graph_lora_guard:
+            self._graph_runner.enabled = False
         try:
             for index, item in enumerate(request.loras):
                 path = (lora_root / item.id).resolve()
@@ -651,6 +691,11 @@ class LTXGenerator:
                     pipe.unload_lora_weights()
                 except Exception as exc:
                     print(f"[ltx25] LoRA cleanup failed: {exc}", flush=True)
+            if _graph_lora_guard:
+                # unload_lora_weights 後の構造復元を信用せず、防御的に capture を捨てる
+                # (次の非 LoRA ジョブが ~1s で再 capture する)。
+                self._graph_runner.reset()
+                self._graph_runner.enabled = True
 
     def _generate_still_impl(
         self, request: GenerateRequest, target: Path, progress: Callable[[float], None]

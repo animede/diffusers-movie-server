@@ -59,6 +59,16 @@ class Settings(BaseSettings):
     # distilled-transformer-nvfp4.safetensors") resolves it (18.7GB, cached).
     # Env: LTX25_NVFP4_CKPT
     ltx25_nvfp4_ckpt: str | None = None
+    # transformer.forward 全体を CUDA Graph capture/replay して denoise の
+    # カーネル起動律速を潰す(app/cudagraph.py。実測 512x288x121f t2v 8steps:
+    # denoise 1.82s→0.48s(3.8x)、映像・音声とも eager と bit 一致)。
+    # OFFLOAD_MODE=none 前提(それ以外では警告して無効)。LoRA ジョブは自動で
+    # eager に落ちる。Env: LTX25_CUDA_GRAPH
+    ltx25_cuda_graph: bool = False
+    # capture を保持する shape 数の上限。超過分の新 shape は eager フォールバック。
+    # 1 shape あたり静的入出力バッファ+graph 中間メモリ(共有 mempool)を保持する。
+    # Env: LTX25_CUDA_GRAPH_MAX_CAPTURES
+    ltx25_cuda_graph_max_captures: int = 8
 
 
 settings = Settings()
