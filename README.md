@@ -284,3 +284,10 @@ curl -X POST http://127.0.0.1:8630/api/v1/prompt/enhance \
 9. h3 の `negative_prompt` / `guidance_scale` / `fps` は無視される(notes に記録)。
 10. venv・モデルは旧ディレクトリへの symlink 共有 — **旧ディレクトリ削除禁止**
     (`docs/MIGRATION.md` 参照)。
+
+## ライセンス
+
+このリポジトリで独自に実装したアプリケーションコードは [Apache License 2.0](LICENSE) で提供します。
+
+> [!IMPORTANT]
+> Apache License 2.0 は MiniMax-H3 / LTX-2.5 / Gemma 等のモデル重み、派生 LoRA・チェックポイント、その他の第三者製コンポーネントには適用されません。各モデルのライセンスを個別に確認してください。
