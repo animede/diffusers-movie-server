@@ -3939,6 +3939,13 @@ class MiniMaxH3Runner:
         """
         if getattr(self, "_turbo_lora_path", None) is not None:
             return
+        # H3_TE_PROJ と同じ流儀: H3_TURBO_LORA_FILE が実在する絶対パスならローカル
+        # ファイルとして直接使う (HF に無い自作/フィルタ済み LoRA の A/B 用。
+        # 2026-09-10、FastH3 dense LoRA の adaln 除外版検証で追加)。
+        if os.path.isabs(H3_TURBO_LORA_FILE) and os.path.isfile(H3_TURBO_LORA_FILE):
+            self._turbo_lora_path = H3_TURBO_LORA_FILE
+            logger.info("turbo LoRA checkpoint resolved: %s (local file)", H3_TURBO_LORA_FILE)
+            return
         from huggingface_hub import hf_hub_download
 
         t0 = time.time()
