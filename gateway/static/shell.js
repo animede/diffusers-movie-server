@@ -266,11 +266,11 @@ function selectedGpus(backend) {
 
 function onStartClicked(backend) {
   const status = state.status || {};
-  const active = status.active_backend;
-  if (active && active !== backend) {
+  const others = loadedBackends(status).filter(function (n) { return n !== backend; });
+  if (others.length) {
+    const names = others.map(function (n) { return LABELS[n] || n; }).join("・");
     const ok = window.confirm(
-      "現在の " + (LABELS[active] || active) + " を停止して "
-      + LABELS[backend] + " を起動します。よろしいですか?");
+      "現在の " + names + " を停止して " + LABELS[backend] + " を起動します。よろしいですか?");
     if (!ok) return;
   }
   startBackend(backend, selectedPreset(backend), null, selectedGpus(backend));
@@ -322,9 +322,22 @@ function showStartError(backend, message) {
   ctlErr.hidden = false;
 }
 
+// coresident(複数バックエンドが同時に重みを持つ)では active_backend は1つしか
+// 表せないので、判定は backends[name] の2軸(プロセス生存 / 重みロード済み)で行う。
+function loadedBackends(st) {
+  if (!st) return [];
+  if (Array.isArray(st.loaded_backends)) return st.loaded_backends;
+  return st.active_backend ? [st.active_backend] : [];  // 旧 gateway 互換
+}
+
+function isLoaded(st, backend) {
+  const b = st && st.backends && st.backends[backend];
+  if (b) return !!(b.process_alive && b.weights_loaded);
+  return !!(st && st.active_backend === backend);
+}
+
 function backendReady(backend) {
-  const st = state.status;
-  return !!(st && st.active_backend === backend && st.backend_health);
+  return isLoaded(state.status, backend);
 }
 
 function renderBackendTab(backend) {
@@ -589,16 +602,18 @@ function renderControls() {
   const spin = $("ctl-spinner");
 
   const targetBackend = $("ctl-backend").value;
-  const otherActive = st.active_backend && st.active_backend !== targetBackend;
-  loadBtn.textContent = otherActive
-    ? "切替(" + (LABELS[st.active_backend] || st.active_backend) + " を停止して起動)"
+  const loaded = loadedBackends(st);
+  const others = loaded.filter(function (n) { return n !== targetBackend; });
+  loadBtn.textContent = others.length
+    ? "切替(" + others.map(function (n) { return LABELS[n] || n; }).join("・")
+      + " を停止して起動)"
     : "起動";
-  loadBtn.disabled = loading || (busy && st.active_backend !== targetBackend);
-  unloadBtn.disabled = loading || busy || !st.active_backend;
+  loadBtn.disabled = loading || (busy && !isLoaded(st, targetBackend));
+  unloadBtn.disabled = loading || busy || !loaded.length;
 
   const reasons = [];
   if (busy) reasons.push("生成中(busy)のため切替・アンロードはできません。");
-  if (!st.active_backend) reasons.push("アクティブなバックエンドはありません(アンロード不要)。");
+  if (!loaded.length) reasons.push("ロード済みのバックエンドはありません(アンロード不要)。");
   note.textContent = reasons.join(" ");
 
   spin.hidden = !loading;

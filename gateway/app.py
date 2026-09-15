@@ -72,6 +72,8 @@ class LoadRequest(BaseModel):
     toggles: dict[str, bool] = Field(default_factory=dict)  # 例: {"turbo": true}
     # Phase 5a: "process"(既定・従来どおりプロセス再起動)| "resident"
     # (プロセス温存 + in-process unload/reload による高速切替)
+    # Phase 7: "coresident"(他バックエンドに触らず、重みを VRAM に載せたまま同居。
+    # 生成の排他は実行ゲート側で担保するので切替コストがゼロになる)
     strategy: str = "process"
     # Phase 6: 実行GPUの選択(例 "0" / "1" / "0,1")。指定時は子プロセスの
     # CUDA_VISIBLE_DEVICES に設定(可視GPUは 0 から再番号付けされる点に注意)
@@ -79,7 +81,10 @@ class LoadRequest(BaseModel):
 
 
 class UnloadRequest(BaseModel):
-    strategy: str = "process"  # "resident" なら VRAM 解放のみ(プロセス温存)
+    strategy: str = "process"  # "resident"/"coresident" なら VRAM 解放のみ(プロセス温存)
+    # 指定するとそのバックエンドだけを対象にする(coresident で片方だけ降ろす用)。
+    # 省略時は従来どおり管理下の全バックエンドが対象。
+    backend: str | None = None
 
 
 @app.get("/api/v1/backends")
@@ -112,7 +117,8 @@ def api_backend_load(req: LoadRequest):
 @app.post("/api/v1/backend/unload")
 def api_backend_unload(req: UnloadRequest | None = None):
     try:
-        return manager.unload(strategy=req.strategy if req else "process")
+        return manager.unload(strategy=req.strategy if req else "process",
+                              backend_name=req.backend if req else None)
     except ValidationError as exc:
         raise HTTPException(400, str(exc))
     except BusyError as exc:
@@ -281,7 +287,7 @@ class PromptEnhanceRequest(BaseModel):
 def api_prompt_enhance(req: PromptEnhanceRequest):
     if req.backend not in BACKENDS:
         raise HTTPException(400, f"未知のバックエンドです: {req.backend!r}")
-    if manager.active_backend_name() != req.backend:
+    if not manager.is_loaded(req.backend):
         raise HTTPException(
             502,
             f"バックエンド {req.backend} は起動していません。"
@@ -347,7 +353,7 @@ for _name, _dir in _OUTPUT_DIRS.items():
 
 async def _passthrough(prefix: str, path: str, request: Request):
     backend = BACKENDS[prefix]
-    if manager.active_backend_name() != prefix:
+    if not manager.is_loaded(prefix):
         return JSONResponse(
             status_code=502,
             content={"detail": (

@@ -251,7 +251,10 @@ class JobRegistry:
             modes.build_ltx25_request(mode, params or {}, extra or {}, dummy)
 
         # バックエンド起動確認(未起動なら auto_load で既定/指定プリセット起動)
-        if manager.active_backend_name() != backend:
+        # 注意: auto_load は既定の process 戦略で起動するため、**他バックエンドが
+        # ロード済みならそれを停止する**(従来どおりの挙動)。coresident で同居させたい
+        # ときは先に POST /api/v1/backend/load {"strategy":"coresident"} を明示すること。
+        if not manager.is_loaded(backend):
             if not auto_load:
                 raise NotActiveError(
                     f"バックエンド {backend} は起動していません(auto_load=false)。"
@@ -264,6 +267,15 @@ class JobRegistry:
             raise BusyError(
                 f"バックエンド {backend} が生成中(busy)です。"
                 "完了を待ってから再試行してください(Phase 2 はキューイング非対応)")
+
+        # 実行ゲート(Phase 7): coresident では VRAM は同時に持てるが、生成を重ねると
+        # 計算資源を食い合う(2026-09-15 実測: LTX 3.46→6.55秒 = 1.89倍、H3 25.7→38.4秒
+        # = 1.49倍。LTX は 4.8秒のリアルタイム予算を超えて破綻する)。ここで直列化する。
+        other = manager.other_busy(backend)
+        if other is not None:
+            raise BusyError(
+                f"他バックエンド {other} が生成中です。同一GPU上で生成を重ねると双方が"
+                "大幅に遅くなるため直列化しています。完了を待ってから再試行してください")
 
         job = UnifiedJob(id=uuid.uuid4().hex[:16], backend=backend, mode=mode)
         with self._lock:
@@ -346,7 +358,7 @@ class JobRegistry:
     def _refresh_ltx25(self, job: UnifiedJob) -> None:
         if job.status in TERMINAL:
             return
-        if manager.active_backend_name() != "ltx25":
+        if not manager.is_loaded("ltx25"):
             job.status = "failed"
             job.error = "バックエンド ltx25 がジョブ完了前に停止しました(切替/unload)"
             job.finished_at = time.time()
@@ -412,7 +424,7 @@ class JobRegistry:
         """running 中のみ /api/progress を中継して progress を更新する。"""
         if job.status != "running":
             return
-        if manager.active_backend_name() != "h3":
+        if not manager.is_loaded("h3"):
             return  # worker スレッドが接続断で failed にする
         try:
             with httpx.Client(timeout=5.0) as client:

@@ -1,9 +1,19 @@
 """バックエンドプロセスマネージャ。
 
-- 「VRAM を持てる(アクティブ)のは同時1バックエンドのみ」の排他原則。切替は
+- 既定は「VRAM を持てるのは同時1バックエンドのみ」の排他原則。切替は
   「busy でないこと確認 → 旧の解放完了 → 新の有効化」の直列。全操作は
   threading.Lock 1本で排他する(FastAPI 側は def エンドポイント=スレッドプール
   実行なので同期ロックで良い)。
+- Phase 7 (coresident): **VRAM は両方保持し、実行(生成)だけを排他する**モード。
+  「重みの再ロードを一切起こさずに LTX⇔H3 を切り替えたい」用途のために足した。
+  排他の軸が2つに分かれるので、状態も2軸で持つ:
+    - `_loaded`: 重みを VRAM に持つことを許可されたバックエンドの**集合**
+      (process/resident では常に 0〜1 個、coresident では複数になりうる)
+    - 実行ゲート: 状態は持たず、投入時に「自分以外が busy でないか」を
+      バックエンドへ問い合わせて判定する(`other_busy()`)。生成の直列化は
+      これ1点で担保する。
+  2026-09-15 の実機実測では GPU0(96GB)で LTX nvfp4-fast 常駐 + H3 int8 単騎が
+  同居でき、ピーク 83.2GiB・余裕 12.4GiB・切替コスト 0・速度劣化なしだった。
 - Phase 5a: 切替戦略を2種類サポートする。
   - "process"(既定・従来どおり): 旧プロセスを停止(kill)してから新プロセスを起動。
   - "resident": 旧プロセスは生かしたまま `/api/admin/unload` で VRAM だけ解放し
@@ -15,8 +25,8 @@
 - 起動: subprocess で run.sh を env 付き起動。ログは gateway/logs/<backend>.log、
   PID は gateway/run/<backend>.pid。
 - 孤児処理: gateway 起動時に PID ファイル + ポートの生存を確認し、一致すれば
-  adopt(管理下へ戻す)。resident 運用では複数プロセスが同時に生きているのが
-  正常なので、生存プロセスは全て adopt し、「アクティブ(重みロード済み)」は
+  adopt(管理下へ戻す)。resident/coresident 運用では複数プロセスが同時に生きて
+  いるのが正常なので、生存プロセスは全て adopt し、「重みロード済み」は
   各バックエンドの自己申告(h3 runner status / ltx25 health.loaded)から推定する。
   PID ファイルと不一致のリスナーはエラー報告のみ(勝手に kill しない)。
 """
@@ -56,7 +66,7 @@ UNLOAD_VRAM_TIMEOUT_S = 90.0
 ADMIN_TIMEOUT_S = 120.0        # /api/admin/unload の HTTP タイムアウト
 RELOAD_TIMEOUT_S = 900.0       # /api/admin/reload(h3 96gb preload は数十秒〜)
 
-VALID_STRATEGIES = ("process", "resident")
+VALID_STRATEGIES = ("process", "resident", "coresident")
 
 
 class BusyError(RuntimeError):
@@ -106,6 +116,25 @@ def _pid_vram_mb(pid: int) -> int | None:
         return None
 
 
+def _gpu_vram_mb() -> list[dict] | None:
+    """GPU ごとの使用量/総量。coresident の load 応答に載せて余裕を可視化する。"""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,memory.used,memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10)
+        if out.returncode != 0:
+            return None
+        gpus = []
+        for line in out.stdout.strip().splitlines():
+            idx, used, total = [part.strip() for part in line.split(",")]
+            gpus.append({"index": int(idx), "used_mb": int(used),
+                         "total_mb": int(total), "free_mb": int(total) - int(used)})
+        return gpus
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+
+
 @dataclass
 class ManagedProcess:
     backend: BackendDef
@@ -130,7 +159,9 @@ class ProcessManager:
     def __init__(self) -> None:
         self._lock = Lock()
         self._procs: dict[str, ManagedProcess] = {}   # backend name -> live process
-        self._active: str | None = None               # VRAM を持てる唯一のバックエンド
+        # 重みを VRAM に持つことを許可されたバックエンド。process/resident 戦略では
+        # 常に 0〜1 個(従来の排他原則)、coresident 戦略でのみ複数になる。
+        self._loaded: set[str] = set()
         self._foreign_listeners: dict[str, int] = {}  # backend name -> port
 
     # -- 起動時の孤児処理 --------------------------------------------------
@@ -164,27 +195,25 @@ class ProcessManager:
                     pid_file.unlink(missing_ok=True)
                     logger.info("陳腐化した PID ファイルを削除: %s(pid=%d は既に消滅)",
                                 pid_file, pid)
-            # アクティブ推定: 重みロード済みと自己申告するバックエンドを探す
+            # ロード状態の推定: 重みロード済みと自己申告するバックエンドを全て拾う。
+            # coresident 戦略では複数が同時にロード済みなのが**正常**なので、
+            # 以前あった「先頭のみ採用 + 排他原則違反エラー」は廃止した。
             loaded = [name for name, proc in self._procs.items()
                       if self._backend_weights_loaded(proc)]
-            if len(loaded) > 1:
-                logger.error(
-                    "複数バックエンドが同時に重みロード済みです: %s。排他原則違反の"
-                    "状態のため先頭 %s のみアクティブ扱いにします(手動確認を推奨)",
-                    loaded, loaded[0])
             if loaded:
-                self._active = loaded[0]
-                self._procs[loaded[0]].weights_loaded = True
-                logger.info("adopt: アクティブバックエンド = %s", loaded[0])
+                for name in loaded:
+                    self._loaded.add(name)
+                    self._procs[name].weights_loaded = True
+                logger.info("adopt: 重みロード済みバックエンド = %s", loaded)
             elif len(self._procs) == 1:
                 # 自己申告なし(ltx25 の遅延ロード前など)でも、生存プロセスが1つ
-                # だけなら従来どおりそれをアクティブ扱いにする(gateway 再起動で
-                # パススルーが 502 になる退行を避ける)。2つ生きていて判別不能な
-                # 場合のみ両方 parked のままにする(排他原則を優先)。
+                # だけならそれをロード済み扱いにする(gateway 再起動でパススルーが
+                # 502 になる退行を避ける)。2つ生きていて判別不能な場合のみ
+                # 両方 parked のままにする(誤ってVRAMを二重に見積もらないため)。
                 only = next(iter(self._procs))
-                self._active = only
+                self._loaded.add(only)
                 self._procs[only].weights_loaded = True
-                logger.info("adopt: 生存プロセスが1つのため %s をアクティブ扱いにします", only)
+                logger.info("adopt: 生存プロセスが1つのため %s をロード済み扱いにします", only)
 
     def _backend_weights_loaded(self, proc: ManagedProcess) -> bool:
         """バックエンド自己申告の「重みロード済み」判定(adopt 時のアクティブ推定用)。"""
@@ -242,12 +271,18 @@ class ProcessManager:
              toggles: dict[str, bool] | None = None,
              strategy: str = "process",
              gpus: str | None = None) -> dict:
-        """排他切替。既に同一バックエンド・同一構成でアクティブなら no-op。
+        """バックエンドを有効化する。既に同一構成でロード済みなら no-op。
 
-        strategy="process": 旧プロセス停止 → 新プロセス起動(従来どおり)。
-        strategy="resident": 旧プロセスは温存して VRAM のみ解放 → 新バックエンドの
-        既存プロセスを再有効化(env 一致時)。env 不一致・プロセス無しは自動で
-        プロセス起動へフォールバックする。
+        strategy="process": 他バックエンドのプロセスを停止 → 新プロセス起動(従来どおり)。
+        strategy="resident": 他バックエンドはプロセス温存で VRAM のみ解放 → 対象の
+        既存プロセスを再有効化(env 一致時)。
+        strategy="coresident": **他バックエンドに一切触らない**(重みは VRAM に
+        載せたまま)。対象だけを起動/再有効化する。生成の排他は VRAM ではなく
+        実行ゲート(`other_busy()`)側で担保する。
+
+        resident/coresident とも、env(プリセット/overrides)が既存プロセスと
+        異なる場合は env がプロセス起動時に固定されるためプロセス再起動へ
+        自動フォールバックする。
         """
         if strategy not in VALID_STRATEGIES:
             raise ValidationError(
@@ -262,115 +297,146 @@ class ProcessManager:
                     "手動で停止してから再試行してください")
             self._reap_dead_locked()
 
-            active = self._procs.get(self._active) if self._active else None
-            if (active is not None and active.backend.name == backend_name
-                    and active.env_extra == env_extra and active.weights_loaded
-                    and not active.adopted):
-                return {"result": "no-op",
-                        "detail": "同一バックエンド・同一構成が既にアクティブです",
-                        **self._proc_info(active)}
-
-            # -- 旧アクティブの解放 ----------------------------------------
-            note = None
-            if active is not None:
-                if self.backend_busy(active):
-                    raise BusyError(
-                        f"アクティブなバックエンド {active.backend.name} が生成中(busy)です。"
-                        "完了を待ってから再試行してください")
-                if strategy == "resident" and active.backend.name != backend_name:
-                    self._deactivate_locked(active)
-                else:
-                    # process 戦略、または同一バックエンドの構成変更(env 固定のため
-                    # resident でも再起動が必須)
-                    if strategy == "resident" and active.backend.name == backend_name:
-                        note = ("resident 要求ですが同一バックエンドの構成変更"
-                                f"(旧={active.env_extra} 新={env_extra})のため"
-                                "プロセス再起動へフォールバックしました")
-                        logger.info("%s: %s", backend_name, note)
-                    self._stop_locked(active)
-            self._active = None
-
-            # -- 新バックエンドの有効化 ------------------------------------
             existing = self._procs.get(backend_name)
-            if existing is not None and existing.alive():
-                if (strategy == "resident" and existing.env_extra == env_extra
-                        and not existing.adopted):
+            if existing is not None and not existing.alive():
+                self._cleanup_locked(existing)
+                existing = None
+
+            if (existing is not None and existing.env_extra == env_extra
+                    and existing.weights_loaded and not existing.adopted):
+                return {"result": "no-op",
+                        "detail": "同一バックエンド・同一構成が既にロード済みです",
+                        **self._proc_info(existing)}
+
+            note = None
+
+            # -- 他バックエンドの扱い --------------------------------------
+            # coresident は「触らない」が唯一の正しい振る舞い。他は従来どおり退去。
+            if strategy == "coresident":
+                busy_other = self._other_busy_locked(backend_name)
+                if busy_other is not None:
+                    raise BusyError(
+                        f"他バックエンド {busy_other} が生成中(busy)です。重みの確保と"
+                        "競合するため、完了を待ってから再試行してください")
+            else:
+                for other in [p for name, p in self._procs.items()
+                              if name != backend_name and p.weights_loaded]:
+                    if self.backend_busy(other):
+                        raise BusyError(
+                            f"バックエンド {other.backend.name} が生成中(busy)です。"
+                            "完了を待ってから再試行してください")
+                    if strategy == "resident":
+                        self._deactivate_locked(other)
+                    else:
+                        self._stop_locked(other)
+
+            # -- 対象バックエンドの有効化 ----------------------------------
+            if existing is not None:
+                reusable = existing.env_extra == env_extra and not existing.adopted
+                if reusable and strategy in ("resident", "coresident"):
+                    # 重みだけ落ちている(parked)状態からの復帰。プロセスは再利用する。
                     t0 = time.time()
                     self._reactivate_locked(existing)
-                    self._active = backend_name
+                    self._loaded.add(backend_name)
                     return {"result": "reactivated",
                             "reactivate_s": round(time.time() - t0, 1),
                             **self._proc_info(existing)}
-                if strategy == "resident":
-                    note = ("resident 要求ですが既存プロセスの env が異なる"
+                if not reusable and strategy in ("resident", "coresident"):
+                    note = (f"{strategy} 要求ですが既存プロセスの env が異なる"
                             f"(旧={existing.env_extra} 新={env_extra})ため"
                             "プロセス再起動へフォールバックしました")
                     logger.info("%s: %s", backend_name, note)
+                if self.backend_busy(existing):
+                    raise BusyError(
+                        f"バックエンド {backend_name} が生成中(busy)です。"
+                        "完了を待ってから再試行してください")
                 self._stop_locked(existing)
-            elif existing is not None:
-                self._cleanup_locked(existing)
 
             proc = self._start_locked(backend, preset_used, env_extra)
-            self._active = backend_name
+            self._loaded.add(backend_name)
             # 起動中に死んだ場合は _wait_health_locked → _cleanup_locked が
-            # _procs/_active を掃除した上で例外を上げる。ヘルスタイムアウトは
+            # _procs/_loaded を掃除した上で例外を上げる。ヘルスタイムアウトは
             # プロセス温存のままエラー(従来どおり、ロード継続中の可能性)。
             self._wait_health_locked(proc)
             result = {"result": "started", **self._proc_info(proc)}
+            if strategy == "coresident":
+                result["coresident_with"] = sorted(self._loaded - {backend_name})
+                result["vram"] = _gpu_vram_mb()
             if note:
                 result["note"] = note
             return result
 
-    def unload(self, strategy: str = "process") -> dict:
-        """strategy="process": 管理下の全プロセスを停止(完全クリーン)。
-        strategy="resident": アクティブの VRAM のみ解放してプロセスは温存。
+    def unload(self, strategy: str = "process",
+               backend_name: str | None = None) -> dict:
+        """strategy="process": プロセスを停止(完全クリーン)。
+        strategy="resident"/"coresident": VRAM のみ解放してプロセスは温存。
+
+        backend_name を指定すると**そのバックエンドだけ**を対象にする。省略時は
+        従来どおり全部が対象(coresident で片方だけ降ろしたい場合に指定する)。
         """
         if strategy not in VALID_STRATEGIES:
             raise ValidationError(
                 f"未知の strategy です: {strategy!r}(有効: {list(VALID_STRATEGIES)})")
+        if backend_name is not None and backend_name not in BACKENDS:
+            raise ValidationError(
+                f"未知のバックエンドです: {backend_name!r}(有効: {sorted(BACKENDS)})")
         with self._lock:
             self._reap_dead_locked()
-            active = self._procs.get(self._active) if self._active else None
-            if strategy == "resident":
-                if active is None:
-                    return {"result": "no-op",
-                            "detail": "アクティブなバックエンドはありません"}
-                if self.backend_busy(active):
+            if backend_name is None:
+                targets = list(self._procs.values())
+            else:
+                proc = self._procs.get(backend_name)
+                targets = [proc] if proc is not None else []
+
+            if not targets:
+                return {"result": "no-op",
+                        "detail": "対象のバックエンドは起動していません"}
+
+            # busy なものが1つでもあれば、何も壊さずに拒否する(全か無か)
+            for proc in targets:
+                if proc.weights_loaded and self.backend_busy(proc):
                     raise BusyError(
-                        f"バックエンド {active.backend.name} が生成中(busy)のため解放できません")
-                self._deactivate_locked(active)
-                self._active = None
-                return {"result": "unloaded-resident",
-                        "backend": active.backend.name,
+                        f"バックエンド {proc.backend.name} が生成中(busy)のため解放できません")
+
+            if strategy in ("resident", "coresident"):
+                freed = []
+                for proc in targets:
+                    if not proc.weights_loaded:
+                        continue
+                    self._deactivate_locked(proc)
+                    freed.append(proc.backend.name)
+                if not freed:
+                    return {"result": "no-op",
+                            "detail": "重みをロード済みのバックエンドはありません"}
+                return {"result": "unloaded-resident", "backends": freed,
+                        "backend": freed[0] if len(freed) == 1 else None,
                         "detail": "VRAM を解放しました(プロセスは温存)"}
-            # process: アクティブが busy なら拒否、その後全プロセス停止
-            if active is not None and self.backend_busy(active):
-                raise BusyError(
-                    f"バックエンド {active.backend.name} が生成中(busy)のため停止できません")
+
             stopped = []
-            for proc in list(self._procs.values()):
+            for proc in targets:
                 if proc.alive():
                     self._stop_locked(proc)
                 else:
                     self._cleanup_locked(proc)
                 stopped.append(proc.backend.name)
-            self._active = None
-            if not stopped:
-                return {"result": "no-op", "detail": "アクティブなバックエンドはありません"}
             return {"result": "stopped", "backends": stopped,
                     "backend": stopped[0] if len(stopped) == 1 else None}
 
     def status(self) -> dict:
         with self._lock:
             self._reap_dead_locked()
-            active = self._procs.get(self._active) if self._active else None
+            loaded = sorted(n for n in self._loaded if n in self._procs)
+            # active_backend / process は後方互換のため残す(単一バックエンド運用では
+            # 従来と同じ値になる)。coresident で複数ロード中は loaded_backends を見ること。
+            primary = self._procs.get(loaded[0]) if loaded else None
             info: dict = {"active_backend": None, "process": None,
-                          "backend_health": None, "busy": None}
-            if active is not None:
-                info["active_backend"] = active.backend.name
-                info["process"] = self._proc_info(active)
-                info["backend_health"] = self.backend_health(active)
-                info["busy"] = (self.backend_busy(active)
+                          "backend_health": None, "busy": None,
+                          "loaded_backends": loaded}
+            if primary is not None:
+                info["active_backend"] = primary.backend.name
+                info["process"] = self._proc_info(primary)
+                info["backend_health"] = self.backend_health(primary)
+                info["busy"] = (self.backend_busy(primary)
                                 if info["backend_health"] is not None else None)
             # Phase 5a: process alive / weights loaded の2軸(全バックエンド)
             backends_info = {}
@@ -454,6 +520,7 @@ class ProcessManager:
             self._stop_locked(proc)
             return
         proc.weights_loaded = False
+        self._loaded.discard(name)
         logger.info("resident 解放完了: %s pid=%d(%.1fs、残VRAM=%sMB)",
                     name, proc.pid, time.time() - t0, vram)
 
@@ -574,17 +641,44 @@ class ProcessManager:
         (RUN_DIR / f"{proc.backend.name}.pid").unlink(missing_ok=True)
         if self._procs.get(proc.backend.name) is proc:
             del self._procs[proc.backend.name]
-        if self._active == proc.backend.name:
-            self._active = None
+        self._loaded.discard(proc.backend.name)
 
-    # パススルー用
-    def active_backend_name(self) -> str | None:
-        if self._active is None:
-            return None
-        proc = self._procs.get(self._active)
-        if proc is not None and proc.alive():
-            return self._active
+    def _other_busy_locked(self, backend_name: str) -> str | None:
+        """自分以外で生成中のバックエンド名。無ければ None(_lock 保持前提)。"""
+        for name, proc in self._procs.items():
+            if name == backend_name or not proc.weights_loaded:
+                continue
+            if self.backend_busy(proc):
+                return name
         return None
+
+    # -- 公開ヘルパ(パススルー・ジョブ投入から使う)-------------------------
+
+    def is_loaded(self, backend_name: str) -> bool:
+        """このバックエンドが「重みを持って生きている」か。
+
+        coresident では複数が同時に True になりうる。従来の
+        `active_backend_name() == name` の置き換え。
+        """
+        if backend_name not in self._loaded:
+            return False
+        proc = self._procs.get(backend_name)
+        return proc is not None and proc.alive()
+
+    def other_busy(self, backend_name: str) -> str | None:
+        """**実行ゲート**: 自分以外のバックエンドが生成中ならその名前を返す。
+
+        coresident では VRAM は同時に持てるが、生成を重ねると計算資源を食い合う
+        (2026-09-15 実測で LTX は 1.89倍・H3 は 1.49倍に劣化し、LTX の
+        リアルタイム予算 4.8秒を超える)。投入前にこれで直列化する。
+        """
+        with self._lock:
+            return self._other_busy_locked(backend_name)
+
+    def loaded_backends(self) -> list[str]:
+        """重みを持って生きているバックエンド名(ソート済み)。"""
+        return sorted(n for n in self._loaded
+                      if (p := self._procs.get(n)) is not None and p.alive())
 
 
 def _proc_start_time(pid: int) -> float | None:
