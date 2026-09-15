@@ -389,6 +389,13 @@ class ProcessManager:
                 # LTX 生成中のピークは GPU 全体 43.2GiB、H3 のロードは 37GiB で
                 # 合計 80GiB(容量 95.6GiB)。判定は busy ではなく**空き VRAM**で行う。
                 free = _min_free_vram_mb(env_extra.get("CUDA_VISIBLE_DEVICES"))
+                # 対象自身が既にロード済みなら、この load は載せ替え(stop → start)に
+                # なるのでその VRAM は解放される。足し戻さないと「同居中の相手の
+                # プリセットを変更できない」状態になる(2026-09-15 に実際に踏んだ)。
+                if free is not None and existing is not None and existing.weights_loaded:
+                    own = _pid_vram_mb(existing.pid)
+                    if own:
+                        free += own
                 if free is not None and free < CORESIDENT_MIN_FREE_MB:
                     raise BusyError(
                         f"同居で {backend_name} を載せるには空き VRAM が足りません"
