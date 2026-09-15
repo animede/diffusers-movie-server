@@ -122,10 +122,8 @@ curl -X POST http://127.0.0.1:8630/api/v1/backend/load \
 
 curl -X POST http://127.0.0.1:8630/api/v1/backend/load \
   -H 'Content-Type: application/json' -d '{
-    "backend":"h3","preset":"96gb-int8","gpus":"0","strategy":"coresident",
-    "toggles":{"turbo":true},
-    "overrides":{"H3_KEEP_TRANSFORMER":"1","H3_VIDEO_VAE_FP16":"1",
-                 "H3_TE_PROJ":"NicoLab28/ClipProj-MiniMax-H3"}}'
+    "backend":"h3","preset":"48gb-lowvram","gpus":"0","strategy":"coresident",
+    "toggles":{"turbo":true}}'
 
 # 片方だけ降ろす(プロセスは温存、次回は reactivate で復帰)
 curl -X POST http://127.0.0.1:8630/api/v1/backend/unload \
@@ -139,9 +137,19 @@ curl -X POST http://127.0.0.1:8630/api/v1/backend/unload \
   予算 4.8秒を割るため)
 - **`auto_load` は coresident にならない**(既定の process 戦略で起動するので
   他バックエンドを停止する)。同居させたいときは上のように明示的に load すること
-- **h3 の同居構成は上の overrides が必須**。`96gb-int8` 単体では ref2va ピークが
-  73.8GB で LTX と同居できない。投影TE(`H3_TE_PROJ`)で TE-nf4 の 21GB を 3.11GB に
-  落とすことで収まる。代償として細部のプロンプト追従が落ちる(PSNR 22.64dB)
+- **h3 は同居時だけプリセットを落とす**。`96gb`(常駐87GB)や `96gb-int8`
+  (ref2va ピーク 73.8GB)は LTX(常駐33GB)と同じ GPU に載らない。
+  **`48gb-lowvram` が同居の既定解**で、実測は下表のとおり:
+
+  | 構成(ref2va 768×448・5秒・turbo、LTX 常駐中、定常値) | 所要 | GPU0 全体ピーク | TE |
+  |---|---|---|---|
+  | **`48gb-lowvram`** | **40.5秒** | **74.5GiB**(余裕21.0) | **32B のまま** |
+  | `96gb-int8` + 投影TE | 27.5秒 | 83.2GiB(余裕12.4) | 投影4B |
+
+  denoise(14.4s)も decode(3.4s)もほぼ同一で、差は全部フェーズ循環の固定費。
+  **1本13秒の代償で品質劣化ゼロ + 余裕 8.6GiB 増**なので、品質重視の用途では
+  `48gb-lowvram` を選ぶこと。投影TE(`H3_TE_PROJ`)は近似で、細部のプロンプト追従が
+  落ちる(PSNR 22.64dB / 鮮鋭度 -23%)。速度が要る用途でだけ検討する
 - **LTX の `upscale` は同居時 409 で止める**(ガード実装済み)。2段アップスケールの
   デコードは 480×640×97f でも GPU 全体 94.3GiB に達し、同居すると確実に OOM するため。
   **`upscale` の既定は true** なので、何も指定しないクライアントが踏む点に注意
