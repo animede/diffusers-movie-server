@@ -250,6 +250,17 @@ class JobRegistry:
             dummy = [{"id": "0" * 32, "kind": m["kind"]} for m in asset_metas]
             modes.build_ltx25_request(mode, params or {}, extra or {}, dummy)
 
+        # 優先ゲート(Phase 7): 他バックエンドが会話セッション中なら入口で断る。
+        # busy 判定より前に置くこと — H3 の t2va は約25秒かかり、一度始まると止められない
+        # ので、走り出してから優先度を付けても LTX の 4.8秒予算には間に合わない。
+        # また LTX は会話していないときも待機プール補充で頻繁に busy なので、
+        # 「相手が busy か」だけで判定すると H3 がほとんど回らなくなる。
+        blocker = manager.realtime_blocker(backend)
+        if blocker is not None:
+            raise BusyError(
+                f"バックエンド {blocker} が会話セッション中です。会話は待てないため "
+                f"{backend} の生成は受け付けません。セッション終了後に再試行してください")
+
         # バックエンド起動確認(未起動なら auto_load で既定/指定プリセット起動)
         # 注意: auto_load は既定の process 戦略で起動するため、**他バックエンドが
         # ロード済みならそれを停止する**(従来どおりの挙動)。coresident で同居させたい
