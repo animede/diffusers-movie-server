@@ -77,6 +77,11 @@ LEASE_TTL_DEFAULT_S = 60.0
 LEASE_TTL_MIN_S = 5.0
 LEASE_TTL_MAX_S = 600.0
 
+# coresident でもう1つ載せるのに最低限ほしい空き VRAM。この箱で同居させる
+# H3(int8 単騎 + 投影TE)の常駐が実測 37GiB なので、それに少し余裕を見た値。
+# 相手が生成中でも LTX 43.2 + H3 ロード 37 = 80GiB(容量 95.6GiB)で収まる。
+CORESIDENT_MIN_FREE_MB = int(os.environ.get("GW_CORESIDENT_MIN_FREE_MB", 40 * 1024))
+
 
 class BusyError(RuntimeError):
     """busy 中の stop/switch 要求(409 に変換)。"""
@@ -123,6 +128,24 @@ def _pid_vram_mb(pid: int) -> int | None:
         return total
     except (OSError, subprocess.TimeoutExpired, ValueError):
         return None
+
+
+def _min_free_vram_mb(visible: str | None) -> int | None:
+    """対象 GPU のうち最も空きが少ないものの空き MiB。取得不可なら None。
+
+    visible = CUDA_VISIBLE_DEVICES の値(None = 全GPU可視)。
+    """
+    gpus = _gpu_vram_mb()
+    if not gpus:
+        return None
+    if visible:
+        try:
+            wanted = {int(i) for i in visible.split(",")}
+        except ValueError:
+            wanted = set()
+        if wanted:
+            gpus = [g for g in gpus if g["index"] in wanted] or gpus
+    return min(g["free_mb"] for g in gpus)
 
 
 @dataclass
@@ -360,11 +383,17 @@ class ProcessManager:
             # -- 他バックエンドの扱い --------------------------------------
             # coresident は「触らない」が唯一の正しい振る舞い。他は従来どおり退去。
             if strategy == "coresident":
-                busy_other = self._other_busy_locked(backend_name)
-                if busy_other is not None:
+                # 相手が生成中でもロードを止めない。当初は busy なら断っていたが、
+                # LTX は待機プール補充でほぼ連続 busy になるため H3 が永久にロード
+                # できなくなった(2026-09-15 実機で発覚)。実測上も同時に収まる —
+                # LTX 生成中のピークは GPU 全体 43.2GiB、H3 のロードは 37GiB で
+                # 合計 80GiB(容量 95.6GiB)。判定は busy ではなく**空き VRAM**で行う。
+                free = _min_free_vram_mb(env_extra.get("CUDA_VISIBLE_DEVICES"))
+                if free is not None and free < CORESIDENT_MIN_FREE_MB:
                     raise BusyError(
-                        f"他バックエンド {busy_other} が生成中(busy)です。重みの確保と"
-                        "競合するため、完了を待ってから再試行してください")
+                        f"同居で {backend_name} を載せるには空き VRAM が足りません"
+                        f"(空き {free}MiB < 必要目安 {CORESIDENT_MIN_FREE_MB}MiB)。"
+                        "相手の生成完了を待つか、不要なバックエンドを unload してください")
             else:
                 for other in [p for name, p in self._procs.items()
                               if name != backend_name and p.weights_loaded]:
