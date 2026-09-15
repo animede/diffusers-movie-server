@@ -39,6 +39,7 @@ import signal
 import socket
 import subprocess
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
@@ -67,6 +68,14 @@ ADMIN_TIMEOUT_S = 120.0        # /api/admin/unload の HTTP タイムアウト
 RELOAD_TIMEOUT_S = 900.0       # /api/admin/reload(h3 96gb preload は数十秒〜)
 
 VALID_STRATEGIES = ("process", "resident", "coresident")
+
+
+# リアルタイム優先リース(会話セッション宣言)の TTL。
+# 会話アプリはチャンクごとに renew するので短めで良い。切れれば自動で解放されるため、
+# クライアントが落ちてもゲートが開きっぱなしにならない。
+LEASE_TTL_DEFAULT_S = 60.0
+LEASE_TTL_MIN_S = 5.0
+LEASE_TTL_MAX_S = 600.0
 
 
 class BusyError(RuntimeError):
@@ -116,6 +125,34 @@ def _pid_vram_mb(pid: int) -> int | None:
         return None
 
 
+@dataclass
+class RealtimeLease:
+    """「いま会話セッション中」の宣言。保持者以外の生成を入口で締め出す。
+
+    なぜ busy 判定ではなくリースなのか:
+    - LTX は会話していないときも待機プール補充で頻繁に busy になる。「LTX が busy なら
+      H3 は待つ」にすると H3 がほとんど回らない。
+    - 逆に H3 の生成(t2va 5秒で約25秒)が走り出してから会話が来ると、LTX の
+      リアルタイム予算 4.8秒に対して25秒待たされる。**H3 は途中で止められない**ので、
+      始まってから優先度を付けても間に合わない。
+    → 会話の**開始を宣言**してもらい、その間は相手の投入を入口で断るしかない。
+    """
+    lease_id: str
+    backend: str
+    created_at: float
+    expires_at: float
+    renewals: int = 0
+
+    def alive(self) -> bool:
+        return time.time() < self.expires_at
+
+    def to_dict(self) -> dict:
+        return {"lease_id": self.lease_id, "backend": self.backend,
+                "created_at": self.created_at, "expires_at": self.expires_at,
+                "remaining_s": round(max(0.0, self.expires_at - time.time()), 1),
+                "renewals": self.renewals}
+
+
 def _gpu_vram_mb() -> list[dict] | None:
     """GPU ごとの使用量/総量。coresident の load 応答に載せて余裕を可視化する。"""
     try:
@@ -163,6 +200,7 @@ class ProcessManager:
         # 常に 0〜1 個(従来の排他原則)、coresident 戦略でのみ複数になる。
         self._loaded: set[str] = set()
         self._foreign_listeners: dict[str, int] = {}  # backend name -> port
+        self._lease: RealtimeLease | None = None      # リアルタイム優先リース
 
     # -- 起動時の孤児処理 --------------------------------------------------
 
@@ -297,6 +335,15 @@ class ProcessManager:
                     "手動で停止してから再試行してください")
             self._reap_dead_locked()
 
+            # 会話セッション中の相手から VRAM を奪う load は断る。coresident は
+            # 相手に触らないので許可する(生成側は実行ゲートで直列化される)。
+            blocker = self._lease_blocker_locked(backend_name)
+            if blocker is not None and strategy != "coresident":
+                raise BusyError(
+                    f"バックエンド {blocker} が会話セッション中です。strategy={strategy!r} は "
+                    f"{blocker} の VRAM を解放してしまうため実行できません"
+                    '(strategy="coresident" なら同居で起動できます)')
+
             existing = self._procs.get(backend_name)
             if existing is not None and not existing.alive():
                 self._cleanup_locked(existing)
@@ -392,6 +439,13 @@ class ProcessManager:
                 return {"result": "no-op",
                         "detail": "対象のバックエンドは起動していません"}
 
+            # 会話セッション中のバックエンドは降ろさせない
+            lease = self._lease_info_locked()
+            if lease is not None and any(p.backend.name == lease["backend"] for p in targets):
+                raise BusyError(
+                    f"バックエンド {lease['backend']} が会話セッション中のため解放できません"
+                    f"(残り {lease['remaining_s']:.0f}秒)")
+
             # busy なものが1つでもあれば、何も壊さずに拒否する(全か無か)
             for proc in targets:
                 if proc.weights_loaded and self.backend_busy(proc):
@@ -456,6 +510,7 @@ class ProcessManager:
                         "gpus": proc.env_extra.get("CUDA_VISIBLE_DEVICES"),
                     }
             info["backends"] = backends_info
+            info["realtime_lease"] = self._lease_info_locked()
             if self._foreign_listeners:
                 info["foreign_listeners"] = dict(self._foreign_listeners)
             return info
@@ -679,6 +734,90 @@ class ProcessManager:
         """重みを持って生きているバックエンド名(ソート済み)。"""
         return sorted(n for n in self._loaded
                       if (p := self._procs.get(n)) is not None and p.alive())
+
+    # -- リアルタイム優先リース(会話セッション)------------------------------
+
+    def acquire_lease(self, backend_name: str, ttl_s: float | None = None,
+                      lease_id: str | None = None) -> dict:
+        """会話セッションを宣言する。lease_id を渡すと延長(renew)になる。
+
+        既に**別バックエンド**が保持している場合は BusyError(409)。同一バックエンドの
+        取得は lease_id 無しでも新しいリースとして受け付ける(会話アプリが再起動した
+        ケースを救うため — 同じ持ち主なら奪い合いにならない)。
+        """
+        if backend_name not in BACKENDS:
+            raise ValidationError(
+                f"未知のバックエンドです: {backend_name!r}(有効: {sorted(BACKENDS)})")
+        ttl = LEASE_TTL_DEFAULT_S if ttl_s is None else float(ttl_s)
+        if not LEASE_TTL_MIN_S <= ttl <= LEASE_TTL_MAX_S:
+            raise ValidationError(
+                f"ttl_s は {LEASE_TTL_MIN_S}〜{LEASE_TTL_MAX_S} 秒の範囲で指定してください: {ttl_s!r}")
+        now = time.time()
+        with self._lock:
+            current = self._lease if (self._lease and self._lease.alive()) else None
+            if current is not None and current.backend != backend_name:
+                raise BusyError(
+                    f"バックエンド {current.backend} が会話セッション中です"
+                    f"(残り {current.expires_at - now:.0f}秒)。終了を待ってください")
+            if current is not None and (lease_id is None or lease_id == current.lease_id):
+                current.expires_at = now + ttl
+                current.renewals += 1
+                return {"result": "renewed", **current.to_dict()}
+            lease = RealtimeLease(
+                lease_id=uuid.uuid4().hex[:16], backend=backend_name,
+                created_at=now, expires_at=now + ttl)
+            self._lease = lease
+            logger.info("リアルタイムリース取得: %s (ttl=%.0fs, id=%s)",
+                        backend_name, ttl, lease.lease_id)
+            return {"result": "acquired", **lease.to_dict()}
+
+    def release_lease(self, lease_id: str | None = None) -> dict:
+        """会話セッション終了。lease_id 指定時は一致するときだけ解放する
+        (古いターンの release が新しいターンのリースを消さないようにするため)。"""
+        with self._lock:
+            lease = self._lease
+            if lease is None or not lease.alive():
+                self._lease = None
+                return {"result": "no-op", "detail": "有効なリースはありません"}
+            if lease_id is not None and lease_id != lease.lease_id:
+                return {"result": "no-op",
+                        "detail": f"lease_id が一致しないため解放しません"
+                                  f"(現在の保持者: {lease.backend})"}
+            self._lease = None
+            logger.info("リアルタイムリース解放: %s (id=%s)", lease.backend, lease.lease_id)
+            return {"result": "released", "backend": lease.backend,
+                    "lease_id": lease.lease_id}
+
+    def lease_info(self) -> dict | None:
+        with self._lock:
+            return self._lease_info_locked()
+
+    def _lease_info_locked(self) -> dict | None:
+        if self._lease is None:
+            return None
+        if not self._lease.alive():
+            logger.info("リアルタイムリース期限切れ: %s (id=%s)",
+                        self._lease.backend, self._lease.lease_id)
+            self._lease = None
+            return None
+        return self._lease.to_dict()
+
+    def _lease_blocker_locked(self, backend_name: str) -> str | None:
+        """このバックエンドの投入を止めるリース保持者。無ければ None。"""
+        info = self._lease_info_locked()
+        if info is None or info["backend"] == backend_name:
+            return None
+        return info["backend"]
+
+    def realtime_blocker(self, backend_name: str) -> str | None:
+        """**優先ゲート**: 他バックエンドが会話セッション中ならその名前を返す。
+
+        `other_busy()` が「いま生成中か」の事後判定なのに対し、こちらは
+        「これから会話が続く」という事前宣言。H3 のような長尺ジョブは一度始まると
+        止められないので、入口で断るにはこちらが必要になる。
+        """
+        with self._lock:
+            return self._lease_blocker_locked(backend_name)
 
 
 def _proc_start_time(pid: int) -> float | None:

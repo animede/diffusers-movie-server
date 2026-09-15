@@ -146,6 +146,46 @@ curl -X POST http://127.0.0.1:8630/api/v1/backend/unload \
   デコードで 94.3GiB に達する(480×640×97f 実測)。リアルタイム経路
   (realtime-narration-video)は常に `extra.upscale=false` を送るので安全
 
+### リアルタイム優先リース(会話セッション)
+
+同居しただけでは「先に生成を始めた方が勝つ」ので、H3 の t2va(約25秒)が走り出した
+直後に会話チャンクが来ると、LTX の 4.8秒予算に対して25秒待たされる。**H3 は途中で
+止められない**ので、始まってから優先度を付けても間に合わない。そこで会話アプリに
+**会話の開始を宣言**してもらい、その間は相手の投入を入口で断る。
+
+```bash
+# 会話ターン開始
+curl -X POST http://127.0.0.1:8630/api/v1/realtime/lease \
+  -H 'Content-Type: application/json' -d '{"backend":"ltx25","ttl_s":60}'
+# → {"result":"acquired","lease_id":"...","expires_at":...}
+
+# チャンクごとに延長(lease_id を渡すと renew)
+curl -X POST http://127.0.0.1:8630/api/v1/realtime/lease \
+  -H 'Content-Type: application/json' -d '{"backend":"ltx25","ttl_s":60,"lease_id":"..."}'
+
+# 会話ターン終了
+curl -X DELETE 'http://127.0.0.1:8630/api/v1/realtime/lease?lease_id=...'
+
+curl http://127.0.0.1:8630/api/v1/realtime/lease   # 現在の保持者
+```
+
+保持している間:
+
+| 操作 | 結果 |
+|---|---|
+| 保持者の `/api/v1/generate` | 通常どおり |
+| **他バックエンドの `/api/v1/generate`** | **409** |
+| 他バックエンドの `backend/load`(process / resident) | **409**(保持者の VRAM を奪うため) |
+| 他バックエンドの `backend/load`(**coresident**) | 許可(保持者に触らないため) |
+| 保持者の `backend/unload` | **409** |
+| 別バックエンドによるリース取得 | **409** |
+
+- **TTL は必須の安全網**。会話アプリが落ちてもリースは自動失効し、ゲートが開きっぱなしに
+  ならない。既定60秒・範囲5〜600秒。チャンクごとの renew を推奨
+- `release` に `lease_id` を渡すと一致するときだけ解放する(古いターンの release が
+  新しいターンのリースを消さないため)
+- `/api/v1/status` の `realtime_lease` で現在の保持者・残り時間が見える
+
 実測(2026-09-15、GPU0 = RTX PRO 6000 96GB / 95.6GiB):
 
 | 状態 | GPU0 |

@@ -125,6 +125,37 @@ def api_backend_unload(req: UnloadRequest | None = None):
         raise HTTPException(409, str(exc))
 
 
+# -- リアルタイム優先リース(会話セッション)------------------------------------
+# 会話アプリが「いま会話中」を宣言する。保持している間、**他バックエンドの生成は
+# 入口で 409** になる(会話は待てないため)。TTL 付きなのでクライアントが落ちても
+# 自動で解放される。会話アプリはチャンクごとに renew する運用を想定。
+
+class LeaseRequest(BaseModel):
+    backend: str
+    ttl_s: float | None = None        # 省略時 60秒(5〜600秒)
+    lease_id: str | None = None       # 指定すると延長(renew)
+
+
+@app.get("/api/v1/realtime/lease")
+def api_lease_get():
+    return {"lease": manager.lease_info()}
+
+
+@app.post("/api/v1/realtime/lease")
+def api_lease_acquire(req: LeaseRequest):
+    try:
+        return manager.acquire_lease(req.backend, req.ttl_s, req.lease_id)
+    except ValidationError as exc:
+        raise HTTPException(400, str(exc))
+    except BusyError as exc:
+        raise HTTPException(409, str(exc))
+
+
+@app.delete("/api/v1/realtime/lease")
+def api_lease_release(lease_id: str | None = None):
+    return manager.release_lease(lease_id)
+
+
 def _nvidia_smi() -> list[dict] | None:
     try:
         out = subprocess.run(
