@@ -39,7 +39,7 @@ MiniMax-H3(旧 `/home/animede/minimax-h3`、port 8611)と LTX-2.5
 │  /h3/*    → 127.0.0.1:8631 パススルー(未起動時 502)                                  │
 │  /ltx25/* → 127.0.0.1:8632 パススルー(未起動時 502)                                  │
 │  /h3/outputs /ltx25/outputs 静的配信(バックエンド停止後も成果物URLが生きる)           │
-│  procman: 同時アクティブ1バックエンド。切替 = 旧stop → 新start(env プリセット付き)   │
+│  procman: 既定は同時1バックエンド(切替 = 旧stop → 新start)。coresident では両方常駐  │
 └───────────────┬───────────────────────────────┬───────────────────────────────────────┘
                 ▼                               ▼
    backends/minimax-h3 (port 8631)   backends/ltx2_5 (port 8632)
@@ -107,8 +107,55 @@ curl -X POST http://127.0.0.1:8630/api/v1/backend/load \
 curl -X POST http://127.0.0.1:8630/api/v1/backend/unload             # 停止
 ```
 
-同時にアクティブなのは1バックエンドのみ。別バックエンドの load は自動で
+既定では同時にロードできるのは1バックエンドのみ。別バックエンドの load は自動で
 旧 stop → 新 start(排他切替)。生成中(busy)の load/unload/generate は 409。
+
+### 同居モード(`strategy: "coresident"`)— 重みの再ロードをゼロにする
+
+**VRAM は両方に載せたまま、生成(実行)だけを排他**するモード。LTX をリアルタイム用に
+常駐させたまま H3 も使いたい、という用途のために足した。切替コストがゼロになる。
+
+```bash
+curl -X POST http://127.0.0.1:8630/api/v1/backend/load \
+  -H 'Content-Type: application/json' -d '{
+    "backend":"ltx25","preset":"nvfp4-fast","gpus":"0","strategy":"coresident"}'
+
+curl -X POST http://127.0.0.1:8630/api/v1/backend/load \
+  -H 'Content-Type: application/json' -d '{
+    "backend":"h3","preset":"96gb-int8","gpus":"0","strategy":"coresident",
+    "toggles":{"turbo":true},
+    "overrides":{"H3_KEEP_TRANSFORMER":"1","H3_VIDEO_VAE_FP16":"1",
+                 "H3_TE_PROJ":"NicoLab28/ClipProj-MiniMax-H3"}}'
+
+# 片方だけ降ろす(プロセスは温存、次回は reactivate で復帰)
+curl -X POST http://127.0.0.1:8630/api/v1/backend/unload \
+  -H 'Content-Type: application/json' -d '{"strategy":"coresident","backend":"h3"}'
+```
+
+- `/api/v1/status` の **`loaded_backends`** が同時ロード中のバックエンド一覧。
+  `active_backend` は単一値なので同居時は先頭しか表せない(後方互換用)
+- **生成は直列化される**。他バックエンドが生成中の `/api/v1/generate` は 409
+  (同一GPUで生成を重ねると LTX 1.89倍・H3 1.49倍に遅くなり、LTX のリアルタイム
+  予算 4.8秒を割るため)
+- **`auto_load` は coresident にならない**(既定の process 戦略で起動するので
+  他バックエンドを停止する)。同居させたいときは上のように明示的に load すること
+- **h3 の同居構成は上の overrides が必須**。`96gb-int8` 単体では ref2va ピークが
+  73.8GB で LTX と同居できない。投影TE(`H3_TE_PROJ`)で TE-nf4 の 21GB を 3.11GB に
+  落とすことで収まる。代償として細部のプロンプト追従が落ちる(PSNR 22.64dB)
+- **LTX の `upscale=true` は同居時に踏むと OOM する**。単独でも 2段アップスケールの
+  デコードで 94.3GiB に達する(480×640×97f 実測)。リアルタイム経路
+  (realtime-narration-video)は常に `extra.upscale=false` を送るので安全
+
+実測(2026-09-15、GPU0 = RTX PRO 6000 96GB / 95.6GiB):
+
+| 状態 | GPU0 |
+|---|---|
+| LTX `nvfp4-fast` 常駐のみ | 33.1GiB |
+| LTX + H3 両方常駐 | 69.6GiB |
+| H3 ref2va×2 ピーク(最大) | **83.2GiB**(余裕 12.4GiB) |
+| LTX 生成(480×640×97f・steps4) | 単独 3.46秒 → 同居 3.56〜3.81秒(**劣化なし**) |
+| H3 t2i 768² / t2va 5秒 / ref2va 連続 | 7.14秒 / 24.8秒 / 27〜28秒 |
+| 切替コスト | **0**(再ロードなし) |
 
 ### バックエンドを手動起動したときは PID ファイルも書く(409 の原因になる)
 
