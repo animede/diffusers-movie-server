@@ -142,9 +142,12 @@ curl -X POST http://127.0.0.1:8630/api/v1/backend/unload \
 - **h3 の同居構成は上の overrides が必須**。`96gb-int8` 単体では ref2va ピークが
   73.8GB で LTX と同居できない。投影TE(`H3_TE_PROJ`)で TE-nf4 の 21GB を 3.11GB に
   落とすことで収まる。代償として細部のプロンプト追従が落ちる(PSNR 22.64dB)
-- **LTX の `upscale=true` は同居時に踏むと OOM する**。単独でも 2段アップスケールの
-  デコードで 94.3GiB に達する(480×640×97f 実測)。リアルタイム経路
-  (realtime-narration-video)は常に `extra.upscale=false` を送るので安全
+- **LTX の `upscale` は同居時 409 で止める**(ガード実装済み)。2段アップスケールの
+  デコードは 480×640×97f でも GPU 全体 94.3GiB に達し、同居すると確実に OOM するため。
+  **`upscale` の既定は true** なので、何も指定しないクライアントが踏む点に注意
+  (リアルタイム経路の realtime-narration-video は常に `extra.upscale=false` を送るので無影響)。
+  静止画モード(`t2i`/`ref2i`/`refine_image`)は跳ね上がらないので対象外(同居中の
+  t2i 512² を実測 80.9GiB で完走確認)。逃げ道は `GW_ALLOW_UPSCALE_CORESIDENT=1`
 
 ### リアルタイム優先リース(会話セッション)
 
