@@ -12,12 +12,15 @@
 - h3: 同期 API を gateway のバックグラウンドスレッドで呼び、実行中は /api/progress を
   中継して progress(0-1)を返す。同時1件(バックエンド自体が排他)。
 - Phase 2 ではキューイングしない: バックエンド busy 中の generate は 409。
+- Phase 7: 同居(coresident)運用のための3つの入口ガードを submit() が持つ。
+  (1) upscale ガード、(2) リアルタイム優先リース、(3) 実行ゲート(生成の直列化)。
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import threading
 import time
@@ -39,6 +42,15 @@ TERMINAL = {"completed", "failed", "interrupted"}
 
 DB_PATH = Path(__file__).resolve().parent / "data" / "jobs.sqlite3"
 RESTORE_LIMIT = 1000  # 復元する履歴の上限(新しい順)
+
+# ltx25 の upscale 既定値(backends/ltx2_5/app/schemas.py の `upscale: bool = True`)。
+# gateway は extra.upscale を素通しするだけなので、未指定時の実効値はこちらで判断する。
+# なお legacy の `quality` は LTX25_EXTRA_KEYS に無く素通しされないため考慮不要。
+LTX25_UPSCALE_DEFAULT = True
+# 静止画モードは 1〜22 フレームしかなく、upscale のデコード段でも跳ね上がらない。
+LTX25_STILL_MODES = {"t2i", "ref2i", "refine_image"}
+# 逃げ道: より大きなカードに載せ替えたときなど、実測で安全と分かっている場合だけ外す。
+ALLOW_UPSCALE_CORESIDENT = os.environ.get("GW_ALLOW_UPSCALE_CORESIDENT") == "1"
 
 
 class NotActiveError(RuntimeError):
@@ -249,6 +261,26 @@ class JobRegistry:
             # 起動確認後に本組み立てする)
             dummy = [{"id": "0" * 32, "kind": m["kind"]} for m in asset_metas]
             modes.build_ltx25_request(mode, params or {}, extra or {}, dummy)
+
+        # upscale ガード(Phase 7): LTX の2段アップスケールはデコード段で
+        # **GPU を丸ごと使い切る**。480×640×97f・steps4 という小さな構成でも
+        # nvidia-smi 観測で 96544MiB = 94.3GiB に達する(2026-09-15 実測。
+        # 常駐 39GiB から t=43.7s→48.8s の5秒間だけ跳ね上がり、その後 39GiB に戻る)。
+        # 他バックエンドが重みを持ったまま踏むと確実に OOM するので入口で断る。
+        # 静止画モードは1〜22フレームしかなくこの跳ね上がりが起きない。実測でも
+        # 同居中の t2i 512²(upscale 既定=有効)は GPU0 ピーク 80.9GiB で完走したので
+        # 対象外にしている(推論ではなく実測に基づく除外)。
+        if (backend == "ltx25" and mode not in LTX25_STILL_MODES
+                and (extra or {}).get("upscale", LTX25_UPSCALE_DEFAULT)):
+            others = [n for n in manager.loaded_backends() if n != "ltx25"]
+            if others and not ALLOW_UPSCALE_CORESIDENT:
+                # 400 ではなく 409(同じリクエストが単独運用なら通るため、
+                # リクエストの不正ではなく現在の状態との衝突)
+                raise BusyError(
+                    f"upscale 有効の ltx25 ジョブは {others} と同居できません"
+                    "(2段アップスケールのデコードで GPU 全体 94.3GiB を使うため。"
+                    "2026-09-15 実測)。extra.upscale=false にするか、"
+                    f"{others} を unload してから実行してください")
 
         # 優先ゲート(Phase 7): 他バックエンドが会話セッション中なら入口で断る。
         # busy 判定より前に置くこと — H3 の t2va は約25秒かかり、一度始まると止められない
