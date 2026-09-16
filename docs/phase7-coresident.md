@@ -87,15 +87,17 @@ Phase 6 では「GPU が分かれていれば同時アクティブにできる�
 | 8 | **TTL 失効**(ttl_s=5 で8秒待つ) | lease が None になり H3 が 202 |
 | 9 | h3 がリースを奪取 | **409**「ltx25 が会話セッション中です(残り30秒)」 |
 
-### 会話アプリ側の組み込み(未実施)
+### 会話アプリ側の組み込み(2026-09-16 実装済み)
 
-`~/realtime-narration-video` の `GatewayClient` に3点入れれば有効になる:
+`~/realtime-narration-video` の `_run_chat`(会話ターン本体)に組み込んだ
+(同リポジトリ coresident-mode ブランチ c2bbf02):
 
-1. ターン開始(チャット受信時)に `POST /api/v1/realtime/lease {"backend":"ltx25"}`
-2. チャンク生成ごとに同じ body + `lease_id` で renew
-3. ターン終了で `DELETE /api/v1/realtime/lease?lease_id=...`
+1. ターン冒頭で acquire(TTL 60秒)
+2. renew はチャンク進行と独立に 20 秒周期(チャンク間隔は負荷で伸びるため同期させない)
+3. finally で release(キャンセル・失敗経路も含む)
 
-待機プール補充はリースを取らないこと(取ると H3 が永久に回らなくなる)。
+待機プール補充ではリースを取らない(取ると H3 が永久に回らなくなる)。
+実機E2E: ターン中の H3 t2i が 409 → ターン completed 直後に解放 → H3 202。
 
 ## upscale ガード
 
