@@ -53,19 +53,29 @@ async function fetchJSON(url, opts) {
 // タブ切替
 // ---------------------------------------------------------------------------
 
+function selectTab(tab) {
+  const btn = document.querySelector(`.tab-btn[data-tab="${tab}"]`);
+  if (!btn) return;
+  state.currentTab = tab;
+  document.querySelectorAll(".tab-btn").forEach((b) =>
+    b.classList.toggle("active", b === btn));
+  document.querySelectorAll(".tab-panel").forEach((p) =>
+    p.classList.toggle("active", p.id === "panel-" + tab));
+  renderAll();
+  // ギャラリーはポーリングしない: タブ表示時と更新ボタンでのみ取得
+  if (tab === "gallery") refreshGallery();
+}
+
 function initTabs() {
   $("tabs").addEventListener("click", (ev) => {
     const btn = ev.target.closest(".tab-btn");
     if (!btn) return;
-    state.currentTab = btn.dataset.tab;
-    document.querySelectorAll(".tab-btn").forEach((b) =>
-      b.classList.toggle("active", b === btn));
-    document.querySelectorAll(".tab-panel").forEach((p) =>
-      p.classList.toggle("active", p.id === "panel-" + state.currentTab));
-    renderAll();
-    // ギャラリーはポーリングしない: タブ表示時と更新ボタンでのみ取得
-    if (state.currentTab === "gallery") refreshGallery();
+    selectTab(btn.dataset.tab);
   });
+  // URL ハッシュで初期タブを指定できる(#admin / #ltx25 / #h3 / #gallery)。
+  // 外部(ai-stack-console 等)から「バックエンド管理」へ直接飛ぶために追加した。
+  const hash = location.hash.replace("#", "");
+  if (hash) selectTab(hash);
 }
 
 // ---------------------------------------------------------------------------
