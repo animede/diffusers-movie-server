@@ -693,6 +693,13 @@ function jobRow(job) {
       a.target = "_blank";
       a.textContent = label;
       row.tdLinks.appendChild(a);
+      // 表示リンクとは別に、確実にファイル保存になるDLリンクを付ける
+      const dl = document.createElement("a");
+      dl.href = result[key];
+      dl.setAttribute("download", decodeURIComponent(result[key].split("/").pop().split("?")[0]) || "");
+      dl.textContent = "保存";
+      dl.title = label + "をダウンロード";
+      row.tdLinks.appendChild(dl);
       row.links[key] = a;
     }
   }
@@ -795,11 +802,17 @@ function galleryTile(item) {
     meta.className = "gallery-meta";
     const info = document.createElement("span");
     info.className = "gallery-info";
+    const dl = document.createElement("a");
+    dl.className = "btn small gallery-dl";
+    dl.href = item.url;
+    dl.setAttribute("download", item.filename || "");
+    dl.textContent = "DL";
+    dl.title = "ダウンロード";
     const del = document.createElement("button");
     del.className = "btn danger small";
     del.textContent = "削除";
     del.addEventListener("click", () => deleteOutput(key));
-    meta.append(info, del);
+    meta.append(info, dl, del);
     cap.append(name, meta);
     el.appendChild(cap);
 
