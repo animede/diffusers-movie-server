@@ -239,6 +239,28 @@ LTX25_PRESETS = {
         description="公式 NVFP4 蒸留 transformer + FP4 GEMM 全常駐 + NVENC p4 + CUDA Graph denoise。sm_120(Blackwell)専用・速度最優先。",
         vram_hint="transformer ~19GB + TE/VAE(全常駐)",
     ),
+    "nvfp4-32gb": Preset(
+        name="nvfp4-32gb",
+        # nvfp4-fast の 32GB 級(RTX 5090)向け派生(2026-09-27)。全常駐が
+        # ~32.5GB 必要で 32GB カードには載らない(空き31GB制限のバラスト実測で
+        # ロード段階 OOM を確認)問題を、リアルタイム用途で不要な常駐の削減で
+        # 解決する:
+        #   - LTX25_LOAD_UPSAMPLERS=0: latent/temporal upsampler 非ロード(-1.2GB)。
+        #     upscale/temporal_upscale/t2i(diffusion 品質経路)は明確なエラーになる。
+        #   - LTX25_TE_DIET=1: Gemma TE の embed_tokens(bf16 1.88GB)を CPU へ
+        #     ブリッジ+lm_head スキップ(全トークン logits ~0.5GB の一時確保も
+        #     消える)。app/tediet.py 参照。
+        # 合計 -3.1GB 常駐 + -0.5GB 一時で、全常駐 ~29.4GB → 空き31GB(5090
+        # ヘッドレス相当)に収まる想定。速度は nvfp4-fast と同等(削るのは
+        # 未使用コンポーネントと埋め込み lookup の配置のみ、denoise 経路は不変)。
+        # 48GB 級では nvfp4-fast を使うこと(t2i/upscale も使えるため)。
+        env={"LTX25_TRANSFORMER_PRECISION": "nvfp4", "OFFLOAD_MODE": "none",
+             "LTX25_NVENC_PRESET": "p4", "LTX25_CUDA_GRAPH": "1",
+             "LTX25_LOAD_UPSAMPLERS": "0", "LTX25_TE_DIET": "1"},
+        description="nvfp4-fast の 32GB 級(RTX 5090)向け派生。upsampler 非ロード + TE ダイエットで"
+                    "全常駐を ~29GB に削減、リアルタイム経路(t2av/a2v、upscale なし)専用。",
+        vram_hint="全常駐 ~29GB 想定(upscale/t2i 不可)",
+    ),
 }
 
 # app/config.py の Settings フィールド由来のキーのみ許可(pydantic-settings は
@@ -250,6 +272,7 @@ LTX25_ALLOWED_KEYS = {
     "LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL", "LLM_TIMEOUT_SECONDS",
     "LTX25_PORT", "LTX25_TRANSFORMER_PRECISION", "LTX25_NVFP4_CKPT",
     "LTX25_VIDEO_ENCODER", "LTX25_VIDEO_CRF", "LTX25_DECODER",
+    "LTX25_LOAD_UPSAMPLERS", "LTX25_TE_DIET",
 }
 
 LTX25 = BackendDef(
