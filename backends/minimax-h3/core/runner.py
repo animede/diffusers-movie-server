@@ -1398,6 +1398,62 @@ if H3_TURBO_LORA and H3_TURBO_LORA_REPO in _TURBO_COMFY_REPOS and (H3_LOWVRAM_AN
         "(lightx2v/Minimax-h3-Turbo) instead, or drop the other flag."
     )
 
+# HyperFlow (Video Rebirth の 8-step flow-map 蒸留 LoRA、2026-09-26 統合、A/B 検証用)。
+# rank256/alpha256(scale=1.0)の PEFT LoRA + TwoTimeEmbedder(現在時刻 t と step 終端 r の
+# 2時刻条件付け、gate=0.25)+ 焼き込み9点σグリッド(8 NFE、shift はスケジューラ設定値を
+# 実行時に適用 -- 既定 12/3 は蒸留時と同一)。**ref2va 専用**(t2va/fl2va は generate() 側で
+# 明確に拒否する。LoRA 自体は3タスク対応だが transformer(非ref)側への配線は未実装)。
+# 適用機構は hyperflow_h3 パッケージ(公式、pip 導入済み):
+#   - runner 名前空間の MiniMaxH3SetTimestepsStep を HyperFlowSetTimestepsStep へ丸ごと
+#     差し替える(下)。未ロード時の _hyperflow_is_disabled() は False(=有効扱い)を
+#     返す実装のため、transformer_ref のロードが set_timesteps より後でも正しく
+#     HyperFlow グリッドが組まれる(実装確認済み)。
+#   - denoise 側は _maybe_hyperflowify_denoise_step() が LoopDenoiser サブブロックを
+#     HyperFlowLoopDenoiser へ差し替える(endpoint_context の配線はそちらが担う)。
+#   - LoRA 本体のロードは apply_instant_settings(is_ref=True) 直前の
+#     _ensure_hyperflow_ref()(単一チョークポイント、ref2va と ref バッチ両方を通る)。
+# フェーズA probe 実測(2026-09-26): int8 prequant transformer_ref に PEFT が
+# TorchaoLoraLinear でそのまま適用可、LoRA 常駐 +2.87GB、ロード 6.5s。
+H3_HYPERFLOW = os.environ.get("H3_HYPERFLOW", "0").strip() == "1"
+H3_HYPERFLOW_LORA = os.environ.get("H3_HYPERFLOW_LORA", "videorebirth/hyperflow").strip()
+if H3_HYPERFLOW and H3_TURBO_LORA:
+    raise RuntimeError(
+        "H3_HYPERFLOW=1 と H3_TURBO_LORA=1 は併用できません (turbo の _TurboLoRALinear と "
+        "HyperFlow の PEFT アダプタが同じ Linear 群へ二重適用になる)。どちらか一方にしてください。"
+    )
+def _make_set_timesteps_step():
+    """ref2va 経路の set_timesteps ブロックを返す。H3_HYPERFLOW 時は HyperFlow 版。
+
+    グローバル名の import 差し替えではなくインスタンス化ヘルパーにしたのは、
+    generate_ref2va() が関数ローカルで公式 `MiniMaxH3SetTimestepsStep` を import して
+    おり、モジュールグローバルの上書きが効かない(= denoise 側だけ差し替わって
+    set_timesteps 側が公式のまま 2-tuple を作りエラーになる)ため。両ブロックを
+    必ず対で HyperFlow 版にするための単一ソース。
+    """
+    if H3_HYPERFLOW:
+        from hyperflow_h3 import HyperFlowSetTimestepsStep
+        return HyperFlowSetTimestepsStep()
+    from diffusers.modular_pipelines.minimax_h3.before_denoise import MiniMaxH3SetTimestepsStep
+    return MiniMaxH3SetTimestepsStep()
+
+
+def _maybe_hyperflowify_denoise_step(step):
+    """H3_HYPERFLOW 時、denoise 複合ブロック内の LoopDenoiser を HyperFlow 版へ差し替える。
+
+    HyperFlowLoopDenoiser は step ごとに row_timestep_plan の (t, r, indices) 3-tuple を
+    読み、transformer 呼び出しを TwoTimeEmbedder.endpoint_context(r) で包む(公式実装)。
+    transformer_name は元ブロックの値(ref2va なら "transformer_ref")を引き継ぐ。
+    """
+    if not H3_HYPERFLOW:
+        return step
+    from hyperflow_h3 import HyperFlowLoopDenoiser
+    from diffusers.modular_pipelines.minimax_h3.denoise import MiniMaxH3LoopDenoiser
+    for key, block in list(step.sub_blocks.items()):
+        if isinstance(block, MiniMaxH3LoopDenoiser) and not isinstance(block, HyperFlowLoopDenoiser):
+            step.sub_blocks[key] = HyperFlowLoopDenoiser(transformer_name=block.transformer_name)
+    return step
+
+
 # MINIMAX_H3_MIN_DURATION..MAX_DURATION = 5..15s at 24fps, aligned to 17*n+5.
 MIN_SECONDS = 5.0
 MAX_SECONDS = 15.0
@@ -3955,6 +4011,38 @@ class MiniMaxH3Runner:
             self._turbo_lora_path, time.time() - t0, H3_TURBO_LORA_REPO, H3_TURBO_LORA_FILE,
         )
 
+    def _ensure_hyperflow_ref(self, progress: ProgressState | None = None) -> None:
+        """H3_HYPERFLOW 時、transformer_ref に HyperFlow LoRA + TwoTimeEmbedder を適用する。
+
+        冪等: 適用済みかは transformer_ref インスタンスの time_embedder が
+        TwoTimeEmbedder かどうかで判定する(bool フラグではなくインスタンス基準 --
+        lowvram のパーティション切替等で transformer_ref が作り直された場合にも
+        自動で再適用される)。呼び出し点は apply_instant_settings(is_ref=True) の直前
+        (ref2va 本体と ref バッチの両経路が通る単一チョークポイント。denoise より
+        前であれば set_timesteps との順序は問わない -- モジュールコメント参照)。
+        """
+        if not H3_HYPERFLOW:
+            return
+        tr = getattr(self._pipe_ref, "transformer_ref", None)
+        if tr is None:
+            raise RuntimeError("H3_HYPERFLOW: transformer_ref が未ロードのまま適用点に到達しました")
+        from hyperflow_h3.embedder import TwoTimeEmbedder
+
+        if isinstance(tr.time_embedder, TwoTimeEmbedder):
+            return
+        if progress:
+            progress.update(phase="loading_transformer", message="HyperFlow LoRA を適用中...")
+        import types as _types
+
+        from hyperflow_h3 import load_hyperflow_lora
+
+        t0 = time.time()
+        load_hyperflow_lora(_types.SimpleNamespace(transformer_ref=tr), H3_HYPERFLOW_LORA)
+        logger.info(
+            "HyperFlow LoRA applied to transformer_ref in %.1fs (source=%s). gpu=%s",
+            time.time() - t0, H3_HYPERFLOW_LORA, gpu_mem_gb(),
+        )
+
     def _check_group_offload_ram_guard(self):
         """Refuse to start a group-offload transformer load if host RAM is already tight.
 
@@ -5881,6 +5969,11 @@ class MiniMaxH3Runner:
         still: bool = False,
         still_frames: int = 22,
     ) -> dict:
+        if H3_HYPERFLOW:
+            raise RuntimeError(
+                "H3_HYPERFLOW=1 は ref2va 専用です (t2va/fl2va/静止画への配線は未実装)。"
+                "generate_ref2va を使うか、H3_HYPERFLOW を外して起動し直してください。"
+            )
         """
         Runs T2VA (image=None, last_image=None) or FL2VA (either/both given).
 
@@ -7570,6 +7663,12 @@ class MiniMaxH3Runner:
         state.set("width", width)
         state.set("num_frames", num_frames)
         state.set("generator", torch.Generator(device="cpu").manual_seed(seed) if seed is not None else None)
+        if H3_HYPERFLOW and num_inference_steps != 8:
+            logger.info(
+                "H3_HYPERFLOW: num_inference_steps %s -> 8 (step数とσグリッドは重みに焼き込み)",
+                num_inference_steps,
+            )
+            num_inference_steps = 8
         state.set("num_inference_steps", num_inference_steps)
         state.set("output_type", "pt")
         state.set("attention_kwargs", None)
@@ -7709,7 +7808,7 @@ class MiniMaxH3Runner:
             _, state = latents_step(pipe, state)
             ref2va_latents_step = MiniMaxH3Ref2VAPrepareLatentsStep()
             _, state = ref2va_latents_step(pipe, state)
-            timesteps_step = MiniMaxH3SetTimestepsStep()
+            timesteps_step = _make_set_timesteps_step()
             if vocal_lock_effective and vocal_lock_latents is not None:
                 vocal_lock_original_num_condition_audio_rows = _inflate_vocal_lock_condition_rows(
                     state, state.get("num_audio_latents"), pipe.audio_channels
@@ -7749,7 +7848,7 @@ class MiniMaxH3Runner:
             _, state = latents_step(pipe, state)
             ref2va_latents_step = MiniMaxH3Ref2VAPrepareLatentsStep()
             _, state = ref2va_latents_step(pipe, state)
-            timesteps_step = MiniMaxH3SetTimestepsStep()
+            timesteps_step = _make_set_timesteps_step()
             if vocal_lock_effective and vocal_lock_latents is not None:
                 vocal_lock_original_num_condition_audio_rows = _inflate_vocal_lock_condition_rows(
                     state, state.get("num_audio_latents"), pipe.audio_channels
@@ -7827,7 +7926,7 @@ class MiniMaxH3Runner:
                 _, state = latents_step(pipe, state)
                 ref2va_latents_step = MiniMaxH3Ref2VAPrepareLatentsStep()
                 _, state = ref2va_latents_step(pipe, state)
-                timesteps_step = MiniMaxH3SetTimestepsStep()
+                timesteps_step = _make_set_timesteps_step()
                 if vocal_lock_effective and vocal_lock_latents is not None:
                     vocal_lock_original_num_condition_audio_rows = _inflate_vocal_lock_condition_rows(
                         state, state.get("num_audio_latents"), pipe.audio_channels
@@ -7878,7 +7977,7 @@ class MiniMaxH3Runner:
                 _, state = latents_step(pipe, state)
                 ref2va_latents_step = MiniMaxH3Ref2VAPrepareLatentsStep()
                 _, state = ref2va_latents_step(pipe, state)
-                timesteps_step = MiniMaxH3SetTimestepsStep()
+                timesteps_step = _make_set_timesteps_step()
                 if vocal_lock_effective and vocal_lock_latents is not None:
                     vocal_lock_original_num_condition_audio_rows = _inflate_vocal_lock_condition_rows(
                         state, state.get("num_audio_latents"), pipe.audio_channels
@@ -7948,13 +8047,14 @@ class MiniMaxH3Runner:
         # Instant-apply this request's cache/attn/turbo settings -- see generate()'s
         # matching comment for the full reasoning. `transformer_ref` is confirmed
         # resident by every branch above this point.
+        self._ensure_hyperflow_ref(progress=progress)
         self.apply_instant_settings(self._pipe_ref.transformer_ref, instant, is_ref=True, progress=progress)
 
         def _fbc_reset_and_context():
             self._pipe_ref.transformer_ref._reset_stateful_cache()
             return self._pipe_ref.transformer_ref.cache_context("h3")
 
-        denoise_step = MiniMaxH3Ref2VADenoiseStep()
+        denoise_step = _maybe_hyperflowify_denoise_step(MiniMaxH3Ref2VADenoiseStep())
         orig_loop_step = denoise_step.loop_step
 
         def timed_loop_step(components, bstate, i, t):
@@ -8460,7 +8560,7 @@ class MiniMaxH3Runner:
             _, state = latents_step(pipe, state)
             ref2va_latents_step = MiniMaxH3Ref2VAPrepareLatentsStep()
             _, state = ref2va_latents_step(pipe, state)
-            timesteps_step = MiniMaxH3SetTimestepsStep()
+            timesteps_step = _make_set_timesteps_step()
             _, state = timesteps_step(pipe, state)
             scene["state"] = state
         encode_time = time.time() - t_encode
@@ -8469,6 +8569,7 @@ class MiniMaxH3Runner:
         with self._load_lock:
             self._free_text_encoder(force=True)
             self._ensure_transformer_ref(progress)
+        self._ensure_hyperflow_ref(progress=progress)
         self.apply_instant_settings(self._pipe_ref.transformer_ref, instant, is_ref=True, progress=progress)
 
         # --- denoise 位相: 全場面を順に ---
@@ -8490,7 +8591,7 @@ class MiniMaxH3Runner:
 
             step_times: list[float] = []
             cache_skips = [0]
-            denoise_step = MiniMaxH3Ref2VADenoiseStep()
+            denoise_step = _maybe_hyperflowify_denoise_step(MiniMaxH3Ref2VADenoiseStep())
             orig_loop_step = denoise_step.loop_step
 
             def timed_loop_step(components, bstate, i, t, _idx=idx, _step_times=step_times, _skips=cache_skips):
