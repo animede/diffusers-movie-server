@@ -109,6 +109,31 @@ H3_PRESETS = {
                     "(overrides で追加可)。",
         vram_hint="t2va peak ~38.9GB",
     ),
+    "48gb-hyperflow": Preset(
+        name="48gb-hyperflow",
+        # HyperFlow 8step LoRA(videorebirth/hyperflow、ref2va 対応の flow-map 蒸留)。
+        # 2026-09-26 実測(RTX PRO 5000 Blackwell 48GB、768×448・5秒・ref2va・seed 12345):
+        #   HyperFlow 8step : 合計 160〜173s / denoise 94〜111s / peak 42.6GB
+        #   lightx2v 8step  : 合計 117.7s   / denoise 61.6s     / peak 41.1GB(同条件)
+        #   lightx2v 4step  : 合計  98.6s   / denoise 52.4s     / peak 40.8GB(同条件)
+        # 1step あたりの時間は3構成ともほぼ同じ(8.2〜9.2s)。品質はユーザー目視 A/B で
+        # 「lightx2v 8step(バランス)よりわずかに上」(1seed 判定)。コスト +40〜50% の
+        # 品質 tier として opt-in 選択する用途向け。既定 tier は現行 lightx2v のまま。
+        # 注意: H3_HYPERFLOW=1 はプロセス単位で turbo(lightx2v)と排他
+        # (runner が両方指定を起動時に拒否)。turbo トグルとの併用不可。
+        # steps は 8 固定(σグリッドが重みに焼き込み、runner が強制する)。
+        # ライセンス: MiniMax H3 Community License(EU/UK/韓国/米国は要許諾。日本は制限外)。
+        env={
+            "H3_HYPERFLOW": "1",
+            "H3_LOWVRAM": "1",
+            "H3_TE_PRUNE": "1",
+            "H3_VIDEO_VAE_FP16": "1",
+            "H3_TRANSFORMER_QUANT": "int8",
+        },
+        description="HyperFlow 8step LoRA(ref2va 品質 tier、48GB 級で成立)。lightx2v 8step より"
+                    "品質わずかに上・コスト +40〜50%。turbo トグルと排他、steps 8 固定。",
+        vram_hint="ref2va peak 42.6GB(768×448・5秒)",
+    ),
     "48gb-dual": Preset(
         name="48gb-dual",
         # README「48GB級(推奨: 高速化フル)」そのまま(2GPU分担)。
@@ -343,6 +368,12 @@ def _validate_combination(backend_name: str, env: dict[str, str]) -> None:
                 "併用できません(fuse_projections() の torch.cat が torchao Int8Tensor に"
                 "対応していない)。既定の lightx2v 版(diffusers ネイティブ)なら int8 でも"
                 f"動きます — H3_TURBO_LORA_REPO を外すか {_H3_TURBO_DEFAULT_REPO!r} にしてください")
+        if turbo and env.get("H3_HYPERFLOW") == "1":
+            # core/runner.py 側の起動時 RuntimeError を先取りして 400 にする。
+            raise ValidationError(
+                "H3_HYPERFLOW=1 と turbo(H3_TURBO_LORA=1)は併用できません"
+                "(HyperFlow はプロセス単位で lightx2v turbo と排他。"
+                "48gb-hyperflow プリセットは turbo トグルなしで使ってください)")
         if turbo and env.get("H3_LOWVRAM") == "group":
             raise ValidationError(
                 "turbo(H3_TURBO_LORA=1)と H3_LOWVRAM=group は併用できません"
