@@ -95,6 +95,13 @@ def resolve_instant_settings(
         turbo = runner.H3_TURBO_LORA
     turbo = bool(turbo)
 
+    if getattr(runner, "H3_HYPERFLOW", False):
+        # HyperFlow(8step flow-map 蒸留)構成では turbo と FBC を強制無効にする:
+        # turbo の _TurboLoRALinear は HyperFlow の PEFT アダプタと同じ Linear 群へ
+        # 二重適用になり、FBC は蒸留短工程に安全な窓が無い(turbo と同じ理屈)。
+        turbo = False
+        cache = "none"
+
     # A handful of turbo steps (4-8) leaves no redundant-computation window for FBC's
     # residual-similarity skip to safely exploit, and caching on top of an
     # already-short trajectory risks compounding drift for no measured benefit -- same
