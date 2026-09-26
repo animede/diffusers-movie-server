@@ -260,8 +260,15 @@ LTX25_PRESETS = {
         # 「reserved but unallocated 1.3〜1.6GB」が発生し、空き31GB制限で境界OOMした
         # (単一shapeの合成テストでは 28.8GB で収まっていた)。expandable_segments は
         # この未使用予約分を回収する。
+        # LTX25_CUDA_GRAPH=0(2026-09-27、会話モードの実機OOMを受けて変更):
+        # 会話は朗読より shape 種が多く(ターン内連結の条件付きチャンク等)、
+        # capture ごとの graph pool 蓄積で backend が 30.9GB に達し、新 shape の
+        # ワークスペース確保(364MB)が失敗した(偶数チャンク=既存shapeのreplayだけ
+        # 成功する症状)。31GB 予算では graph pool の余裕がないため 32GB プリセット
+        # では graph を切る(速度 +0.5s/チャンク程度、4.8s 予算内)。48GB 以上の
+        # nvfp4-fast は従来どおり graph 有効。
         env={"LTX25_TRANSFORMER_PRECISION": "nvfp4", "OFFLOAD_MODE": "none",
-             "LTX25_NVENC_PRESET": "p4", "LTX25_CUDA_GRAPH": "1",
+             "LTX25_NVENC_PRESET": "p4", "LTX25_CUDA_GRAPH": "0",
              "LTX25_LOAD_UPSAMPLERS": "0", "LTX25_TE_DIET": "1",
              "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"},
         description="nvfp4-fast の 32GB 級(RTX 5090)向け派生。upsampler 非ロード + TE ダイエットで"
