@@ -254,9 +254,16 @@ LTX25_PRESETS = {
         # ヘッドレス相当)に収まる想定。速度は nvfp4-fast と同等(削るのは
         # 未使用コンポーネントと埋め込み lookup の配置のみ、denoise 経路は不変)。
         # 48GB 級では nvfp4-fast を使うこと(t2i/upscale も使えるため)。
+        # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True(2026-09-27追加):
+        # 実アプリ(realtime-narration)は shape が多く(待機動画/アンカー/ターン先頭
+        # 低解像度/本番チャンク)、capture ごとの graph pool 蓄積 + アロケータ断片化で
+        # 「reserved but unallocated 1.3〜1.6GB」が発生し、空き31GB制限で境界OOMした
+        # (単一shapeの合成テストでは 28.8GB で収まっていた)。expandable_segments は
+        # この未使用予約分を回収する。
         env={"LTX25_TRANSFORMER_PRECISION": "nvfp4", "OFFLOAD_MODE": "none",
              "LTX25_NVENC_PRESET": "p4", "LTX25_CUDA_GRAPH": "1",
-             "LTX25_LOAD_UPSAMPLERS": "0", "LTX25_TE_DIET": "1"},
+             "LTX25_LOAD_UPSAMPLERS": "0", "LTX25_TE_DIET": "1",
+             "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"},
         description="nvfp4-fast の 32GB 級(RTX 5090)向け派生。upsampler 非ロード + TE ダイエットで"
                     "全常駐を ~29GB に削減、リアルタイム経路(t2av/a2v、upscale なし)専用。",
         vram_hint="全常駐 ~29GB 想定(upscale/t2i 不可)",
@@ -272,7 +279,7 @@ LTX25_ALLOWED_KEYS = {
     "LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL", "LLM_TIMEOUT_SECONDS",
     "LTX25_PORT", "LTX25_TRANSFORMER_PRECISION", "LTX25_NVFP4_CKPT",
     "LTX25_VIDEO_ENCODER", "LTX25_VIDEO_CRF", "LTX25_DECODER",
-    "LTX25_LOAD_UPSAMPLERS", "LTX25_TE_DIET",
+    "LTX25_LOAD_UPSAMPLERS", "LTX25_TE_DIET", "PYTORCH_CUDA_ALLOC_CONF",
 }
 
 LTX25 = BackendDef(
