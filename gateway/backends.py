@@ -260,16 +260,16 @@ LTX25_PRESETS = {
         # 「reserved but unallocated 1.3〜1.6GB」が発生し、空き31GB制限で境界OOMした
         # (単一shapeの合成テストでは 28.8GB で収まっていた)。expandable_segments は
         # この未使用予約分を回収する。
-        # LTX25_CUDA_GRAPH=0(2026-09-27、会話モードの実機OOMを受けて変更):
-        # 会話は朗読より shape 種が多く(ターン内連結の条件付きチャンク等)、
-        # capture ごとの graph pool 蓄積で backend が 30.9GB に達し、新 shape の
-        # ワークスペース確保(364MB)が失敗した(偶数チャンク=既存shapeのreplayだけ
-        # 成功する症状)。31GB 予算では graph pool の余裕がないため 32GB プリセット
-        # では graph を切る(速度 +0.5s/チャンク程度、4.8s 予算内)。48GB 以上の
-        # nvfp4-fast は従来どおり graph 有効。
+        # LTX25_TE_STREAM=1(2026-09-27追加): TE の NF4 言語モデル層(~5.0GB)を
+        # pinned host に置き、エンコード中だけ窓付き先読みで GPU へ流す
+        # (app/testream.py、encode +0.16s・bit一致)。常駐 28.8 -> ~23.8GB。
+        # LTX25_CUDA_GRAPH は一度 0 に落とした(会話の多shapeで graph pool が
+        # 31GB 予算に収まらず新shapeのworkspace確保がOOM)が、TE_STREAM の
+        # 5GB 削減でヘッドルームが戻ったため 1 へ再有効化(会話E2Eで再検証済み)。
         env={"LTX25_TRANSFORMER_PRECISION": "nvfp4", "OFFLOAD_MODE": "none",
-             "LTX25_NVENC_PRESET": "p4", "LTX25_CUDA_GRAPH": "0",
+             "LTX25_NVENC_PRESET": "p4", "LTX25_CUDA_GRAPH": "1",
              "LTX25_LOAD_UPSAMPLERS": "0", "LTX25_TE_DIET": "1",
+             "LTX25_TE_STREAM": "1",
              "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"},
         description="nvfp4-fast の 32GB 級(RTX 5090)向け派生。upsampler 非ロード + TE ダイエットで"
                     "全常駐を ~29GB に削減、リアルタイム経路(t2av/a2v、upscale なし)専用。",
@@ -286,7 +286,8 @@ LTX25_ALLOWED_KEYS = {
     "LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL", "LLM_TIMEOUT_SECONDS",
     "LTX25_PORT", "LTX25_TRANSFORMER_PRECISION", "LTX25_NVFP4_CKPT",
     "LTX25_VIDEO_ENCODER", "LTX25_VIDEO_CRF", "LTX25_DECODER",
-    "LTX25_LOAD_UPSAMPLERS", "LTX25_TE_DIET", "PYTORCH_CUDA_ALLOC_CONF",
+    "LTX25_LOAD_UPSAMPLERS", "LTX25_TE_DIET", "LTX25_TE_STREAM",
+    "LTX25_TE_STREAM_WINDOW", "PYTORCH_CUDA_ALLOC_CONF",
 }
 
 LTX25 = BackendDef(
