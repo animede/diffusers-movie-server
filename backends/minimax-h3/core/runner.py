@@ -3216,7 +3216,8 @@ def resolve_turbo_lora_scale(lora_format: str, lora_path: str | None = None) -> 
 
             with safe_open(lora_path, framework="pt") as f:
                 metadata = f.metadata() or {}
-                alpha_raw = metadata.get("alpha")
+                # `lora_alpha` は PDMD 版 (pdmd2026/*) の metadata キー名
+                alpha_raw = metadata.get("alpha") or metadata.get("lora_alpha")
                 if alpha_raw is not None:
                     lora_a_keys = sorted(k for k in f.keys() if ".lora_A." in k)
                     rank = f.get_slice(lora_a_keys[0]).get_shape()[0]
@@ -3271,6 +3272,17 @@ def apply_diffusers_turbo_lora(transformer, lora_path: str, scale: float) -> int
 
     t_load = time.time()
     lora_sd = load_file(lora_path)
+    # キー形式の正規化: lightx2v 版は `<path>.lora_A.default.weight`、PDMD 版
+    # (pdmd2026/pdmd_{2,4}NFE_lora) は `transformer.<path>.lora_A.weight`。どちらも
+    # `<path>.lora_A.default.weight` へ揃える (既存の lightx2v ファイルは無変更で通る)。
+    _norm: dict[str, torch.Tensor] = {}
+    for k, v in lora_sd.items():
+        nk = k[len("transformer."):] if k.startswith("transformer.") else k
+        nk = nk.replace(".lora_A.weight", ".lora_A.default.weight").replace(
+            ".lora_B.weight", ".lora_B.default.weight"
+        )
+        _norm[nk] = v
+    lora_sd = _norm
     paths = sorted({k.rsplit(".lora_", 1)[0] for k in lora_sd if ".lora_" in k})
     device = next(transformer.parameters()).device
     n_wrapped = 0
