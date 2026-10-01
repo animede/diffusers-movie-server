@@ -1272,6 +1272,34 @@ def _keep_ref2va_active() -> bool:
 # 適用対象は bnb-4bit の TE のみ (H3_TE_QUANT=none / H3_TE_PROJ は対象外)。
 H3_TE_DIET = os.environ.get("H3_TE_DIET", "0").strip() == "1"
 
+# EXPERIMENTAL, opt-in (2026-10-01). `H3_TE_STREAM=1`: bnb-4bit text_encoder の LM 層
+# (H3_TE_PRUNE=1 の 51 層、~13GiB) を pinned host に置き、エンコード中だけ窓付きで層単位に
+# GPU へ流す (LTX-2.5 の `LTX25_TE_STREAM`、`core/testream.py`)。TE が呼ばれるのは参照
+# プレフィックスのエンコード (cache MISS 時) と各リクエストのプロンプト継続 forward だけで、
+# denoise / decode の間は LM 層は使われない -> その間の GPU 常駐を ~13GiB 減らす。
+# 層単位の移動 (モジュール丸ごとのスワップではない)・値は不変なので出力はビット一致。
+# 適用は `_apply_te_diet` の直後 (同じ2箇所)。TE が計算用 GPU に載る bnb-4bit 構成専用
+# (H3_TE_DEVICE 外部常駐・H3_TE_QUANT=none・H3_TE_PROJ では無視)。ホスト RAM は pinned
+# 確保分 (~14GiB) + 余裕を MemAvailable で確認し、足りなければ RuntimeError。
+# `H3_TE_STREAM_WINDOW` (既定 2 = LTX-2.5 と同じ): 先読みする層数。既定 (0) は挙動不変。
+H3_TE_STREAM = os.environ.get("H3_TE_STREAM", "0").strip() == "1"
+H3_TE_STREAM_WINDOW = max(1, int(os.environ.get("H3_TE_STREAM_WINDOW", "2").strip() or "2"))
+H3_TE_STREAM_MIN_FREE_RAM_GB = float(os.environ.get("H3_TE_STREAM_MIN_FREE_RAM_GB", "10").strip() or "10")
+
+
+def _apply_te_stream(text_encoder) -> float:
+    """`H3_TE_STREAM`: 適用して pinned GiB を返す。冪等。呼び出し側が `not self._te_external` を保証する。"""
+    from core.testream import apply_te_stream
+
+    pinned = apply_te_stream(
+        text_encoder, window=H3_TE_STREAM_WINDOW, min_free_ram_gb=H3_TE_STREAM_MIN_FREE_RAM_GB
+    )
+    if pinned > 0.0:
+        gc.collect()
+        torch.cuda.empty_cache()
+    return pinned
+
+
 # EXPERIMENTAL, opt-in (2026-10-01). `H3_REF_PREFIX_PARK=1`: `H3_REF_PREFIX_CACHE_SINGLE=1` の
 # プレフィックス KV (~0.84GiB) を、エンコードしていない間は CPU (pinned) に置く。KV を使うのは
 # 次のリクエストの `_encode_ref2va_prompt_prefix_cached()` の継続 forward だけで、denoise/decode
@@ -5348,6 +5376,13 @@ class MiniMaxH3Runner:
         if H3_TE_DIET and not self._te_external:
             _apply_te_diet(self._pipe.text_encoder)  # no-op unless H3_TE_DIET=1 (bnb-4bit TE only)
             logger.info("text_encoder after H3_TE_DIET. gpu=%s", gpu_mem_gb())
+        if H3_TE_STREAM and not self._te_external:
+            t_stream = time.time()
+            pinned = _apply_te_stream(self._pipe.text_encoder)  # after diet (same order as LTX2.5)
+            logger.info(
+                "text_encoder after H3_TE_STREAM (window=%d, pinned %.2fGiB, %.1fs). gpu=%s ram=%s",
+                H3_TE_STREAM_WINDOW, pinned, time.time() - t_stream, gpu_mem_gb(), ram_gb(),
+            )
         self._detach_te_if_external()
         # フェーズ境界での中断チェック(loading_text_encoder)。
         interrupt_controller.check()
@@ -5846,6 +5881,13 @@ class MiniMaxH3Runner:
             if H3_TE_DIET and not self._te_external:
                 # prequant 保存(上)は完全な重みで済ませた後に適用する (保存物を痩せさせない)。
                 _apply_te_diet(self._pipe.text_encoder)
+            if H3_TE_STREAM and not self._te_external:
+                t_stream = time.time()
+                pinned = _apply_te_stream(self._pipe.text_encoder)  # after diet (same order as LTX2.5)
+                logger.info(
+                    "text_encoder after H3_TE_STREAM (window=%d, pinned %.2fGiB, %.1fs). gpu=%s ram=%s",
+                    H3_TE_STREAM_WINDOW, pinned, time.time() - t_stream, gpu_mem_gb(), ram_gb(),
+                )
             self._detach_te_if_external()
             # フェーズ境界での中断チェック(loading_text_encoder)。
             interrupt_controller.check()
@@ -5934,6 +5976,9 @@ class MiniMaxH3Runner:
         # `_encode_ref2va_prompt_prefix_cached` 側の weakref チェックでも救えるが、
         # VRAM を即座に返すためここで能動的に捨てる)。既定 OFF のときは常に no-op。
         _clear_single_ref_prefix_cache("text_encoder freed")
+        # H3_TE_STREAM: LM 層の pinned host 実体 (~14GiB) は PyTorch の host キャッシュに残って
+        # しまう (del + gc + empty_cache では OS へ返らない) ので、TE を落とすときに明示的に返す。
+        _te_was_streamed = bool(getattr(self._pipe.text_encoder, "_te_stream_applied", False))
         del self._pipe.text_encoder
         self._pipe.text_encoder = None
         if self._pipe_ref is not None and getattr(self._pipe_ref, "text_encoder", None) is not None:
@@ -5953,6 +5998,8 @@ class MiniMaxH3Runner:
         self._text_encoder_loaded = False
         gc.collect()
         torch.cuda.empty_cache()
+        if _te_was_streamed and hasattr(torch._C, "_host_emptyCache"):
+            torch._C._host_emptyCache()
         logger.info("text_encoder freed (force=%s). gpu=%s ram=%s", force, gpu_mem_gb(), ram_gb())
 
     def _free_vaes(self):
@@ -6049,8 +6096,10 @@ class MiniMaxH3Runner:
                     "pruned" if H3_PRUNED else "int8", H3_KEEP_REF2VA_VAE,
                 )
                 logger.info(
-                    "H3_KEEP_REF2VA low-VRAM options: te_diet=%s ref_prefix_park=%s vae_split=%s",
+                    "H3_KEEP_REF2VA low-VRAM options: te_diet=%s ref_prefix_park=%s vae_split=%s "
+                    "te_stream=%s (window=%d)",
                     H3_TE_DIET, H3_REF_PREFIX_PARK and H3_REF_PREFIX_CACHE_SINGLE, H3_VAE_SPLIT,
+                    H3_TE_STREAM, H3_TE_STREAM_WINDOW,
                 )
                 if H3_REF_PREFIX_PARK and not H3_REF_PREFIX_CACHE_SINGLE:
                     logger.warning("H3_REF_PREFIX_PARK=1 has no effect without H3_REF_PREFIX_CACHE_SINGLE=1")
@@ -6118,6 +6167,8 @@ class MiniMaxH3Runner:
             "keep_ref2va": _keep_ref2va_active(),
             "keep_ref2va_vae": _keep_ref2va_active() and H3_KEEP_REF2VA_VAE,
             "te_diet": H3_TE_DIET,
+            "te_stream": H3_TE_STREAM,
+            "te_stream_window": H3_TE_STREAM_WINDOW if H3_TE_STREAM else None,
             "ref_prefix_park": H3_REF_PREFIX_PARK and H3_REF_PREFIX_CACHE_SINGLE,
             "vae_split": H3_VAE_SPLIT and _keep_ref2va_active(),
             "lowvram_group": H3_LOWVRAM_GROUP,
