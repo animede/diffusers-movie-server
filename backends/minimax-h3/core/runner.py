@@ -1059,6 +1059,46 @@ if H3_LOWVRAM_ANY:
             "anything else on a 24-48GB-class card."
         )
 
+# ---- AdaLN-pruned transformer_ref (2026-10-01、core/pruned.py 参照) -------------
+# multimodalart/MiniMax-H3-Pruned: AdaLN 入力射影の構造リファクタ(13.03B 削減、
+# ほぼロスレス)。ref2va 用 transformer_ref を pruned + int8 weight-only で読む
+# (既定 int8wo: 4.60 s/step・peak 28GB 実測。常駐 ~21GB)。現状 ref2va(transformer_ref)専用 -- t2va 側の
+# pruned 化は未実装(transformer/ サブフォルダを取得していない)。
+H3_PRUNED = os.environ.get("H3_PRUNED", "0").strip() == "1"
+H3_PRUNED_REPO = os.environ.get("H3_PRUNED_REPO", "multimodalart/MiniMax-H3-Pruned").strip()
+H3_PRUNED_CONVROT_GROUP = int(os.environ.get("H3_PRUNED_CONVROT_GROUP", "256"))
+# pruned transformer_ref の量子化方式(core/pruned.py の PRUNED_QUANT_SPECS)。既定は
+# `int8wo`(torchao Int8WeightOnlyConfig(version=2, PerRow)、ConvRot なし。2026-10-01 に
+# int8dyn-convrot から変更: 実測 4.60 vs 7.60 s/step、peak 28GB、品質同等。速度差の主因は
+# torchao int8 動的量子化の eager 経路)。`int8dyn-convrot`(旧既定)・`int8wo-convrot`・
+# `fp8`・`fp8-convrot`・`bf16` も選べる。キャッシュ dir 名・meta.json は方式ごとに別
+# (旧既定 int8dyn-convrot のキャッシュも従来のまま使える)。
+# 未知の値・torchao に無い config は初回リクエストまで持ち越さず、起動時にここで落とす。
+H3_PRUNED_QUANT = os.environ.get("H3_PRUNED_QUANT", "int8wo").strip().lower()
+if H3_PRUNED:
+    from core import pruned as _pruned_mod
+
+    H3_PRUNED_QUANT_SPEC = _pruned_mod.get_quant_spec(H3_PRUNED_QUANT)
+    H3_PRUNED_QUANT_SPEC.check_available()
+    H3_PRUNED_QUANT = H3_PRUNED_QUANT_SPEC.name
+else:
+    H3_PRUNED_QUANT_SPEC = None
+if H3_PRUNED and H3_TRANSFORMER_QUANT != "int8":
+    # pruned は ref2va の transformer_ref 専用で、その量子化方式は H3_PRUNED_QUANT が決める。
+    # H3_TRANSFORMER_QUANT は t2va 側の transformer と両常駐(H3_TRANSFORMER_BOTH_RESIDENT)
+    # / LOWVRAM 経路を決めるため別軸だが、pruned との組み合わせは int8 でしか検証して
+    # いないので従来どおり int8 を要求する。
+    raise RuntimeError(
+        "H3_PRUNED=1 は H3_TRANSFORMER_QUANT=int8 と併用してください(pruned 側の量子化"
+        "方式は H3_PRUNED_QUANT で選ぶ。H3_TRANSFORMER_QUANT は t2va 側/両常駐/LOWVRAM の"
+        "経路を決める別軸で、pruned との組み合わせは int8 のみ検証済み)。"
+    )
+if H3_PRUNED and H3_LOWVRAM_GROUP:
+    raise RuntimeError(
+        "H3_PRUNED=1 と H3_LOWVRAM=group は併用できません(group offload 経路の "
+        "pruned 対応は未実装。pruned は常駐 19.6GB なので group が必要な場面も薄い)。"
+    )
+
 # EXPERIMENTAL, opt-in. `H3_LOWVRAM=1` は毎リクエスト、デコード直前に transformer を
 # 解放し次リクエストで再ロードする (実測 14.8-32.7s の固定費、RESIDENCY.md §5.5)。
 # `H3_KEEP_TRANSFORMER=1` はその解放をスキップし、transformer をリクエスト間も
@@ -1420,6 +1460,12 @@ if H3_HYPERFLOW and H3_TURBO_LORA:
     raise RuntimeError(
         "H3_HYPERFLOW=1 と H3_TURBO_LORA=1 は併用できません (turbo の _TurboLoRALinear と "
         "HyperFlow の PEFT アダプタが同じ Linear 群へ二重適用になる)。どちらか一方にしてください。"
+    )
+if H3_HYPERFLOW and H3_PRUNED:
+    raise RuntimeError(
+        "H3_HYPERFLOW=1 と H3_PRUNED=1 は併用できません (pruned は time_proj/"
+        "time_embedder MLP を補間テーブルへ置換しており、HyperFlow の TwoTimeEmbedder が "
+        "ラップする対象が存在しない)。HyperFlow 品質 tier は非 pruned のまま使うこと。"
     )
 def _make_set_timesteps_step():
     """ref2va 経路の set_timesteps ブロックを返す。H3_HYPERFLOW 時は HyperFlow 版。
@@ -3879,7 +3925,7 @@ class MiniMaxH3Runner:
                 from torchao.quantization import Int8WeightOnlyConfig
 
                 quant_config = TorchAoConfig(
-                    Int8WeightOnlyConfig(version=2),
+                    Int8WeightOnlyConfig(version=2, set_inductor_config=False),
                     modules_to_not_convert=H3_INT8_MODULES_TO_NOT_CONVERT,
                 )
                 self._pipe.load_components(
@@ -4141,7 +4187,7 @@ class MiniMaxH3Runner:
         from torchao.quantization import Int8WeightOnlyConfig
 
         quant_config = TorchAoConfig(
-            Int8WeightOnlyConfig(version=2),
+            Int8WeightOnlyConfig(version=2, set_inductor_config=False),
             modules_to_not_convert=H3_INT8_MODULES_TO_NOT_CONVERT,
         )
         self._pipe.load_components(
@@ -4300,7 +4346,33 @@ class MiniMaxH3Runner:
             progress.update(phase="loading_transformer", message="transformer_ref (ref2va) をロード中...")
         t0 = time.time()
         loaded_from_prequant = False
-        if H3_TRANSFORMER_QUANT == "int8":
+        if H3_PRUNED:
+            # AdaLN-pruned 経路(core/pruned.py)。方式は H3_PRUNED_QUANT(既定 int8wo)。キャッシュ優先、無ければ bf16(CPU)-> 量子化 ->
+            # GPU 常駐で作って保存する(bf16 はキャッシュ対象外)。
+            spec = H3_PRUNED_QUANT_SPEC
+            logger.info(
+                "pruned transformer_ref: H3_PRUNED_QUANT=%s -> %s",
+                spec.name, spec.describe(H3_PRUNED_CONVROT_GROUP),
+            )
+            if spec.cacheable and H3_TRANSFORMER_PREQUANT and self._load_pruned_ref_from_prequant(
+                self._transformer_prequant_dir(is_ref=True), progress=progress
+            ):
+                loaded_from_prequant = True
+            else:
+                from core import pruned as pruned_mod
+
+                avail_ram = ram_gb()["avail_gb"]
+                if avail_ram < 45.0:
+                    raise RuntimeError(
+                        f"H3_PRUNED の初回ロードには bf16 重み ~40GB を CPU に置く必要が"
+                        f"ありますが、空きホストRAMが {avail_ram:.1f}GB しかありません "
+                        "(量子化方式ならキャッシュ作成後は不要になります)。"
+                    )
+                snapshot = pruned_mod.pruned_snapshot_dir(H3_PRUNED_REPO)
+                self._pipe_ref.transformer_ref = pruned_mod.load_pruned_ref_fresh(
+                    snapshot, DEVICE, H3_PRUNED_CONVROT_GROUP, quant=spec.name
+                )
+        elif H3_TRANSFORMER_QUANT == "int8":
             # 量子化済みキャッシュがあればそこから読む (`_ensure_transformer` と同じ、
             # H3_TRANSFORMER_PREQUANT の module docstring 参照)。
             if H3_TRANSFORMER_PREQUANT and self._load_transformer_from_prequant(
@@ -4312,7 +4384,7 @@ class MiniMaxH3Runner:
                 from torchao.quantization import Int8WeightOnlyConfig
 
                 quant_config = TorchAoConfig(
-                    Int8WeightOnlyConfig(version=2),
+                    Int8WeightOnlyConfig(version=2, set_inductor_config=False),
                     modules_to_not_convert=H3_INT8_MODULES_TO_NOT_CONVERT,
                 )
                 self._pipe_ref.load_components(
@@ -4337,7 +4409,13 @@ class MiniMaxH3Runner:
             )
         # See `_ensure_transformer`'s matching save call: only on a fresh in-place
         # quantize, and before turbo LoRA/attn backend/FBC/AdaLN precompute setup below.
-        if H3_TRANSFORMER_QUANT == "int8" and H3_TRANSFORMER_PREQUANT and not loaded_from_prequant:
+        # pruned は方式がキャッシュ対象のときだけ(bf16 はスナップショットがそのまま
+        # キャッシュなので保存しない)。
+        if H3_PRUNED:
+            cache_this_ref = H3_PRUNED_QUANT_SPEC.cacheable
+        else:
+            cache_this_ref = H3_TRANSFORMER_QUANT == "int8"
+        if cache_this_ref and H3_TRANSFORMER_PREQUANT and not loaded_from_prequant:
             self._save_transformer_prequant(
                 self._transformer_prequant_dir(is_ref=True), self._pipe_ref.transformer_ref, is_ref=True
             )
@@ -4348,7 +4426,12 @@ class MiniMaxH3Runner:
             logger.info("transformer_ref attention backend set to %r", H3_ATTN_BACKEND)
         if H3_CACHE == "fbc":
             self._enable_fbc_ref()
-        if H3_ADALN_PRECOMP:
+        if H3_ADALN_PRECOMP and H3_PRUNED:
+            logger.info(
+                "H3_ADALN_PRECOMP は H3_PRUNED=1 ではスキップします"
+                "(pruned は AdaLN 構造自体が別物で、精計算の対象が存在しない)"
+            )
+        if H3_ADALN_PRECOMP and not H3_PRUNED:
             # Mirrors `_ensure_transformer`'s own arming call -- see that method's
             # comment for the full rationale (re-arm on every fresh load, ordering vs
             # FBC does not matter). `enable_adaln_precompute()`'s class-level monkeypatch
@@ -4365,7 +4448,9 @@ class MiniMaxH3Runner:
             enable_adaln_precompute(self._pipe_ref.transformer_ref)
         logger.info(
             "transformer_ref loaded to GPU in %.1fs (quant=%s, adaln_precomp=%s). gpu=%s ram=%s",
-            time.time() - t0, H3_TRANSFORMER_QUANT, H3_ADALN_PRECOMP, gpu_mem_gb(), ram_gb(),
+            time.time() - t0,
+            f"pruned/{H3_PRUNED_QUANT}" if H3_PRUNED else H3_TRANSFORMER_QUANT,
+            H3_ADALN_PRECOMP, gpu_mem_gb(), ram_gb(),
         )
         # フェーズ境界での中断チェック(loading_transformer)。
         interrupt_controller.check()
@@ -4415,7 +4500,7 @@ class MiniMaxH3Runner:
         from torchao.quantization import Int8WeightOnlyConfig
 
         quant_config = TorchAoConfig(
-            Int8WeightOnlyConfig(version=2),
+            Int8WeightOnlyConfig(version=2, set_inductor_config=False),
             modules_to_not_convert=H3_INT8_MODULES_TO_NOT_CONVERT,
         )
         self._pipe_ref.load_components(
@@ -5057,7 +5142,18 @@ class MiniMaxH3Runner:
         混同しないよう名前でも分ける)。H3_TRANSFORMER_QUANT が int8 以外のときは
         呼び出し側がそもそもこのキャッシュに触れないので、ディレクトリ名に量子化方式は
         含めていない (現状 int8 のみが対象)。"""
-        name = "transformer_ref_int8" if is_ref else "transformer_int8"
+        if H3_PRUNED and is_ref:
+            # pruned は重み・構造とも別物なので専用ディレクトリ(非 pruned の
+            # transformer_ref_int8 と取り違えない)。さらに方式ごとに分ける(ConvRot の
+            # 有無はキャッシュファイルから判別できないため、名前で分けるしかない)。
+            # int8dyn-convrot は従来名 transformer_ref_pruned_int8convrot のまま。
+            name = H3_PRUNED_QUANT_SPEC.cache_name
+            if name is None:
+                raise RuntimeError(
+                    f"H3_PRUNED_QUANT={H3_PRUNED_QUANT!r} はキャッシュ対象外です(呼び出し側のバグ)"
+                )
+        else:
+            name = "transformer_ref_int8" if is_ref else "transformer_int8"
         return H3_TRANSFORMER_PREQUANT_DIR / name
 
     def _transformer_prequant_metadata(self) -> dict:
@@ -5080,7 +5176,7 @@ class MiniMaxH3Runner:
             source_snapshot = str(cached) if cached else None
         except Exception:
             source_snapshot = None
-        return {
+        meta = {
             "model_id": MODEL_ID,
             "source_snapshot": source_snapshot,
             "torchao_version": importlib.metadata.version("torchao"),
@@ -5090,6 +5186,28 @@ class MiniMaxH3Runner:
             # 定義時点の pristine スナップショットを使う(定義箇所のコメント参照)。
             "modules_to_not_convert": sorted(_H3_INT8_MODULES_TO_NOT_CONVERT_PRISTINE),
         }
+        if H3_PRUNED:
+            # pruned 時のみキーを追加する(非 pruned のメタデータを一切変えない =
+            # 既存キャッシュ transformer_int8/transformer_ref_int8 を無効化しない)。
+            try:
+                from huggingface_hub import try_to_load_from_cache as _ttlfc
+
+                cached = _ttlfc(H3_PRUNED_REPO, "transformer_ref/config.json")
+                pruned_snapshot = str(cached) if cached else None
+            except Exception:
+                pruned_snapshot = None
+            # quant_config は方式ごとの文字列(既定は従来の
+            # "Int8DynamicActivationInt8WeightConfig+convrot" のまま)。group size は
+            # ConvRot を掛ける方式でだけレシピの一部になる(回転なしの方式では値を
+            # 変えてもキャッシュが無効にならないよう含めない)。
+            meta.update({
+                "pruned_repo": H3_PRUNED_REPO,
+                "pruned_snapshot": pruned_snapshot,
+                "quant_config": H3_PRUNED_QUANT_SPEC.meta_quant_config,
+            })
+            if H3_PRUNED_QUANT_SPEC.convrot:
+                meta["convrot_group_size"] = H3_PRUNED_CONVROT_GROUP
+        return meta
 
     def _load_transformer_from_prequant(
         self, cache_dir: Path, is_ref: bool, progress: ProgressState | None = None
@@ -5146,6 +5264,57 @@ class MiniMaxH3Runner:
         )
         return True
 
+    def _load_pruned_ref_from_prequant(
+        self, cache_dir: Path, progress: ProgressState | None = None
+    ) -> bool:
+        """pruned(H3_PRUNED_QUANT の方式)の量子化済みキャッシュから transformer_ref を読む。
+
+        `_load_transformer_from_prequant` と同じ fail-open 方針(読めなければ False を
+        返し、呼び出し側が通常の bf16 ロード+量子化経路で作り直す)。違いは
+        ①モデルクラスが remote code の MiniMaxH3PrunedTransformer3DModel であること
+        ②ConvRot 系の方式ではオンライン入力回転がクラス差し替えで実現されており直列化
+        されないため、ロード後に `mark_convrot()` でクラスを付け直すこと(ConvRot 無しの
+        方式では呼ばない。どちらを呼ぶかは core/pruned.py が方式から機械的に決める)。
+        """
+        meta_path = cache_dir / "meta.json"
+        config_path = cache_dir / "config.json"
+        if not (meta_path.exists() and config_path.exists()):
+            return False
+        try:
+            saved_meta = json.loads(meta_path.read_text())
+        except Exception:
+            logger.warning("pruned 量子化済みキャッシュの meta.json が壊れています、"
+                           "通常経路へフォールバック: %s", cache_dir)
+            return False
+        current_meta = self._transformer_prequant_metadata()
+        if saved_meta != current_meta:
+            logger.info(
+                "pruned 量子化済みキャッシュのメタデータが現在の設定と不一致のため無効"
+                "扱いにします: %s\n保存済み=%s\n現在=%s",
+                cache_dir, saved_meta, current_meta,
+            )
+            return False
+        if progress:
+            progress.update(
+                phase="loading_transformer",
+                message="transformer_ref (pruned 量子化済みキャッシュ) をロード中...",
+            )
+        try:
+            from core import pruned as pruned_mod
+
+            snapshot = pruned_mod.pruned_snapshot_dir(H3_PRUNED_REPO)
+            tr = pruned_mod.load_pruned_ref_from_cache(
+                cache_dir, snapshot, DEVICE, H3_PRUNED_CONVROT_GROUP, quant=H3_PRUNED_QUANT
+            )
+        except Exception:
+            logger.exception(
+                "pruned 量子化済みキャッシュの読み込みに失敗、通常経路へフォールバック: %s",
+                cache_dir,
+            )
+            return False
+        self._pipe_ref.transformer_ref = tr
+        return True
+
     def _save_transformer_prequant(self, cache_dir: Path, transformer, is_ref: bool):
         """ロード済み (量子化直後、turbo LoRA 等でまだ手を加えていない) transformer(_ref)
         を量子化済みのまま保存する。失敗しても生成は続行する (`_save_te_prequant` と
@@ -5194,7 +5363,14 @@ class MiniMaxH3Runner:
             # ままの `state_dict()` をシャードに分けて直列化するため、34GB 全体を一度に
             # CPU へ複製することはない -- モジュール冒頭の H3_TRANSFORMER_PREQUANT_MIN_RAM_GB
             # のコメント参照)。
-            transformer.save_pretrained(str(tmp_dir))
+            if H3_PRUNED and is_ref:
+                # pruned は hf_quantizer を介さない生 torchao 量子化のため safetensors
+                # 保存が不可(core/pruned.py の save_pruned_ref_cache 参照)。
+                from core import pruned as pruned_mod
+
+                pruned_mod.save_pruned_ref_cache(transformer, tmp_dir, quant=H3_PRUNED_QUANT)
+            else:
+                transformer.save_pretrained(str(tmp_dir))
             (tmp_dir / "meta.json").write_text(
                 json.dumps(self._transformer_prequant_metadata(), indent=2, ensure_ascii=False)
             )
@@ -5586,6 +5762,14 @@ class MiniMaxH3Runner:
         keep the steady-state VRAM footprint minimal between requests.
         """
         with self._load_lock:
+            if H3_PRUNED:
+                # import 時の logger.info は uvicorn のロギング設定前で消えるので、起動時の
+                # 構成はここで出す(H3_LOWVRAM=1 では transformer_ref は初回リクエストまで
+                # ロードされず、`_ensure_transformer_ref` のログだけだと起動直後に分からない)。
+                logger.info(
+                    "H3_PRUNED=1: transformer_ref は pruned、H3_PRUNED_QUANT=%s -> %s",
+                    H3_PRUNED_QUANT, H3_PRUNED_QUANT_SPEC.describe(H3_PRUNED_CONVROT_GROUP),
+                )
             self._ensure_vaes()
             if H3_LOWVRAM_GROUP:
                 self._ensure_transformer()
@@ -5631,6 +5815,14 @@ class MiniMaxH3Runner:
             ),
             "video_vae_fp16": H3_VIDEO_VAE_FP16,
             "transformer_quant": H3_TRANSFORMER_QUANT,
+            # ref2va の transformer_ref を AdaLN-pruned で読むか、その量子化方式
+            # (H3_PRUNED_QUANT、core/pruned.py)。実行中の構成を logs と突合するため。
+            "pruned": H3_PRUNED,
+            "pruned_quant": H3_PRUNED_QUANT if H3_PRUNED else None,
+            # fp32 matmul の精度設定(torch.get_float32_matmul_precision())。torchao の
+            # quantize_() は set_inductor_config=True(既定)だと "high"(TF32)へ変えて
+            # しまうので、量子化経路の副作用で変わっていないこと("highest")を観測するため。
+            "float32_matmul_precision": torch.get_float32_matmul_precision(),
             # ref2va's reference-image normalization short edge (H3_REF_IMAGE_SHORT_EDGE,
             # see its definition above). Reported here (rather than only logged once at
             # pipe-shell build time) so a run's logs can be cross-checked against which

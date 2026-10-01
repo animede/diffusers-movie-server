@@ -347,6 +347,8 @@ H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1 \
 | `H3_TE_PROJ_QUANT` | `bnb-4bit` | 投影TE 4B の量子化(NF4 で 3.11GB。`none`=bf16 8.88GB / `bnb-8bit`) |
 | `H3_TE_DEVICE` | (無効) | TE を2枚目GPUへ常駐(例 `cuda:1`。32B TE は 20GB 級、投影TE なら 8GB 級で可) |
 | `H3_TRANSFORMER_QUANT` | `none` | `int8` で transformer を 66.3→34GB |
+| `H3_PRUNED` | `0` | ref2va の transformer_ref を AdaLN-pruned 版(`multimodalart/MiniMax-H3-Pruned`)で読む(常駐 34→約21GB、`H3_TRANSFORMER_QUANT=int8` 併用必須。HyperFlow/`H3_LOWVRAM=group`/`H3_ADALN_PRECOMP` とは非互換) |
+| `H3_PRUNED_QUANT` | `int8wo` | pruned の量子化方式: `int8wo`(既定、4.60 s/step・peak 28GB)/ `int8dyn-convrot`(旧既定、7.60 s/step)/ `int8wo-convrot` / `fp8` / `fp8-convrot` / `bf16`。方式ごとに別キャッシュ(`models/prequant/transformer_ref_pruned_*`) |
 | `H3_LOWVRAM` | `0` | `1`=48GB級のフェーズ循環 / `group`=32GB級以下の block offload |
 | `H3_KEEP_TRANSFORMER` | `0` | transformer 常駐で再ロード固定費を撤廃(成立条件は該当節参照) |
 | `H3_CACHE` / `H3_CACHE_THRESHOLD` | `fbc` / `0.05` | FirstBlockCache(デノイズ -25%。int8+SDPA 軌道では不発の実測あり) |
@@ -525,6 +527,18 @@ int8同士は同一seedでmp4バイト一致の完全決定論)、デノイズ�
 expandable_segments:True` をrunnerが設定(int8ロード/解放サイクルの断片化で
 「54GBしか使っていないのに15GB確保失敗」が実機再現したため。diffusers-serverでも
 実績のある設定)。既定 `none` は従来とバイト一致(回帰確認済み)。
+
+### torchao の TF32 副作用の抑止 (`set_inductor_config=False`、2026-10-01)
+
+torchao の `quantize_()` は config の `set_inductor_config=True`(既定)だと
+`recommended_inductor_config_setter()` を呼び、`torch.set_float32_matmul_precision("high")`
+(fp32 matmul の TF32 化)等を**プロセス全体**に立てる。fresh 量子化を行ったプロセスだけ
+以後の fp32 計算(audio_vae 等)の数値が変わり、キャッシュ読み込みだけのプロセスと出力が
+一致しなくなるため、本リポジトリの全 config(上記 `Int8WeightOnlyConfig(version=2)` と
+`core/pruned.py` の各方式)は `set_inductor_config=False` で作る。量子化済み重みは
+変わらず(フラグの副作用だけ)、キャッシュの `meta.json` も不変なので既存キャッシュは
+そのまま使える。`/api/status` の `float32_matmul_precision` が `"highest"` のままで
+あることで観測できる。
 
 ## 48GB級VRAM対応 (`H3_LOWVRAM`、既定 `0`)
 
