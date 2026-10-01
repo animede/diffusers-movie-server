@@ -134,6 +134,77 @@ H3_PRESETS = {
                     "品質わずかに上・コスト +40〜50%。turbo トグルと排他、steps 8 固定。",
         vram_hint="ref2va peak 42.6GB(768×448・5秒)",
     ),
+    "96gb-pruned-resident": Preset(
+        name="96gb-pruned-resident",
+        # ref2va を AdaLN-pruned int8wo(H3_PRUNED)+ 全常駐(H3_KEEP_REF2VA)で回す最速構成。
+        # 実測根拠: docs/h3-pruned-lowvram-20261001.md 行4
+        # (RTX PRO 6000 96GB、ref2va 768×448・5s・4step・turbo・seed 12345、定常 = 同一プロセスの
+        #  2回目以降):
+        #   現行 int8(非 pruned)         : 合計 41.8〜51.9s / peak 41.1GB
+        #   この構成(transformer_ref・TE・VAE 全常駐): 合計 24.2s / peak 52.2GB
+        #   (denoise 開始時の常駐 45.8GB、transformer_ref 22.2GB)
+        # 出力は pruned 系内でビット一致(配置換えのみ)。非 pruned int8 とは量子化レシピが違うため
+        # 別値(目視・PSNR で同等品質)。
+        # 注意:
+        #  - 96GB 級(空き 60GB 以上)専用。48GB/32GB には載らない(peak 52.2GB)→ 48gb-pruned-lowvram。
+        #  - H3_PRUNED は ref2va 専用。t2va 側は従来どおり(LOWVRAM=1 の載せ替え経路)。
+        #  - H3_PRUNED は H3_TRANSFORMER_QUANT=int8 必須、H3_HYPERFLOW / H3_LOWVRAM=group と排他
+        #    (runner が起動時に RuntimeError)。HyperFlow tier(48gb-hyperflow)とは別プリセット。
+        #  - turbo(lightx2v)トグル併用・steps 4 の実測。トグルは別途 {"turbo": true} で指定する。
+        env={
+            "H3_LOWVRAM": "1",
+            "H3_TE_PRUNE": "1",
+            "H3_VIDEO_VAE_FP16": "1",
+            "H3_TRANSFORMER_QUANT": "int8",
+            "H3_PRUNED": "1",
+            "H3_KEEP_REF2VA": "1",
+            "H3_KEEP_REF2VA_VAE": "1",
+        },
+        description="96GB機の ref2va 最速(AdaLN-pruned int8wo + transformer_ref/TE/VAE 全常駐)。"
+                    "定常 24.2s(現行 int8 の 41.8〜51.9s)。peak 52.2GB のため 96GB 級専用。"
+                    "HyperFlow と排他。",
+        vram_hint="ref2va peak 52.2GB / 定常 total 24.2s(768×448・5秒・turbo 4step)",
+    ),
+    "48gb-pruned-lowvram": Preset(
+        name="48gb-pruned-lowvram",
+        # ref2va を pruned + 全常駐 + 低VRAM手法4種で 29GB 台に収める構成(48GB/32GB 級向け)。
+        # 実測根拠: docs/h3-pruned-lowvram-20261001.md 行7
+        # (96GB カード上でバラスト確保により空き VRAM を制限して模擬。実 48/32GB カードは未確認):
+        #   現行 int8(非 pruned): 合計 41.8〜51.9s / peak 41.1GB / 成立する空き ≈40GiB+
+        #   この構成            : 合計 27.3〜27.6s / peak 29.06GB / 成立する空き 29GiB(3/3 成功)
+        #   (denoise 開始時の常駐 23.3GB。denoise 14.0〜14.3s、1step 4.67s)
+        # 追加フラグの役割(いずれも配置換えのみで出力はビット一致):
+        #   H3_TE_DIET        -2.9GiB(未使用 lm_head の解放 + embed_tokens の CPU ブリッジ化)
+        #   H3_VAE_SPLIT      -6GB(窓ピーク。encode/decode 窓に必要な側だけ GPU へ)
+        #   H3_REF_PREFIX_PARK -0.84GiB(prefix KV を継続 forward 以外は pinned CPU へ。
+        #                     H3_REF_PREFIX_CACHE_SINGLE=1 が前提 → run.sh 既定だが明示しておく)
+        #   H3_TE_STREAM      -13GiB(TE の LM 層を pinned host に置き窓付きで GPU へ流す。encode +0.2〜0.4s)
+        # 注意:
+        #  - **ホスト RAM に pinned 約 15GiB を使う**(TE の LM 層)。空き RAM が
+        #    H3_TE_STREAM_MIN_FREE_RAM_GB(既定 10)未満だと適用がガードされる。
+        #  - 32GB 級は TTS/LLM 等の同居 GPU 利用が無い前提(空き 29GiB が成立下限)。
+        #  - H3_PRUNED は ref2va 専用。H3_TRANSFORMER_QUANT=int8 必須、
+        #    H3_HYPERFLOW / H3_LOWVRAM=group と排他。HyperFlow tier(48gb-hyperflow)とは併用不可。
+        #  - turbo(lightx2v)トグル併用・steps 4 の実測。トグルは別途 {"turbo": true} で指定する。
+        env={
+            "H3_LOWVRAM": "1",
+            "H3_TE_PRUNE": "1",
+            "H3_VIDEO_VAE_FP16": "1",
+            "H3_TRANSFORMER_QUANT": "int8",
+            "H3_PRUNED": "1",
+            "H3_KEEP_REF2VA": "1",
+            "H3_TE_DIET": "1",
+            "H3_VAE_SPLIT": "1",
+            "H3_REF_PREFIX_CACHE_SINGLE": "1",
+            "H3_REF_PREFIX_PARK": "1",
+            "H3_TE_STREAM": "1",
+        },
+        description="48GB/32GB 級の ref2va 低VRAMフル(pruned + 全常駐 + TE_DIET/VAE_SPLIT/"
+                    "PREFIX_PARK/TE_STREAM)。peak 29.06GB・定常 27.5s(現行 int8 は 41.1GB・"
+                    "41.8〜51.9s)。ホスト RAM に pinned 約15GiB を使う。HyperFlow と排他。"
+                    "実カード未確認(バラスト模擬)。",
+        vram_hint="ref2va peak 29.06GB / 成立する空き 29GiB / ホストRAM pinned ~15GiB",
+    ),
     "48gb-dual": Preset(
         name="48gb-dual",
         # README「48GB級(推奨: 高速化フル)」そのまま(2GPU分担)。
@@ -412,6 +483,21 @@ def _validate_combination(backend_name: str, env: dict[str, str]) -> None:
                 "H3_HYPERFLOW=1 と turbo(H3_TURBO_LORA=1)は併用できません"
                 "(HyperFlow はプロセス単位で lightx2v turbo と排他。"
                 "48gb-hyperflow プリセットは turbo トグルなしで使ってください)")
+        if env.get("H3_PRUNED") == "1":
+            # core/runner.py 側の起動時 RuntimeError を先取りして 400 にする。
+            problems = []
+            if env.get("H3_TRANSFORMER_QUANT") != "int8":
+                problems.append("H3_TRANSFORMER_QUANT=int8 が必要")
+            if env.get("H3_HYPERFLOW") == "1":
+                problems.append("H3_HYPERFLOW=1 と併用不可")
+            if env.get("H3_LOWVRAM") == "group":
+                problems.append("H3_LOWVRAM=group と併用不可")
+            if problems:
+                raise ValidationError(
+                    "H3_PRUNED=1 の前提条件を満たしていません: " + " / ".join(problems))
+        if env.get("H3_KEEP_REF2VA") == "1" and env.get("H3_LOWVRAM") != "1":
+            raise ValidationError(
+                "H3_KEEP_REF2VA=1 は H3_LOWVRAM=1 が必須です(core/runner.py の起動時ガードを先取り)")
         if turbo and env.get("H3_LOWVRAM") == "group":
             raise ValidationError(
                 "turbo(H3_TURBO_LORA=1)と H3_LOWVRAM=group は併用できません"
