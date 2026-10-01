@@ -1171,6 +1171,171 @@ if H3_KEEP_TRANSFORMER:
             "for the VRAM budget derivation). Missing: " + "; ".join(_keep_transformer_missing)
         )
 
+# EXPERIMENTAL, opt-in (2026-10-01). `H3_KEEP_REF2VA=1`: ref2va の transformer_ref と
+# TE をリクエスト間で GPU に常駐させる (`H3_LOWVRAM=1` 専用)。
+#
+# 背景: `H3_LOWVRAM=1` の ref2va は毎リクエスト「TE ロード → 参照エンコード → TE 解放 →
+# transformer_ref ロード → denoise → transformer_ref 解放 → decode」を回すため、
+# denoise 以外に ~43s の固定費がある (うち TE ロード 12.8s + transformer_ref ロード 13.2s)。
+# H3_PRUNED=1 (AdaLN-pruned + int8wo) なら transformer_ref の常駐は 21.6GB、TE
+# (nf4, prune) は 17.5GB なので、同一GPUへ両方載せたまま回せる見込みがある
+# (denoise 活性化 +6.4GB)。このフラグは次の 4 箇所の解放だけを gate する:
+#   (1) generate_ref2va() 入口の `_free_transformer_ref()`
+#   (2) H3_LOWVRAM 分岐の「参照エンコード後の TE 解放」
+#   (3) decode 窓の `_free_transformer_ref()`
+#   (4) `H3_KEEP_REF2VA_VAE=1` のときだけ: VAE pair の CPU 退避 (既定 0 = 従来どおり
+#       参照エンコード後と decode 後に CPU へ退避。VAE を GPU に置いたままにすると
+#       denoise の予算が +5.8GB 増えるため、収支の取れる GPU だけで明示的に使う)
+# 上記以外は一切触らない。既定 (H3_KEEP_REF2VA=0) は 1バイトも挙動が変わらない。
+#
+# 制約と設計判断:
+#   - H3_LOWVRAM=1 以外は起動時エラー。LOWVRAM=0 (int8) は元々 transformer_ref+TE を
+#     常駐させる設計 (H3_TRANSFORMER_BOTH_RESIDENT)、group は CPU 常駐で別設計のため。
+#   - TE を別GPUへ置く構成 (H3_TE_DEVICE) や投影TE (H3_TE_PROJ) でも害はない
+#     (`_free_text_encoder` が元々 no-op / 小さい)。KEEP_TRANSFORMER のような
+#     「TE 別GPU必須」ガードは要らない: pruned の transformer_ref は 21.6GB で、
+#     TE 17.5 + 21.6 = 39.1GB が 48GB 級の予算内に収まるため (KEEP_TRANSFORMER の
+#     ガードは TE 17.45 + int8 transformer 34.3 = 51.75GB > 49.8GB が根拠だった)。
+#   - **非 pruned** (transformer_ref int8 34.3GB) では TE 17.5 + 34.3 + 活性化 6.4 =
+#     58.2GB 必要になり、48GB 級には載らない。起動時に GPU 総容量と突き合わせ、
+#     足りなければ RuntimeError、足りるなら (96GB 級) 警告ログのみとする。
+#   - VRAM が足りないときは素直に CUDA OOM にする。transformer を丸ごと CPU へ
+#     スワップして凌ぐ実装は入れない (diffusers-server CLAUDE.md #33 の事故パターン)。
+#   - 他リクエスト (t2va/fl2va/t2i/ref バッチ) は従来どおり `_free_transformer_ref()` で
+#     transformer_ref を落とし、TE も force 解放するので、常駐は自然に解消される。
+#     次の ref2va が `_load_text_encoder`/`_ensure_transformer_ref` (冪等) で再構築する。
+#   - H3_REF_PREFIX_CACHE_SINGLE=1 のプレフィックス KV (~0.84GiB) は TE と寿命を共にする
+#     (`_free_text_encoder` で捨てる) ので、TE が常駐するこのモードでは同一参照の
+#     リクエスト間で HIT し続ける (VRAM +0.84GiB を常駐させる点に注意)。
+H3_KEEP_REF2VA = os.environ.get("H3_KEEP_REF2VA", "0").strip() == "1"
+H3_KEEP_REF2VA_VAE = os.environ.get("H3_KEEP_REF2VA_VAE", "0").strip() == "1"
+if H3_KEEP_REF2VA:
+    if H3_LOWVRAM_RAW != "1":
+        raise RuntimeError(
+            f"H3_KEEP_REF2VA=1 requires H3_LOWVRAM=1 (got {H3_LOWVRAM_RAW!r}): LOWVRAM=0 "
+            "(int8) already keeps transformer_ref+TE resident by design, and 'group' keeps "
+            "its transformer CPU-resident via a different design -- neither needs this flag."
+        )
+    _keep_ref2va_need_gb = 17.5 + (21.6 if H3_PRUNED else 34.3) + 6.4
+    _keep_ref2va_total_gb = None
+    try:
+        if torch.cuda.is_available():
+            _keep_ref2va_total_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
+    except Exception:  # pragma: no cover - 診断用なので落とさない
+        pass
+    if _keep_ref2va_total_gb is not None and _keep_ref2va_need_gb > _keep_ref2va_total_gb * 0.98:
+        raise RuntimeError(
+            f"H3_KEEP_REF2VA=1 needs ~{_keep_ref2va_need_gb:.1f}GB resident+denoise "
+            f"(TE 17.5 + transformer_ref {'pruned 21.6' if H3_PRUNED else 'int8 34.3'} + "
+            f"activations 6.4) but this GPU has {_keep_ref2va_total_gb:.1f}GB total. "
+            "Use H3_PRUNED=1 or drop H3_KEEP_REF2VA."
+        )
+    if not H3_PRUNED:
+        logger.warning(
+            "H3_KEEP_REF2VA=1 without H3_PRUNED=1: resident set ~%.1fGB (TE 17.5 + int8 "
+            "transformer_ref 34.3 + denoise activations 6.4) -- only fits 80GB-class "
+            "cards, will OOM on 48GB-class.", _keep_ref2va_need_gb,
+        )
+    if not H3_VIDEO_VAE_FP16:
+        logger.warning(
+            "H3_KEEP_REF2VA=1 without H3_VIDEO_VAE_FP16=1: the decode window must fit "
+            "TE + transformer_ref + the fp32 VAE decode peak (16.3GB) -- set H3_VIDEO_VAE_FP16=1."
+        )
+    logger.info(
+        "H3_KEEP_REF2VA=1: ref2va keeps text_encoder + transformer_ref resident across "
+        "requests (pruned=%s, vae_resident=%s, prefix_cache_single=%s)",
+        H3_PRUNED, H3_KEEP_REF2VA_VAE, os.environ.get("H3_REF_PREFIX_CACHE_SINGLE", "0"),
+    )
+
+
+def _keep_ref2va_active() -> bool:
+    """H3_KEEP_REF2VA が今も有効か。`core.settings.apply_reload_settings()` が lowvram を
+    実行時に書き換えうる (そのとき unload_all() で常駐は消える) ので、import 時の定数
+    ではなく呼び出しのたびに LOWVRAM=1 かどうかも併せて見る。"""
+    return H3_KEEP_REF2VA and H3_LOWVRAM
+
+
+# EXPERIMENTAL, opt-in (2026-10-01). `H3_TE_DIET=1`: bnb-4bit text_encoder の VRAM ダイエット。
+# LTX-2.5 の `LTX25_TE_DIET` (backends/ltx2_5/app/tediet.py) と同じ発想を H3 の TE
+# (Qwen3-VL-32B, H3_TE_PRUNE=1 の 51 層) に適用する。H3 が読むのは
+# `text_encoder.model(...)` の `hidden_states[50]` だけなので:
+#   (1) `lm_head` (151936x5120 bf16 = 1.449GiB) は一度も呼ばれない (encoders.py も本ファイルの
+#       `_encode_ref2va_prompt*` も `text_encoder.model` を直接呼ぶ。`tie_word_embeddings=false`
+#       なので embed と共有でもない) -> ロード直後に重みを解放する。
+#   (2) `embed_tokens` (151936x5120 bf16 = 1.449GiB, bnb は Linear しか量子化しないので bf16 の
+#       まま GPU 常駐していた) -> モジュールごと CPU へ置き、forward を「input_ids を CPU へ ->
+#       CPU で gather -> 呼び出し元デバイスへ戻す」ブリッジに差し替える (往復は数千トークン x
+#       10KB = 数十MB 以下)。TE 全体を CPU へ動かすのではなく、埋め込みテーブル 1 枚だけの
+#       配置換え (粒度が小さく、diffusers-server CLAUDE.md #33 の禁止パターンには当たらない)。
+# 合計 常駐 -2.9GiB。**どちらも計算経路の外か値の等価な配置換えのみなので出力はビット一致**
+# (CPU gather は同じ bf16 値を返し、lm_head は計算に参加しない)。既定 (0) は挙動不変。
+# 適用対象は bnb-4bit の TE のみ (H3_TE_QUANT=none / H3_TE_PROJ は対象外)。
+H3_TE_DIET = os.environ.get("H3_TE_DIET", "0").strip() == "1"
+
+# EXPERIMENTAL, opt-in (2026-10-01). `H3_REF_PREFIX_PARK=1`: `H3_REF_PREFIX_CACHE_SINGLE=1` の
+# プレフィックス KV (~0.84GiB) を、エンコードしていない間は CPU (pinned) に置く。KV を使うのは
+# 次のリクエストの `_encode_ref2va_prompt_prefix_cached()` の継続 forward だけで、denoise/decode
+# の間は不要。HIT 時にその直前で GPU へ戻す (~100 テンソル / ~1GiB の PCIe 転送、同一値の
+# 移動なので出力はビット一致)。`H3_KEEP_REF2VA=1` では TE (=キャッシュの寿命) が常駐するため
+# キャッシュも常駐し続け、decode 窓の VRAM を 0.84GiB 食う -- それを返すためのフラグ。
+# 既定 (0) は挙動不変。
+H3_REF_PREFIX_PARK = os.environ.get("H3_REF_PREFIX_PARK", "0").strip() == "1"
+
+# 診断用 (既定 0): ref2va の decode 窓の割り当て量とピークをログに出す。ピーク統計を窓の前で
+# リセットするため (結果の peak_vram_gb は窓前のピークと合成して保つ) ふつうは使わない。
+H3_DEBUG_DECODE_MEM = os.environ.get("H3_DEBUG_DECODE_MEM", "0").strip() == "1"
+
+# EXPERIMENTAL, opt-in (2026-10-01). `H3_VAE_SPLIT=1` (`H3_KEEP_REF2VA=1` 専用): ref2va で VAE を
+# GPU へ送る 2 つの窓のうち、参照エンコード窓には encode 側 (video encoder 0.34GiB + audio
+# encoder 系 ~0.3GiB)、デコード窓には decode 側 (video decoder 4.5GiB + audio decoder ~0.25GiB)
+# だけを送る。従来は両方の窓で pair 全体 (6.3GiB) を送っており、KEEP_REF2VA のように TE +
+# transformer_ref が常駐している間は **この 2 窓が VRAM のピークを決めていた** (実測: 窓前の
+# 割り当て 41.1GB -> 窓内 46.9GB、denoise 自体は窓より低い)。配置換えのみなので出力はビット一致。
+# 既定 (0) は挙動不変。
+H3_VAE_SPLIT = os.environ.get("H3_VAE_SPLIT", "0").strip() == "1"
+
+
+def _apply_te_diet(text_encoder) -> float:
+    """`H3_TE_DIET`: lm_head の重みを解放し、embed_tokens を CPU ブリッジ化する。
+
+    Returns: GPU から解放された GiB。冪等 (2回目以降は 0.0)。
+    """
+    inner = getattr(text_encoder, "model", None)
+    lang = getattr(inner, "language_model", None) if inner is not None else None
+    embed = getattr(lang, "embed_tokens", None) if lang is not None else None
+    if embed is None or getattr(embed, "_h3_te_diet", False):
+        return 0.0
+    freed = 0
+    # (1) lm_head: 使われないので、1 要素のダミー重みに差し替えて実体を解放する
+    #     (属性ごと消すと `PreTrainedModel` の tie/重み管理が参照して壊れうるため、形だけ残す)。
+    lm_head = getattr(text_encoder, "lm_head", None)
+    w = getattr(lm_head, "weight", None)
+    if w is not None and not getattr(w, "is_meta", False):
+        freed += w.numel() * w.element_size()
+        lm_head.weight = torch.nn.Parameter(
+            torch.empty(1, 1, dtype=w.dtype, device=w.device), requires_grad=False
+        )
+    # (2) embed_tokens: CPU ブリッジ。`embed.weight.device` が cpu でも `text_encoder.device`
+    #     (最初のパラメータ = vision tower) は変わらない。
+    orig_forward = embed.forward
+    freed += embed.weight.numel() * embed.weight.element_size()
+
+    def _bridged_embed_forward(input_ids: torch.Tensor) -> torch.Tensor:
+        return orig_forward(input_ids.to("cpu")).to(input_ids.device)
+
+    embed.to("cpu")
+    embed.forward = _bridged_embed_forward
+    embed._h3_te_diet = True
+    if torch.cuda.is_available():
+        gc.collect()
+        torch.cuda.empty_cache()
+    freed_gib = freed / 1024**3
+    logger.info(
+        "[H3_TE_DIET] lm_head released + embed_tokens -> CPU bridge: %.2fGiB freed from GPU", freed_gib
+    )
+    return freed_gib
+
+
 # "group" mode's own RAM guard (see H3_LOWVRAM_GROUP's design comment further down):
 # the int8 transformer (~34GB) is loaded once and stays resident in host RAM for the
 # life of the process (unlike H3_LOWVRAM=1's per-request from-scratch reload) --
@@ -2068,6 +2233,41 @@ class _SingleRefPrefixEntry:
     te_layer: int
     te_proj_id: int | None
     nbytes: int
+    # `H3_REF_PREFIX_PARK=1` のとき、KV (cache.layers[*].keys/values) が今 CPU にあるか。
+    parked: bool = False
+
+
+def _park_prefix_entry(entry: "_SingleRefPrefixEntry") -> None:
+    """KV を CPU (pinned) へ退避する (`H3_REF_PREFIX_PARK`)。値は不変、置き場所だけ変える。
+    小さいテンソル (~100 個 x ~10MiB) の移動で、モジュール丸ごとのスワップではない。"""
+    if entry.parked:
+        return
+    t0 = time.time()
+    for layer in entry.cache.layers:
+        for name in ("keys", "values"):
+            t = getattr(layer, name, None)
+            if t is not None and t.is_cuda:
+                setattr(layer, name, t.detach().to("cpu").pin_memory())
+    entry.parked = True
+    gc.collect()
+    torch.cuda.empty_cache()
+    logger.info("single ref-prefix cache parked on CPU (%.2fGiB) in %.2fs. gpu=%s",
+                entry.nbytes / 1024**3, time.time() - t0, gpu_mem_gb())
+
+
+def _unpark_prefix_entry(entry: "_SingleRefPrefixEntry") -> None:
+    """`_park_prefix_entry` の逆。継続 forward の直前に呼ぶ。"""
+    if not entry.parked:
+        return
+    t0 = time.time()
+    for layer in entry.cache.layers:
+        for name in ("keys", "values"):
+            t = getattr(layer, name, None)
+            if t is not None and not t.is_cuda:
+                setattr(layer, name, t.to(entry.device, non_blocking=True))
+    torch.cuda.synchronize()
+    entry.parked = False
+    logger.info("single ref-prefix cache unparked to %s in %.2fs", entry.device, time.time() - t0)
 
 
 # プロセス内に高々1エントリ。`generate_ref2va()` は app.py の generation_lock で直列化
@@ -2285,6 +2485,8 @@ def _encode_ref2va_prompt_prefix_cached(
         )
 
     # --- 継続 (プロンプト末尾のみ) ---
+    # H3_REF_PREFIX_PARK: CPU に退避していた KV をここで GPU へ戻す (MISS 直後は元々 GPU)。
+    _unpark_prefix_entry(entry)
     # rope_deltas は毎回書き戻す (MISS 直後でも安いので無条件に -- 上の docstring 1.)。
     if entry.rope_deltas is not None:
         model.rope_deltas = entry.rope_deltas.clone()
@@ -2320,6 +2522,9 @@ def _encode_ref2va_prompt_prefix_cached(
     finally:
         entry.cache.crop(entry.prefix_len)
 
+    if H3_REF_PREFIX_PARK:
+        # 次のリクエストまで KV は要らない (denoise/decode の VRAM を返す)。
+        _park_prefix_entry(entry)
     prompt_embeds = torch.cat([entry.prefix_hidden, suffix_hidden], dim=1)
     text_token_tags = torch.tensor(
         entry.prefix_tags + [components.text_tag] * len(suffix_ids), dtype=torch.long
@@ -3619,6 +3824,9 @@ class MiniMaxH3Runner:
         # bnb-4bit mode only: whether the (permanently-loaded-in-RAM-terms, but
         # phase-cycled-on-GPU) VAEs are currently placed on GPU or parked on CPU.
         self._vae_on_gpu = False
+        # H3_VAE_SPLIT: VAE のうち今 GPU にいる部分 ("encode"/"decode" の部分集合)。
+        # `_vae_on_gpu` は「どれかが GPU にいる」の意味 (全部とは限らない)。
+        self._vae_gpu_parts: set[str] = set()
         self._load_lock = threading.Lock()
 
         # --- ref2va (omni-reference) additions ---
@@ -3790,6 +3998,7 @@ class MiniMaxH3Runner:
             self._pipe.vae.to(CPU)
             self._pipe.audio_vae.to(CPU)
             self._vae_on_gpu = False
+            self._vae_gpu_parts = set()
         else:
             self._pipe.vae.to(DEVICE)
             self._pipe.audio_vae.to(DEVICE)
@@ -3842,17 +4051,71 @@ class MiniMaxH3Runner:
         if getattr(self._pipe, "image_processor", None) is None:
             self._pipe.image_processor = VaeImageProcessor(vae_scale_factor=16)
 
-    def _vae_to_gpu(self):
+    # H3_VAE_SPLIT 用: VAE の子モジュールを encode 側 / decode 側に分ける。video VAE は
+    # decoder が 4.5GiB (fp16)、encoder は 0.34GiB しかない (safetensors ヘッダの実測)。
+    # audio VAE は encoder+pre_block+mean/logs_proj (encode) と dec_in_proj+decoder (decode)。
+    # 各 VAE の encode()/decode() が触る子モジュールは autoencoder_kl_minimax_h3(.._audio).py
+    # のソースで確認済み。
+    _VAE_PARTS = {
+        "vae": {
+            "encode": ("encoder", "quant_conv"),
+            "decode": ("post_quant_conv", "decoder"),
+        },
+        "audio_vae": {
+            "encode": ("encoder", "pre_block", "mean_proj", "logs_proj"),
+            "decode": ("dec_in_proj", "decoder"),
+        },
+    }
+
+    def _vae_split_active(self) -> bool:
+        """H3_VAE_SPLIT が効く条件。TE が常駐する KEEP_REF2VA 限定: VAE を部分配置すると
+        `vae.device` (=最初のパラメータの置き場所) が CPU になる窓ができるが、KEEP 中は
+        `_execution_device` が先頭コンポーネントの text_encoder (GPU) で決まるので影響しない。"""
+        return H3_VAE_SPLIT and _keep_ref2va_active()
+
+    def _move_vae_part(self, part: str, device) -> bool:
+        """`part` ("encode"/"decode") の子モジュールだけを `device` へ移す。未知の子モジュール
+        が見つかったら (将来の diffusers 更新対策) False を返し、呼び出し側が全体移動へ退避する。"""
+        for attr, table in (("vae", self._VAE_PARTS["vae"]), ("audio_vae", self._VAE_PARTS["audio_vae"])):
+            module = getattr(self._pipe, attr)
+            known = set(table["encode"]) | set(table["decode"])
+            if any(name not in known for name, _ in module.named_children()) or \
+                    any(True for _ in module.named_parameters(recurse=False)) or \
+                    any(True for _ in module.named_buffers(recurse=False)):
+                return False
+        for attr in ("vae", "audio_vae"):
+            module = getattr(self._pipe, attr)
+            for name in self._VAE_PARTS[attr][part]:
+                getattr(module, name).to(device)
+        return True
+
+    def _vae_to_gpu(self, part: str = "all"):
         """bnb-4bit mode only: move the (small, fp32, ~11GB) VAEs onto GPU for their active
         phase. A single short one-way trip, not a standing swap -- see module docstring.
+
+        `part` ("encode"/"decode") は `H3_VAE_SPLIT=1` かつ KEEP_REF2VA のときだけ効き、その
+        窓で使う子モジュールだけを GPU へ送る (参照エンコード窓ではデコーダ 4.5GiB を、
+        デコード窓ではエンコーダを置き去りにする)。それ以外は従来どおり全体を移す。
+        配置換えだけなので出力はビット一致。
         """
-        if TE_QUANT != "bnb-4bit" or self._vae_on_gpu:
+        if TE_QUANT != "bnb-4bit":
+            return
+        split = part in ("encode", "decode") and self._vae_split_active()
+        want = {part} if split else {"encode", "decode"}
+        need = want - self._vae_gpu_parts
+        if not need:
             return
         t0 = time.time()
-        self._pipe.vae.to(DEVICE)
-        self._pipe.audio_vae.to(DEVICE)
+        if split and all(self._move_vae_part(p, DEVICE) for p in sorted(need)):
+            self._vae_gpu_parts |= need
+        else:
+            # 従来経路 (または未知の子モジュールがあるときの退避): 全体を移す。
+            self._pipe.vae.to(DEVICE)
+            self._pipe.audio_vae.to(DEVICE)
+            self._vae_gpu_parts = {"encode", "decode"}
         self._vae_on_gpu = True
-        logger.info("vae/audio_vae -> GPU in %.2fs. gpu=%s", time.time() - t0, gpu_mem_gb())
+        logger.info("vae/audio_vae -> GPU (%s) in %.2fs. gpu=%s",
+                    "+".join(sorted(self._vae_gpu_parts)), time.time() - t0, gpu_mem_gb())
 
     def _vae_to_cpu(self):
         """bnb-4bit mode only: move the VAEs back off GPU once their phase is done, to make
@@ -3864,6 +4127,7 @@ class MiniMaxH3Runner:
         self._pipe.vae.to(CPU)
         self._pipe.audio_vae.to(CPU)
         self._vae_on_gpu = False
+        self._vae_gpu_parts = set()
         gc.collect()
         torch.cuda.empty_cache()
         logger.info("vae/audio_vae -> CPU in %.2fs. gpu=%s", time.time() - t0, gpu_mem_gb())
@@ -5081,6 +5345,9 @@ class MiniMaxH3Runner:
         )
         _install_patch_embed_linear(self._pipe.text_encoder)  # no-op unless H3_PATCH_EMBED_LINEAR=0
         _install_qwen3vl_submodule_timing(self._pipe.text_encoder)  # no-op unless H3_PHASE_TIMING=1
+        if H3_TE_DIET and not self._te_external:
+            _apply_te_diet(self._pipe.text_encoder)  # no-op unless H3_TE_DIET=1 (bnb-4bit TE only)
+            logger.info("text_encoder after H3_TE_DIET. gpu=%s", gpu_mem_gb())
         self._detach_te_if_external()
         # フェーズ境界での中断チェック(loading_text_encoder)。
         interrupt_controller.check()
@@ -5576,6 +5843,9 @@ class MiniMaxH3Runner:
                 self._save_te_prequant(cache_dir)
             _install_patch_embed_linear(self._pipe.text_encoder)  # no-op unless H3_PATCH_EMBED_LINEAR=0
             _install_qwen3vl_submodule_timing(self._pipe.text_encoder)  # no-op unless H3_PHASE_TIMING=1
+            if H3_TE_DIET and not self._te_external:
+                # prequant 保存(上)は完全な重みで済ませた後に適用する (保存物を痩せさせない)。
+                _apply_te_diet(self._pipe.text_encoder)
             self._detach_te_if_external()
             # フェーズ境界での中断チェック(loading_text_encoder)。
             interrupt_controller.check()
@@ -5709,6 +5979,7 @@ class MiniMaxH3Runner:
             self._pipe.audio_vae = None
         self._vae_loaded = False
         self._vae_on_gpu = False
+        self._vae_gpu_parts = set()
         gc.collect()
         torch.cuda.empty_cache()
         logger.info("vae/audio_vae freed. gpu=%s ram=%s", gpu_mem_gb(), ram_gb())
@@ -5770,6 +6041,21 @@ class MiniMaxH3Runner:
                     "H3_PRUNED=1: transformer_ref は pruned、H3_PRUNED_QUANT=%s -> %s",
                     H3_PRUNED_QUANT, H3_PRUNED_QUANT_SPEC.describe(H3_PRUNED_CONVROT_GROUP),
                 )
+            if _keep_ref2va_active():
+                # import 時のログは uvicorn のロギング設定前で消えるので、起動時の構成表明はここで出す。
+                logger.info(
+                    "H3_KEEP_REF2VA=1: ref2va は text_encoder + transformer_ref(%s) をリクエスト間で "
+                    "GPU 常駐させる (初回 ref2va でロード、以降スキップ)。vae_resident=%s",
+                    "pruned" if H3_PRUNED else "int8", H3_KEEP_REF2VA_VAE,
+                )
+                logger.info(
+                    "H3_KEEP_REF2VA low-VRAM options: te_diet=%s ref_prefix_park=%s vae_split=%s",
+                    H3_TE_DIET, H3_REF_PREFIX_PARK and H3_REF_PREFIX_CACHE_SINGLE, H3_VAE_SPLIT,
+                )
+                if H3_REF_PREFIX_PARK and not H3_REF_PREFIX_CACHE_SINGLE:
+                    logger.warning("H3_REF_PREFIX_PARK=1 has no effect without H3_REF_PREFIX_CACHE_SINGLE=1")
+            elif H3_VAE_SPLIT:
+                logger.warning("H3_VAE_SPLIT=1 is ignored without H3_KEEP_REF2VA=1 (+H3_LOWVRAM=1)")
             self._ensure_vaes()
             if H3_LOWVRAM_GROUP:
                 self._ensure_transformer()
@@ -5829,6 +6115,11 @@ class MiniMaxH3Runner:
             # setting was actually in effect. 2048 = diffusers' own default / unset.
             "ref_image_short_edge": H3_REF_IMAGE_SHORT_EDGE,
             "lowvram": H3_LOWVRAM_RAW,
+            "keep_ref2va": _keep_ref2va_active(),
+            "keep_ref2va_vae": _keep_ref2va_active() and H3_KEEP_REF2VA_VAE,
+            "te_diet": H3_TE_DIET,
+            "ref_prefix_park": H3_REF_PREFIX_PARK and H3_REF_PREFIX_CACHE_SINGLE,
+            "vae_split": H3_VAE_SPLIT and _keep_ref2va_active(),
             "lowvram_group": H3_LOWVRAM_GROUP,
             # import 時の logger.info は uvicorn がロギングを設定する前に走って消えるので、
             # 上限が効いているかは status 経由で確認できるようにしておく (None = 無制限)。
@@ -7814,7 +8105,13 @@ class MiniMaxH3Runner:
                 # pair 11.0 all at once) and OOM'd on the first VAE conv. It is reloaded
                 # fresh, later, after the reference encoder step -- same as the first-
                 # request path. No-op (cheap) when it was not resident.
-                self._free_transformer_ref()
+                if _keep_ref2va_active() and self._transformer_ref_loaded:
+                    # H3_KEEP_REF2VA=1: 常駐のため解放をスキップ (上のコメントの OOM は
+                    # 「TE + transformer_ref + VAE pair が同時に載る」収支が 96GB 超になる
+                    # bf16/int8-both-resident 構成の話で、pruned の 21.6GB 常駐では成立しない)。
+                    logger.info("ref2va: transformer_ref is resident (H3_KEEP_REF2VA=1) -- skip free/reload")
+                else:
+                    self._free_transformer_ref()
             self._ensure_vaes(progress)
             self._load_text_encoder(progress)
             # H3_LOWVRAM bug found and fixed by this task's own verification: syncing
@@ -8007,7 +8304,7 @@ class MiniMaxH3Runner:
                 )
             _, state = timesteps_step(pipe, state)
         elif H3_LOWVRAM:
-            self._vae_to_gpu()
+            self._vae_to_gpu("encode")  # H3_VAE_SPLIT 時は encode 側だけ (それ以外は従来どおり全体)
             # Same `_execution_device` resolution trap as generate()'s own H3_LOWVRAM
             # branch (see its long comment): `vae` sits between `text_encoder` and
             # `transformer_ref` in the pipe's own component order, and stays a
@@ -8030,7 +8327,10 @@ class MiniMaxH3Runner:
                 vocal_lock_latents = _build_vocal_lock_latents(pipe, references, actual_num_frames)
                 if vocal_lock_latents is not None:
                     state.set("audio_latents", vocal_lock_latents)
-            self._vae_to_cpu()
+            if not (_keep_ref2va_active() and H3_KEEP_REF2VA_VAE):
+                self._vae_to_cpu()
+            else:
+                logger.info("ref2va: vae/audio_vae stay on GPU (H3_KEEP_REF2VA_VAE=1) -- skip CPU park")
 
             layout_step = MiniMaxH3Ref2VAPrepareLayoutStep()
             _, state = layout_step(pipe, state)
@@ -8063,7 +8363,18 @@ class MiniMaxH3Runner:
                 self._scene_state_to_compute(state)
 
             with self._load_lock:
-                self._free_text_encoder(force=True)
+                if _keep_ref2va_active():
+                    # H3_KEEP_REF2VA=1: TE を解放せず、transformer_ref も常駐済みなら
+                    # ロードしない (`_ensure_transformer_ref` は冪等、初回だけ実ロード)。
+                    # layout 系ステップは既に走り終わっているので、TE が残っていても
+                    # `_execution_device` の罠 (上のコメント) には影響しない。
+                    logger.info(
+                        "ref2va: text_encoder resident (H3_KEEP_REF2VA=1) -- skip free/reload; "
+                        "transformer_ref %s",
+                        "resident -- skip load" if self._transformer_ref_loaded else "loading (first request)",
+                    )
+                else:
+                    self._free_text_encoder(force=True)
                 self._ensure_transformer_ref(progress)
         elif TE_QUANT == "bnb-4bit":
             self._vae_to_gpu()  # already has its own unconditional timing log
@@ -8334,7 +8645,8 @@ class MiniMaxH3Runner:
             # 正常系と decode 例外時の両方から呼ぶ(例外時に復元しないと後続リクエストが
             # 不整合な常駐セットを引き継いで連鎖 OOM する -- generate() 側の同名 closure の
             # コメント参照)。
-            self._vae_to_cpu()
+            if not (_keep_ref2va_active() and H3_KEEP_REF2VA_VAE):
+                self._vae_to_cpu()
             if TE_QUANT == "bnb-4bit" and not H3_LOWVRAM_ANY:
                 with self._load_lock:
                     self._ensure_transformer_ref(progress)
@@ -8374,12 +8686,25 @@ class MiniMaxH3Runner:
             # "nothing big resident between requests" reasoning as generate()'s own
             # lowvram decode tail.
 
-        if TE_QUANT == "bnb-4bit" and not H3_TRANSFORMER_BOTH_RESIDENT and not H3_LOWVRAM_GROUP:
+        if _keep_ref2va_active():
+            # H3_KEEP_REF2VA=1: decode 窓でも transformer_ref/TE を落とさない (LOWVRAM=1 では
+            # 元々 decode 後に再ロードしないので、ここで落とすと次リクエストが丸ごと再ロードになる)。
+            logger.info("ref2va: transformer_ref/text_encoder stay resident through decode (H3_KEEP_REF2VA=1)")
+        elif TE_QUANT == "bnb-4bit" and not H3_TRANSFORMER_BOTH_RESIDENT and not H3_LOWVRAM_GROUP:
             self._free_transformer_ref()
         elif H3_LOWVRAM_GROUP:
             with self._load_lock:
                 self._free_text_encoder(force=True)
-        self._vae_to_gpu()
+        _dbg_pre_peak = 0.0
+        if H3_DEBUG_DECODE_MEM:
+            # 窓前までのピークを退避してからリセット (結果の peak_vram_gb は合成して保つ)。
+            torch.cuda.synchronize()
+            _dbg_pre_peak = torch.cuda.max_memory_allocated() / 1e9
+            logger.info("[DECODE_MEM] before vae_to_gpu: pre-window peak=%.2fGB gpu=%s", _dbg_pre_peak, gpu_mem_gb())
+            torch.cuda.reset_peak_memory_stats()
+        self._vae_to_gpu("decode")  # H3_VAE_SPLIT 時は decode 側だけ (それ以外は従来どおり全体)
+        if H3_DEBUG_DECODE_MEM:
+            logger.info("[DECODE_MEM] after vae_to_gpu: gpu=%s", gpu_mem_gb())
         t_decode = time.time()
         try:
             video_decode_step = _cpu_norm_video_decode_step()
@@ -8401,6 +8726,9 @@ class MiniMaxH3Runner:
             peak = float(np.max(np.abs(audio_np)))
 
             peak_vram = torch.cuda.max_memory_allocated() / 1e9
+            if H3_DEBUG_DECODE_MEM:
+                logger.info("[DECODE_MEM] decode window peak=%.2fGB gpu=%s", peak_vram, gpu_mem_gb())
+                peak_vram = max(peak_vram, _dbg_pre_peak)
 
             del video_tensor, videos, audio
             gc.collect()
