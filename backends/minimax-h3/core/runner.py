@@ -248,6 +248,18 @@ if TE_QUANT not in ("none", "bnb-4bit"):
 # 20260826.md`'s open question ("~100s of fixed cost, TE-size and vision-tower FLOP
 # estimates both failed to explain it -- where does the time actually go?").
 H3_PHASE_TIMING = os.environ.get("H3_PHASE_TIMING", "0").strip() == "1"
+H3_TIMELINE = os.environ.get("H3_TIMELINE", "0").strip() == "1"  # probe 2026-10-05: 一時的な壁時計タイムライン
+
+
+# H3_DENOISE_CUDAGRAPH=1 (probe 2026-10-05, 既定 0): transformer_ref.forward を CUDA Graph 化する (core/h3_cudagraph.py)。
+import core.h3_cudagraph as _h3_graph  # noqa: E402
+
+H3_DENOISE_CUDAGRAPH = os.environ.get("H3_DENOISE_CUDAGRAPH", "0").strip() == "1"
+
+
+def _tl(msg):
+    if H3_TIMELINE:
+        logger.info("[TL] %s t=%.3f", msg, time.time() % 1000)
 
 
 class _PhaseTimer:
@@ -1090,7 +1102,7 @@ else:
 _h3_pc = os.environ.get("H3_PRUNED_COMPILE", "0").strip()
 # 1 = ConvRot Linear のみ compile。2 = さらに turbo LoRA ラッパー(base + LoRA 加算)も compile
 # (実験: LoRA の mul/add を融合して elementwise の素通しを減らす)。
-H3_PRUNED_COMPILE_LEVEL = int(_h3_pc) if _h3_pc in ("1", "2") else 0
+H3_PRUNED_COMPILE_LEVEL = int(_h3_pc) if _h3_pc in ("1", "2", "3") else 0  # 3 = probe: 2 + transformer ブロック単位 compile (attention は graph break)
 H3_PRUNED_COMPILE = H3_PRUNED_COMPILE_LEVEL >= 1
 if H3_PRUNED_COMPILE and not (H3_PRUNED and H3_PRUNED_QUANT_SPEC is not None and H3_PRUNED_QUANT_SPEC.convrot and H3_PRUNED_QUANT_SPEC.quantized):
     logging.getLogger("minimax_h3").warning(
@@ -2016,6 +2028,17 @@ H3_DECODE_STREAM_SIDE = _H3_DECODE_STREAM_RAW == "2"
 H3_DECODE_DEVICE = os.environ.get("H3_DECODE_DEVICE", "").strip()
 # 別 GPU の decode 専用 VAE コピーを native attention に固定するか (既定 0 = 本体と同じ backend)。
 H3_DECODE_NATIVE_ATTN = os.environ.get("H3_DECODE_NATIVE_ATTN", "0").strip() == "1"
+# H3_DECODE_VAE=light (2026-10-05, probe, 既定なし=標準 VAE): decode 専用コピーの video VAE を
+# LynnReal の蒸留版 light VAE (`stdstu123/LynnReal-Onmi-light-vae`: encoder は H3 公式と同一、
+# decoder だけ 36→26 層。latent の channel/mean/std/圧縮率は公式と同一) に差し替える。
+# **encode 側・標準の `pipe.vae` は触らない**。`H3_DECODE_STREAM`/`H3_DECODE_DEVICE` の decode
+# 分離経路 (`_decode_ref2va_deferred`) だけが対象で、インライン decode には効かない。
+# 値は "light" (既定 repo) か、HF repo id / ローカルディレクトリ。再現 (同一 latent でも RGB は
+# 標準 VAE と一致しない: LICENSE は minimax-h3-community = H3 本体と同じ地域制限あり)。
+H3_DECODE_VAE = os.environ.get("H3_DECODE_VAE", "").strip()
+H3_DECODE_VAE_REPO = (
+    "stdstu123/LynnReal-Onmi-light-vae" if H3_DECODE_VAE.lower() == "light" else H3_DECODE_VAE
+)
 
 
 # H3_TE_PROJ 有効時、H3 トークナイザ固有の特殊トークン (`<d>`=151669 / `</d>`=151670)
@@ -5142,6 +5165,10 @@ class MiniMaxH3Runner:
                 from core import pruned as pruned_mod
 
                 pruned_mod.compile_turbo_wrappers(transformer, _TurboLoRALinear)
+            if is_ref and H3_PRUNED_COMPILE_LEVEL >= 3:
+                from core import pruned as pruned_mod
+
+                pruned_mod.compile_transformer_blocks(transformer)
             logger.info("turbo LoRA lazily applied to %s (%d layers wrapped)", label, n)
         elif getattr(self, wrapped_attr):
             n = set_turbo_lora_enabled(transformer, turbo)
@@ -6356,19 +6383,30 @@ class MiniMaxH3Runner:
         if not self.decode_deferred_active():
             return
         separate = self._decode_target_device() != DEVICE
-        if not (separate or H3_DECODE_STREAM_SIDE):
+        if not (separate or H3_DECODE_STREAM_SIDE or H3_DECODE_VAE):
             return
         import copy
 
         dev = self._decode_target_device()
         t0 = time.time()
-        vae = copy.deepcopy(self._pipe.vae)
-        # `_fp16_autocast_encode` (encode のパッチ) は元の VAE にひも付くクロージャ。decode 専用
-        # コピーでは使わないので外して、取り違えようがないようにする。
-        vae.__dict__.pop("encode", None)
-        if H3_DECODE_NATIVE_ATTN or not separate:
-            # 専用ストリーム版: sage は side stream で壊れる (H3_DECODE_STREAM のコメント) ので native 固定。
+        if H3_DECODE_VAE:
+            # light VAE (probe)。標準 VAE と同じ手順 (fp32 ロード→fp16 キャスト) で作る。
+            from diffusers import AutoencoderKLMiniMaxH3
+
+            vae = AutoencoderKLMiniMaxH3.from_pretrained(H3_DECODE_VAE_REPO, torch_dtype=torch.float32)
+            vae = vae.to(torch.float16)
+            vae.eval()
             vae.set_attention_backend("native")
+            logger.info("decode-only video VAE = %s (H3_DECODE_VAE, decoder_num_layers=%s) loaded in %.2fs",
+                        H3_DECODE_VAE_REPO, vae.config.decoder_num_layers, time.time() - t0)
+        else:
+            vae = copy.deepcopy(self._pipe.vae)
+            # `_fp16_autocast_encode` (encode のパッチ) は元の VAE にひも付くクロージャ。decode 専用
+            # コピーでは使わないので外して、取り違えようがないようにする。
+            vae.__dict__.pop("encode", None)
+            if H3_DECODE_NATIVE_ATTN or not separate:
+                # 専用ストリーム版: sage は side stream で壊れる (H3_DECODE_STREAM のコメント) ので native 固定。
+                vae.set_attention_backend("native")
         self._decode_vae = vae.to(dev)
         # audio VAE は deepcopy できない (legacy weight_norm が計算済みの非リーフ `weight` を属性に持つ:
         # "Only Tensors created explicitly by the user support the deepcopy protocol")。config から
@@ -6432,12 +6470,20 @@ class MiniMaxH3Runner:
         dev = self._decode_target_device()
         separate = dev != DEVICE
         lat, alat = holder.pop(0), holder.pop(0)
+        _tl("pre_sync")
         torch.cuda.synchronize(DEVICE)  # denoise + unpatchify の GPU 作業が完了していること
+        _tl("post_sync")
+        _dump_dir = os.environ.get("H3_DEBUG_DUMP_LATENT", "").strip()  # probe 用 (既定 OFF): 標準/light の同一 latent 比較
+        if _dump_dir:
+            os.makedirs(_dump_dir, exist_ok=True)
+            torch.save({"video": lat.detach().cpu(), "audio": alat.detach().cpu()},
+                       os.path.join(_dump_dir, f"lat_{int(time.time() * 1000)}_{lat.shape[2]}f.pt"))
         peak_at_release = torch.cuda.max_memory_allocated() / 1e9
         released = False
         if H3_DECODE_STREAM and on_denoise_done is not None:
             on_denoise_done()
             released = True
+            _tl("lock_released")
         t_wait0 = time.time()
         if progress:
             progress.update(phase="decoding", message="動画/音声をデコード中...")
@@ -6445,10 +6491,11 @@ class MiniMaxH3Runner:
             "device": str(dev), "separate_gpu": separate, "stream": bool(H3_DECODE_STREAM),
             "side_stream": bool(H3_DECODE_STREAM_SIDE),
             "lock_released_before_decode": released,
+            "decode_vae": H3_DECODE_VAE_REPO or "standard",
         }
         with self._decode_lock:
             info["decode_lock_wait_s"] = round(time.time() - t_wait0, 3)
-            if separate or H3_DECODE_STREAM_SIDE:
+            if separate or H3_DECODE_STREAM_SIDE or H3_DECODE_VAE:
                 self._ensure_decode_vaes()
                 vae, audio_vae = self._decode_vae, self._decode_audio_vae
             else:
@@ -6571,6 +6618,7 @@ class MiniMaxH3Runner:
             "ref_latent_cache_stats": dict(_ref_latent_cache_stats) if H3_REF_LATENT_CACHE else None,
             "decode_stream": _H3_DECODE_STREAM_RAW if H3_DECODE_STREAM else None,
             "decode_device": H3_DECODE_DEVICE or None,
+            "decode_vae": H3_DECODE_VAE_REPO or None,
             "decode_deferred_active": self.decode_deferred_active(),
             "vae_split": H3_VAE_SPLIT and _keep_ref2va_active(),
             "lowvram_group": H3_LOWVRAM_GROUP,
@@ -8455,6 +8503,7 @@ class MiniMaxH3Runner:
         from diffusers.modular_pipelines.minimax_h3.encoders import MiniMaxH3Ref2VAReferenceEncoderStep
         from diffusers.modular_pipelines.modular_pipeline import PipelineState
 
+        _tl("gen_entry")
         t_start = time.time()
         # H3_PHASE_TIMING (2026-08-27 encode-phase profiling task, see `_PhaseTimer`'s
         # own docstring): one timer per request, marked at every named checkpoint
@@ -8997,6 +9046,7 @@ class MiniMaxH3Runner:
         if progress:
             progress.update(phase="denoising", step=0, total_steps=num_inference_steps, message="デノイズ中...")
         t_denoise = time.time()
+        _tl("denoise_start")
         step_times = []
         cache_skips = [0]
         out_height, out_width = state.get("height"), state.get("width")
@@ -9006,6 +9056,9 @@ class MiniMaxH3Runner:
         # resident by every branch above this point.
         self._ensure_hyperflow_ref(progress=progress)
         self.apply_instant_settings(self._pipe_ref.transformer_ref, instant, is_ref=True, progress=progress)
+        if H3_DENOISE_CUDAGRAPH and not isinstance(self._pipe_ref.transformer_ref.__dict__.get("forward"), _h3_graph.ForwardGraphRunner):
+            _h3_graph.ForwardGraphRunner(self._pipe_ref.transformer_ref).install()
+            logger.info("H3_DENOISE_CUDAGRAPH: ForwardGraphRunner installed on transformer_ref")
 
         def _fbc_reset_and_context():
             self._pipe_ref.transformer_ref._reset_stateful_cache()
@@ -9036,6 +9089,7 @@ class MiniMaxH3Runner:
         else:
             _, state = denoise_step(pipe, state)
         denoise_time = time.time() - t_denoise
+        _tl("denoise_end(cpu)")
 
         # PR #14355 note: unpatchify is a separate step now (`MiniMaxH3AfterDenoiseStep`,
         # decoders.py) -- see `generate()`'s matching comment for the full contract. Has to
@@ -9061,6 +9115,7 @@ class MiniMaxH3Runner:
             _restore_vocal_lock_condition_rows(state, vocal_lock_original_num_condition_audio_rows)
         after_denoise_step = MiniMaxH3AfterDenoiseStep()
         _, state = after_denoise_step(pipe, state)
+        _tl("after_denoise_step")
 
         # --- decode (shared MiniMaxH3VideoDecodeStep/MiniMaxH3AudioDecodeStep -- no
         # ref2va-specific decode step exists; `MiniMaxH3AfterDenoiseStep` just above
