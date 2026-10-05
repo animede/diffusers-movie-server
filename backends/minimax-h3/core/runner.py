@@ -1083,6 +1083,22 @@ if H3_PRUNED:
     H3_PRUNED_QUANT = H3_PRUNED_QUANT_SPEC.name
 else:
     H3_PRUNED_QUANT_SPEC = None
+# H3_PRUNED_COMPILE=1: ConvRot 系の方式(int8dyn-convrot 等)のとき、ロード後に 300 の ConvRot
+# Linear(回転 + 量子化 GEMM)へ torch.compile(dynamic=True)を適用する(core/pruned.py の
+# compile_convrot_layers)。torchao int8 動的量子化 eager 経路の未融合 per-token 量子化を
+# 融合して GEMM を ~3 倍速くする。既定 0(完全に従来どおり)。ConvRot 無しの方式では無効。
+_h3_pc = os.environ.get("H3_PRUNED_COMPILE", "0").strip()
+# 1 = ConvRot Linear のみ compile。2 = さらに turbo LoRA ラッパー(base + LoRA 加算)も compile
+# (実験: LoRA の mul/add を融合して elementwise の素通しを減らす)。
+H3_PRUNED_COMPILE_LEVEL = int(_h3_pc) if _h3_pc in ("1", "2") else 0
+H3_PRUNED_COMPILE = H3_PRUNED_COMPILE_LEVEL >= 1
+if H3_PRUNED_COMPILE and not (H3_PRUNED and H3_PRUNED_QUANT_SPEC is not None and H3_PRUNED_QUANT_SPEC.convrot and H3_PRUNED_QUANT_SPEC.quantized):
+    logging.getLogger("minimax_h3").warning(
+        "H3_PRUNED_COMPILE=1 は H3_PRUNED=1 かつ ConvRot 系の量子化方式(H3_PRUNED_QUANT=int8dyn-convrot 等)"
+        "でのみ有効です。現在の設定では無視します。"
+    )
+    H3_PRUNED_COMPILE = False
+    H3_PRUNED_COMPILE_LEVEL = 0
 if H3_PRUNED and H3_TRANSFORMER_QUANT != "int8":
     # pruned は ref2va の transformer_ref 専用で、その量子化方式は H3_PRUNED_QUANT が決める。
     # H3_TRANSFORMER_QUANT は t2va 側の transformer と両常駐(H3_TRANSFORMER_BOTH_RESIDENT)
@@ -1951,6 +1967,57 @@ H3_REF_PREFIX_CACHE_SINGLE = _H3_REF_PREFIX_CACHE_SINGLE_REQUESTED and not (
 )
 
 
+# EXPERIMENTAL, opt-in (2026-10-05). `H3_REF_LATENT_CACHE=1`: ref2va の**参照画像 VAE エンコード
+# 結果 (condition latent)** を、プロセス内に1エントリだけキャッシュする。
+#
+# 動機: 単機リアルタイム連続生成 (同じ衣装の参照画像 + 台詞=音声/プロンプトだけが毎回変わる)
+# では、参照画像の VAE エンコード (実測 ~1.0s) を毎回同じ入力で計算し直している。
+# `H3_REF_PREFIX_CACHE_SINGLE` が Qwen 画像特徴 (prefix KV) を使い回すのと同じ思想で、
+# こちらは VAE 側の latent を使い回す。音声参照の audio_vae エンコードは毎回違うので
+# キャッシュしない (hit 時も実行する)。
+#
+# キー: 正規化後 (setup step 通過後=短辺リサイズ済み) の画像参照すべての
+#   (md5(ピクセル), shape) の列 + keyframe_encode_seed + pixel_mean/std + VAE dtype +
+#   短辺設定。エンコード結果に影響しうる値をすべて含めるので、衣装切替・解像度変更・
+#   短辺変更はどれも自然に別キー (= miss で再計算して置き換え) になる。
+# 対象: 参照が「画像 (1枚以上) + 音声のみ」の場合。動画参照を含む場合はキャッシュせず
+#   従来経路 (`ref_latent_cache="bypass"`)。キャッシュされるのは CPU 上の小さな float32
+#   テンソル (数 MB 級) で、VRAM は消費しない。
+# 出力は非キャッシュ時と bit 一致する (エンコードは `keyframe_encode_seed` 固定の決定論的
+#   サンプリングで、hit 時はその結果をそのまま返すだけ。検証手順は README/報告参照)。
+# 既定 OFF: OFF のとき生成経路は従来と完全に同一 (関数の先頭でフラグを見て元のステップを
+#   そのまま呼ぶだけ)。
+H3_REF_LATENT_CACHE = os.environ.get("H3_REF_LATENT_CACHE", "0").strip() == "1"
+
+# EXPERIMENTAL, opt-in (2026-10-05). decode の分離 (単機リアルタイム連続生成の cadence 短縮):
+#
+#   `H3_DECODE_STREAM=1`  denoise 完了時点で app の生成ロックを解放し、video/audio VAE decode
+#                         + uint8 変換 + mux を**そのリクエストのスレッド上で** (デフォルト
+#                         ストリームのまま) 行う。次のリクエスト (エンコード/denoise) が decode と
+#                         重なって走れる。`=2` は専用 CUDA ストリーム版 (下記の注意参照)。
+#   `H3_DECODE_DEVICE=cuda:1`  video VAE (と audio VAE) の**デコード専用コピー**を別 GPU に常駐
+#                         させ、denoise 後の latent (数 MB) をそのGPUへ送って decode する。
+#                         transformer/TE/参照エンコード用 VAE は従来どおり cuda:0 (DEVICE) のまま。
+#
+# どちらも既定なし (現行どおり)。安全性 (なぜ重ねて良いか) は `_decode_ref2va_isolated()` と
+# `generate_ref2va()` の `on_denoise_done` 周辺のコメント参照。成立条件は
+# 「VAE 常駐 (H3_KEEP_REF2VA=1 + H3_KEEP_REF2VA_VAE=1 + H3_LOWVRAM=1)」。満たさない場合は
+# 警告を出して従来のインライン decode にフォールバックする (黙って壊れた重なり方をしない)。
+_H3_DECODE_STREAM_RAW = os.environ.get("H3_DECODE_STREAM", "0").strip()
+H3_DECODE_STREAM = _H3_DECODE_STREAM_RAW in ("1", "2")
+# "2" = 専用 CUDA ストリーム (decode 専用 VAE コピーを native attention で使う)。"1" はデフォルト
+# ストリームのまま別スレッドで decode する。**専用ストリームで共有 VAE を使ってはいけない**:
+# `H3_ATTN_BACKEND=sage` (既定) は diffusers の attention backend をプロセス全体で解決するため
+# video VAE の attention も sage になり、sage のカーネルは current stream を尊重せず legacy
+# default stream に投げる → side stream 上の前後の演算と順序が壊れ、decode 結果が全面 NaN
+# (真っ黒な映像) になる。2026-10-05 に実機で再現 (H3_ATTN_BACKEND=default なら NaN にならない
+# ことで原因を特定)。そのため "2" は native attention に固定した別コピーの VAE を使う。
+H3_DECODE_STREAM_SIDE = _H3_DECODE_STREAM_RAW == "2"
+H3_DECODE_DEVICE = os.environ.get("H3_DECODE_DEVICE", "").strip()
+# 別 GPU の decode 専用 VAE コピーを native attention に固定するか (既定 0 = 本体と同じ backend)。
+H3_DECODE_NATIVE_ATTN = os.environ.get("H3_DECODE_NATIVE_ATTN", "0").strip() == "1"
+
+
 # H3_TE_PROJ 有効時、H3 トークナイザ固有の特殊トークン (`<d>`=151669 / `</d>`=151670)
 # はここから拒否する。理由: これらは H3 の 32B TE 用チェックポイントの語彙にだけ追加
 # されたトークンで、Qwen3-VL-4B-Instruct の埋め込み表 (vocab_size=151669、有効IDは
@@ -2319,6 +2386,90 @@ def _clear_single_ref_prefix_cache(reason: str) -> None:
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     logger.info("single ref-prefix cache cleared (%.2fGiB): %s", freed, reason)
+
+
+# H3_REF_LATENT_CACHE の1エントリ: (key, [condition_latent(CPU float32), ...])。
+# 生成経路 (generate_ref2va) からしか触らない。連続生成で次リクエストの参照エンコードが
+# 走るのは前リクエストの denoise 完了後 (H3_DECODE_STREAM でもエンコード同士は重ならない:
+# 生成ロックは1件ずつ取られる) なので追加のロックは要らない。
+_ref_latent_cache_entry: "tuple[str, list[torch.Tensor]] | None" = None
+_ref_latent_cache_stats = {"hit": 0, "miss": 0, "bypass": 0}
+
+
+def _clear_ref_latent_cache(reason: str) -> None:
+    global _ref_latent_cache_entry
+    if _ref_latent_cache_entry is None:
+        return
+    _ref_latent_cache_entry = None
+    logger.info("ref latent cache cleared: %s", reason)
+
+
+def _ref_latent_cache_key(pipe, image_refs: list, short_edge) -> str:
+    """画像参照 (正規化後) の実ピクセルとエンコード条件から、キャッシュキーを作る。"""
+    h = hashlib.md5()
+    for ref in image_refs:
+        arr = np.ascontiguousarray(np.array(ref.image))
+        h.update(np.asarray(arr.shape, dtype=np.int64).tobytes())
+        h.update(hashlib.md5(arr.tobytes()).digest())
+    vae = pipe.vae
+    h.update(repr((
+        int(getattr(pipe, "keyframe_encode_seed", -1)),
+        tuple(pipe.pixel_mean), tuple(pipe.pixel_std),
+        str(next(vae.parameters()).dtype), short_edge, len(image_refs),
+    )).encode())
+    return h.hexdigest()
+
+
+def _ref2va_encode_references(pipe, state):
+    """`MiniMaxH3Ref2VAReferenceEncoderStep` の呼び出しラッパー (`H3_REF_LATENT_CACHE` 対応)。
+
+    戻り値: `(state, status)`。status は None (フラグ OFF) / "hit" / "miss" / "bypass"。
+    フラグ OFF なら元のステップを呼ぶだけで従来と完全に同一。
+
+    ON のとき:
+      * hit : 画像参照のエンコードをスキップし、保存済み latent の clone を
+        `condition_latents` に入れる。音声参照 (毎回違う) は元のステップを「音声参照のみ」の
+        参照リストで走らせて `audio_condition_latents` を得る (画像のエンコードは走らない)。
+      * miss: 元のステップをそのまま走らせ、出来た `condition_latents` を保存する。
+    ステップの出力リストは「画像/動画参照 (パック順)」と「音声持ち参照 (パック順)」で
+    別々なので、画像と音声だけの構成なら両者を独立に差し替えられる (順序の取り違えが無い)。
+    """
+    from diffusers.modular_pipelines.minimax_h3.encoders import MiniMaxH3Ref2VAReferenceEncoderStep
+
+    global _ref_latent_cache_entry
+    step = MiniMaxH3Ref2VAReferenceEncoderStep()
+    if not H3_REF_LATENT_CACHE:
+        _, state = step(pipe, state)
+        return state, None
+
+    refs = state.get("normalized_references")
+    images = [r for r in refs if r.kind == "image"]
+    others = [r for r in refs if r.kind != "image"]
+    if not images or any(r.kind != "audio" for r in others):
+        _ref_latent_cache_stats["bypass"] += 1
+        _, state = step(pipe, state)
+        return state, "bypass"
+
+    key = _ref_latent_cache_key(pipe, images, pipe.config.reference_image_short_edge)
+    entry = _ref_latent_cache_entry
+    if entry is not None and entry[0] == key:
+        if others:
+            state.set("normalized_references", others)
+            try:
+                _, state = step(pipe, state)
+            finally:
+                state.set("normalized_references", refs)
+        else:
+            state.set("audio_condition_latents", [])
+        # clone: 後段が in-place で触っても保存分が汚れないようにする (数 MB なので安い)。
+        state.set("condition_latents", [t.clone() for t in entry[1]])
+        _ref_latent_cache_stats["hit"] += 1
+        return state, "hit"
+
+    _, state = step(pipe, state)
+    _ref_latent_cache_entry = (key, [t.clone() for t in state.get("condition_latents")])
+    _ref_latent_cache_stats["miss"] += 1
+    return state, "miss"
 
 
 def _single_ref_prefix_cache_key(
@@ -3867,6 +4018,13 @@ class MiniMaxH3Runner:
         # H3_VAE_SPLIT: VAE のうち今 GPU にいる部分 ("encode"/"decode" の部分集合)。
         # `_vae_on_gpu` は「どれかが GPU にいる」の意味 (全部とは限らない)。
         self._vae_gpu_parts: set[str] = set()
+        # H3_DECODE_DEVICE: decode 専用 VAE コピー (別 GPU 常駐) と、decode の直列化ロック・
+        # 専用ストリーム。フラグ OFF の既定では一切使われない (None のまま)。
+        self._decode_vae = None
+        self._decode_audio_vae = None
+        self._decode_lock = threading.Lock()
+        self._decode_stream = None
+        self._decode_warned = False
         self._load_lock = threading.Lock()
 
         # --- ref2va (omni-reference) additions ---
@@ -4090,6 +4248,8 @@ class MiniMaxH3Runner:
 
         if getattr(self._pipe, "image_processor", None) is None:
             self._pipe.image_processor = VaeImageProcessor(vae_scale_factor=16)
+        # H3_DECODE_DEVICE: 別 GPU 上の decode 専用コピーをここで一緒に作る (フラグ OFF なら no-op)。
+        self._ensure_decode_vaes()
 
     # H3_VAE_SPLIT 用: VAE の子モジュールを encode 側 / decode 側に分ける。video VAE は
     # decoder が 4.5GiB (fp16)、encoder は 0.34GiB しかない (safetensors ヘッダの実測)。
@@ -4725,6 +4885,15 @@ class MiniMaxH3Runner:
             )
         self._transformer_ref_loaded = True
         self._active_variant = "ref2va"
+        if H3_PRUNED_COMPILE:
+            # キャッシュ保存より後・turbo LoRA wrap(遅延、初回 turbo リクエスト)より前。
+            import sys as _sys
+
+            from core import pruned as pruned_mod
+
+            pruned_mod.compile_convrot_layers(
+                self._pipe_ref.transformer_ref, _sys.modules["modeling_minimax_h3_pruned"]
+            )
         if H3_ATTN_BACKEND:
             self._pipe_ref.transformer_ref.set_attention_backend(H3_ATTN_BACKEND)
             logger.info("transformer_ref attention backend set to %r", H3_ATTN_BACKEND)
@@ -4969,6 +5138,10 @@ class MiniMaxH3Runner:
                 progress.update(message=f"turbo LoRA を {label} へ適用中...")
             n = self._apply_turbo_lora_checkpoint(transformer)
             setattr(self, wrapped_attr, True)
+            if is_ref and H3_PRUNED_COMPILE_LEVEL >= 2:
+                from core import pruned as pruned_mod
+
+                pruned_mod.compile_turbo_wrappers(transformer, _TurboLoRALinear)
             logger.info("turbo LoRA lazily applied to %s (%d layers wrapped)", label, n)
         elif getattr(self, wrapped_attr):
             n = set_turbo_lora_enabled(transformer, turbo)
@@ -6039,6 +6212,8 @@ class MiniMaxH3Runner:
         self._vae_loaded = False
         self._vae_on_gpu = False
         self._vae_gpu_parts = set()
+        self._free_decode_vaes()
+        _clear_ref_latent_cache("vae freed")
         gc.collect()
         torch.cuda.empty_cache()
         logger.info("vae/audio_vae freed. gpu=%s ram=%s", gpu_mem_gb(), ram_gb())
@@ -6134,6 +6309,214 @@ class MiniMaxH3Runner:
                 elif TE_QUANT == "bnb-4bit":
                     self._load_text_encoder()
 
+    # ------------------------------------------------------------------
+    # H3_DECODE_STREAM / H3_DECODE_DEVICE (2026-10-05, 既定 OFF)
+    # ------------------------------------------------------------------
+    def _decode_target_device(self) -> torch.device:
+        return torch.device(H3_DECODE_DEVICE) if H3_DECODE_DEVICE else DEVICE
+
+    def decode_deferred_active(self) -> bool:
+        """decode を denoise から分離する経路 (`_decode_ref2va_deferred`) が今のリクエストで
+        使えるか。フラグ OFF なら常に False (= 従来のインライン decode)。
+
+        成立条件は「VAE が GPU に常駐していて、リクエストの出入りで動かされない」こと
+        (`H3_KEEP_REF2VA=1` + `H3_KEEP_REF2VA_VAE=1` + `H3_LOWVRAM=1`)。そうでない構成では
+        次リクエストのエンコードが `_vae_to_cpu()` 等で VAE を動かし、decode と衝突しうる
+        ので、警告を1回出して従来経路にフォールバックする。
+        """
+        if not (H3_DECODE_STREAM or H3_DECODE_DEVICE):
+            return False
+        reason = None
+        if not (_keep_ref2va_active() and H3_KEEP_REF2VA_VAE):
+            reason = "H3_KEEP_REF2VA=1 + H3_KEEP_REF2VA_VAE=1 + H3_LOWVRAM=1 (VAE 常駐) が必要"
+        elif H3_DECODE_DEVICE:
+            try:
+                d = torch.device(H3_DECODE_DEVICE)
+                if d.type != "cuda" or (d.index or 0) >= torch.cuda.device_count():
+                    reason = f"H3_DECODE_DEVICE={H3_DECODE_DEVICE!r} は存在する CUDA デバイスではない"
+            except Exception as e:  # noqa: BLE001
+                reason = f"H3_DECODE_DEVICE={H3_DECODE_DEVICE!r} を解釈できない ({e})"
+        if reason:
+            if not self._decode_warned:
+                self._decode_warned = True
+                logger.warning("H3_DECODE_STREAM/H3_DECODE_DEVICE は無効化されインライン decode を使う: %s", reason)
+            return False
+        return True
+
+    def decode_overlap_active(self) -> bool:
+        """denoise 完了時点で生成ロックを手放す (= 次リクエストと decode が重なる) か。"""
+        return H3_DECODE_STREAM and self.decode_deferred_active()
+
+    def _ensure_decode_vaes(self) -> None:
+        """`H3_DECODE_DEVICE` が cuda:0 以外のとき、video/audio VAE の decode 専用コピーを
+        そのデバイスへ作る (冪等)。transformer/TE/参照エンコード用の VAE (cuda:0) には触らない。
+        """
+        if self._decode_vae is not None:
+            return
+        if not self.decode_deferred_active():
+            return
+        separate = self._decode_target_device() != DEVICE
+        if not (separate or H3_DECODE_STREAM_SIDE):
+            return
+        import copy
+
+        dev = self._decode_target_device()
+        t0 = time.time()
+        vae = copy.deepcopy(self._pipe.vae)
+        # `_fp16_autocast_encode` (encode のパッチ) は元の VAE にひも付くクロージャ。decode 専用
+        # コピーでは使わないので外して、取り違えようがないようにする。
+        vae.__dict__.pop("encode", None)
+        if H3_DECODE_NATIVE_ATTN or not separate:
+            # 専用ストリーム版: sage は side stream で壊れる (H3_DECODE_STREAM のコメント) ので native 固定。
+            vae.set_attention_backend("native")
+        self._decode_vae = vae.to(dev)
+        # audio VAE は deepcopy できない (legacy weight_norm が計算済みの非リーフ `weight` を属性に持つ:
+        # "Only Tensors created explicitly by the user support the deepcopy protocol")。config から
+        # 組み立て直して state_dict を流し込む。
+        from diffusers import AutoencoderKLMiniMaxH3Audio
+
+        src_audio = self._pipe.audio_vae
+        audio_copy = AutoencoderKLMiniMaxH3Audio.from_config(src_audio.config)
+        audio_copy.load_state_dict({k: v.detach().cpu() for k, v in src_audio.state_dict().items()})
+        audio_copy.eval()
+        audio_copy.set_attention_backend("native")  # 本体の audio_vae と同じ (fp32 固定なので sage 不可)
+        self._decode_audio_vae = audio_copy.to(dev)
+        torch.cuda.synchronize(dev)
+        logger.info("decode-only vae/audio_vae copies placed on %s in %.2fs (H3_DECODE_DEVICE)", dev, time.time() - t0)
+
+    def _free_decode_vaes(self) -> None:
+        if self._decode_vae is None and self._decode_audio_vae is None:
+            return
+        dev = self._decode_target_device()
+        self._decode_vae = None
+        self._decode_audio_vae = None
+        gc.collect()
+        with torch.cuda.device(dev):
+            torch.cuda.empty_cache()
+        logger.info("decode-only vae copies freed (%s)", dev)
+
+    def _decode_ref2va_deferred(self, pipe, holder: list, progress, on_denoise_done):
+        r"""ref2va の decode (video VAE + audio VAE) + uint8 変換を、denoise から分離して実行する。
+
+        `holder` は `[video_latents, audio_latents]` (呼び出し側がローカル参照を残さないための
+        受け渡し用リスト。ここで pop して、decode 完了時に解放する)。
+
+        **なぜ生成ロック解放後に decode して安全か** (`H3_DECODE_STREAM=1` のとき):
+          1. この時点で transformer の仕事は終わっており、残りの入力は latent 2本だけ。
+             以降 decode が触るのは VAE の重みと自分の中間テンソルだけで、`state` /
+             scheduler / transformer / TE / KV キャッシュには一切触れない。
+          2. VAE モジュールはステートレス (`autoencoder_kl_minimax_h3.py` に feature cache 等の
+             インスタンス状態なし。tiling フラグは常に True のまま誰も書き換えない)。次の
+             リクエストの参照エンコード (同じ video VAE の encode) と同じ重みを読むだけ。
+             VAE の GPU⇔CPU 往復 (`_vae_to_cpu`) は KEEP_REF2VA_VAE=1 では起きない
+             (`decode_deferred_active` がこの構成を成立条件にしている)。
+          3. torch の current stream / autocast / no_grad はスレッドローカル。`=1` では
+             デフォルト (legacy) ストリームに両スレッドの演算が投入され、GPU 上では投入順に
+             処理される (カーネルの真の同時実行は無いが、飢餓も起きない)。`=2` は専用ストリーム
+             (PyTorch の side stream は non-blocking) で真に重なるが、sage attention 等
+             「current stream を尊重しないカーネル」が共有 VAE に混ざると壊れるため、native
+             attention に固定した decode 専用コピーを使う (`_ensure_decode_vaes`)。
+          4. 入力 latent は denoise と同じスレッドで `synchronize` 済み、decode 完了
+             (`.cpu()` で同期) まで本スレッドが保持するので、use-after-free は起きない。
+          5. decode 同士は `_decode_lock` で直列化 (次々リクエストの decode が重なって VRAM を
+             二重に積まない)。mux はロック外 (CPU のみ)。
+          6. 注意: 重なっている間は (a) `torch.cuda.reset_peak_memory_stats()` を次リクエストが
+             呼ぶので同一 GPU 上のピーク統計は信頼できない、(b) 同一 GPU の SM を取り合うので
+             denoise/decode とも単体より遅くなる、(c) VRAM は両者の和が要る (96GB 機の
+             resident 構成では余裕があるが、48GB 以下では `H3_DECODE_DEVICE` で別 GPU に逃がす)。
+        `H3_DECODE_DEVICE` のみ (STREAM なし) の場合はロックを手放さない: 純粋に decode を
+        別 GPU へオフロードするだけ (VRAM を cuda:0 から外す効果。レイテンシは同等)。
+        """
+        from contextlib import nullcontext
+
+        dev = self._decode_target_device()
+        separate = dev != DEVICE
+        lat, alat = holder.pop(0), holder.pop(0)
+        torch.cuda.synchronize(DEVICE)  # denoise + unpatchify の GPU 作業が完了していること
+        peak_at_release = torch.cuda.max_memory_allocated() / 1e9
+        released = False
+        if H3_DECODE_STREAM and on_denoise_done is not None:
+            on_denoise_done()
+            released = True
+        t_wait0 = time.time()
+        if progress:
+            progress.update(phase="decoding", message="動画/音声をデコード中...")
+        info: dict = {
+            "device": str(dev), "separate_gpu": separate, "stream": bool(H3_DECODE_STREAM),
+            "side_stream": bool(H3_DECODE_STREAM_SIDE),
+            "lock_released_before_decode": released,
+        }
+        with self._decode_lock:
+            info["decode_lock_wait_s"] = round(time.time() - t_wait0, 3)
+            if separate or H3_DECODE_STREAM_SIDE:
+                self._ensure_decode_vaes()
+                vae, audio_vae = self._decode_vae, self._decode_audio_vae
+            else:
+                vae, audio_vae = pipe.vae, pipe.audio_vae
+            if separate:
+                torch.cuda.reset_peak_memory_stats(dev)
+            if H3_DECODE_STREAM_SIDE and self._decode_stream is None:
+                with torch.cuda.device(dev):
+                    self._decode_stream = torch.cuda.Stream(device=dev)
+            stream = self._decode_stream if H3_DECODE_STREAM_SIDE else None
+            t_dec = time.time()
+            with torch.cuda.device(dev), (torch.cuda.stream(stream) if stream is not None else nullcontext()), \
+                    torch.no_grad():
+                t_x = time.time()
+                if separate:
+                    # **GPU 間の直接コピー (P2P) は使わない**: この機 (RTX PRO 6000 + RTX PRO 5000,
+                    # PCIe NODE 接続) では `tensor.to("cuda:1")` が can_device_access_peer=True
+                    # にもかかわらず**無警告で全要素 0 を書き込む** (2026-10-05 実機、float 100M 要素
+                    # まで全サイズで再現)。最初の A/B で GPU1 decode が「ゼロ latent の decode」に
+                    # なり PSNR 11dB の別物映像になって発覚した。latent は数 MB なので必ず
+                    # ホスト経由でステージングする (実測 ~2ms)。
+                    lat_d = lat.detach().cpu().to(dev)
+                    alat_d = alat.detach().cpu().to(dev)
+                    torch.cuda.synchronize(dev)
+                else:
+                    lat_d, alat_d = lat, alat
+                info["latent_transfer_s"] = round(time.time() - t_x, 4)
+                info["latent_transfer_mb"] = round((lat.numel() * lat.element_size()
+                                                    + alat.numel() * alat.element_size()) / 1e6, 2)
+                mean = torch.tensor(vae.config.latents_mean, device=dev).view(1, -1, 1, 1, 1)
+                std = torch.tensor(vae.config.latents_std, device=dev).view(1, -1, 1, 1, 1)
+                x = lat_d * std + mean
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    video = vae.decode(x, return_dict=False)[0]
+                video = video.cpu()  # 同期。fp16 のまま CPU へ降ろして CPU 側で逆正規化 (既定経路と同じ)
+                a_mean = torch.tensor(audio_vae.config.latents_mean, device=dev).view(1, -1, 1)
+                a_std = torch.tensor(audio_vae.config.latents_std, device=dev).view(1, -1, 1)
+                audio = audio_vae.decode(alat_d * a_std + a_mean, return_dict=False)[0]
+                audio = audio.float().permute(1, 0, 2)
+                audio_np = audio[0].float().cpu().numpy()
+                sampling_rate = pipe.audio_sampling_rate
+                if separate:
+                    info["decode_peak_vram_gb"] = round(torch.cuda.max_memory_allocated(dev) / 1e9, 2)
+            pixel_mean = torch.tensor(pipe.pixel_mean).view(1, -1, 1, 1, 1)
+            pixel_std = torch.tensor(pipe.pixel_std).view(1, -1, 1, 1, 1)
+            video = (video.float() * pixel_std + pixel_mean).clamp(0, 1)
+            videos = pipe.video_processor.postprocess_video(video, output_type="pt")
+            decode_time = time.time() - t_dec
+            video_tensor = videos[0] if isinstance(videos, list) else videos
+            t_u8 = time.time()
+            frames_uint8 = frames_to_uint8(video_tensor)
+            info["uint8_s"] = round(time.time() - t_u8, 3)
+            rms = float(np.sqrt(np.mean(audio_np**2)))
+            peak = float(np.max(np.abs(audio_np)))
+            peak_vram = peak_at_release
+            del lat, alat, lat_d, alat_d, x, video, videos, video_tensor, audio
+            if not released:
+                # 重なりのない構成では従来どおり掃除する。生成ロックを手放して重ねている間は
+                # `torch.cuda.empty_cache()` を呼ばない: これは**全デバイス**のキャッシュを解放する
+                # (current device だけではない) ため、別 GPU 上で走行中の次リクエストの割り当て
+                # キャッシュまで cudaFree してしまう。実際に cuda:1 側で呼んだ empty_cache が
+                # cuda:0 で denoise 中の次リクエストを "illegal memory access" で落とした
+                # (2026-10-05 実機)。gc.collect() も同様にやらない。
+                gc.collect()
+                with torch.cuda.device(dev):
+                    torch.cuda.empty_cache()
+        return frames_uint8, audio_np, sampling_rate, rms, peak, peak_vram, decode_time, info
+
     def status(self) -> dict:
         return {
             "pipe_built": self._pipe is not None,
@@ -6166,6 +6549,7 @@ class MiniMaxH3Runner:
             # (H3_PRUNED_QUANT、core/pruned.py)。実行中の構成を logs と突合するため。
             "pruned": H3_PRUNED,
             "pruned_quant": H3_PRUNED_QUANT if H3_PRUNED else None,
+            "pruned_compile": H3_PRUNED_COMPILE_LEVEL,
             # fp32 matmul の精度設定(torch.get_float32_matmul_precision())。torchao の
             # quantize_() は set_inductor_config=True(既定)だと "high"(TF32)へ変えて
             # しまうので、量子化経路の副作用で変わっていないこと("highest")を観測するため。
@@ -6182,6 +6566,12 @@ class MiniMaxH3Runner:
             "te_stream": H3_TE_STREAM,
             "te_stream_window": H3_TE_STREAM_WINDOW if H3_TE_STREAM else None,
             "ref_prefix_park": H3_REF_PREFIX_PARK and H3_REF_PREFIX_CACHE_SINGLE,
+            # 単機リアルタイム連続生成用の追加機能 (2026-10-05、いずれも既定 OFF)
+            "ref_latent_cache": H3_REF_LATENT_CACHE,
+            "ref_latent_cache_stats": dict(_ref_latent_cache_stats) if H3_REF_LATENT_CACHE else None,
+            "decode_stream": _H3_DECODE_STREAM_RAW if H3_DECODE_STREAM else None,
+            "decode_device": H3_DECODE_DEVICE or None,
+            "decode_deferred_active": self.decode_deferred_active(),
             "vae_split": H3_VAE_SPLIT and _keep_ref2va_active(),
             "lowvram_group": H3_LOWVRAM_GROUP,
             # import 時の logger.info は uvicorn がロギングを設定する前に走って消えるので、
@@ -7987,6 +8377,10 @@ class MiniMaxH3Runner:
         # module-level constant directly (the constant itself is untouched and still
         # backs the env-var default via this resolution).
         vocal_lock: bool | None = None,
+        # H3_DECODE_STREAM / H3_DECODE_DEVICE 用: denoise 完了直後 (decode 開始前) に1回だけ
+        # 呼ばれるコールバック。app が生成ロックの解放に使う。`decode_deferred_active()` が
+        # False のとき (既定) は一切呼ばれない。
+        on_denoise_done=None,
     ) -> dict:
         """
         Runs ref2va: joint video+audio generation conditioned on an ordered list of
@@ -8067,6 +8461,7 @@ class MiniMaxH3Runner:
         # between here and the start of denoise. No-op (single flag check per `.mark()`
         # call) when `H3_PHASE_TIMING=0` (default).
         _pt = _PhaseTimer("generate_ref2va")
+        ref_latent_cache_status = None  # H3_REF_LATENT_CACHE: None(OFF)/hit/miss/bypass
         # Per-request override of `H3_VOCAL_LOCK` (see this parameter's own docstring
         # paragraph above). `None` -> fall back to the module-level env-var default,
         # byte-for-byte identical to today's always-env-var behavior. Every
@@ -8340,8 +8735,7 @@ class MiniMaxH3Runner:
             with self._load_lock:
                 self._free_text_encoder(force=True)
             self._vae_to_gpu()
-            reference_encoder_step = MiniMaxH3Ref2VAReferenceEncoderStep()
-            _, state = reference_encoder_step(pipe, state)
+            state, ref_latent_cache_status = _ref2va_encode_references(pipe, state)
             if vocal_lock_effective:
                 # Must run inside this "audio_vae on GPU" window, before `_vae_to_cpu()`
                 # parks it back -- see `_build_vocal_lock_latents()`'s docstring.
@@ -8382,8 +8776,7 @@ class MiniMaxH3Runner:
             # layout_step/latents_step/timesteps_step all run first, while TE is still
             # the GPU-resident model `_execution_device` resolves to, and only then is
             # TE freed and transformer_ref loaded.
-            reference_encoder_step = MiniMaxH3Ref2VAReferenceEncoderStep()
-            _, state = reference_encoder_step(pipe, state)
+            state, ref_latent_cache_status = _ref2va_encode_references(pipe, state)
             if vocal_lock_effective:
                 # Must run inside this "audio_vae on GPU" window, before `_vae_to_cpu()`
                 # parks it back -- see `_build_vocal_lock_latents()`'s docstring.
@@ -8442,8 +8835,7 @@ class MiniMaxH3Runner:
         elif TE_QUANT == "bnb-4bit":
             self._vae_to_gpu()  # already has its own unconditional timing log
             _pt.mark("vae_to_gpu")
-            reference_encoder_step = MiniMaxH3Ref2VAReferenceEncoderStep()
-            _, state = reference_encoder_step(pipe, state)
+            state, ref_latent_cache_status = _ref2va_encode_references(pipe, state)
             _pt.mark("reference_encoder_step(vae_encode_condition_latents)")
             if vocal_lock_effective:
                 # Must run inside this "audio_vae on GPU" window, before `_vae_to_cpu()`
@@ -8510,8 +8902,7 @@ class MiniMaxH3Runner:
             with self._load_lock:
                 self._free_text_encoder()
                 self._ensure_transformer_ref(progress)
-            reference_encoder_step = MiniMaxH3Ref2VAReferenceEncoderStep()
-            _, state = reference_encoder_step(pipe, state)
+            state, ref_latent_cache_status = _ref2va_encode_references(pipe, state)
             if vocal_lock_effective:
                 # `none` mode keeps `vae`/`audio_vae` permanently GPU-resident (see the
                 # branch comment above), so there is no "vae on GPU" window to miss here
@@ -8675,150 +9066,165 @@ class MiniMaxH3Runner:
         # ref2va-specific decode step exists; `MiniMaxH3AfterDenoiseStep` just above
         # already dropped the reference condition rows, so these two only ever see the
         # generated rows) ---
-        if progress:
-            progress.update(phase="decoding", message="動画/音声をデコード中...")
-        # bf16 mode: transformer_ref(66.3) + TE-nf4(21.0) + vae pair(11.0) would exceed
-        # this card's ~95.6GB (same three-way conflict as everywhere else in this
-        # file), so transformer_ref is dropped for this short decode window and
-        # reloaded right after (see below).
-        # int8 both-resident mode: `transformer` (t2va's) was already freed at this
-        # method's entry and never reloaded before now (see the entry-section and
-        # force_free_te comments above) -- resident set going into decode is just
-        # transformer_ref(34) + TE-nf4(21) = 55GB, and adding the vae pair(11) is only
-        # 66GB, comfortably under budget. So transformer_ref does NOT need to be
-        # dropped here in this mode; it is left alone (stays resident straight through
-        # decode and into the next request, which is the whole point of int8 mode for
-        # ref2va<->ref2va requests specifically).
-        # H3_LOWVRAM_GROUP: `transformer_ref` is left alone here -- same reasoning as
-        # generate()'s own decode section (a group-offloaded transformer_ref's actual
-        # GPU footprint never conflicted with the vae pair's headroom in the first
-        # place). TE-nf4 DOES need force-freeing here though, for the same reason found
-        # by this task's own 32GB-ballast diagnostic against generate()'s t2va path (see
-        # that decode section's own comment for the full `_log_gpu_tensor_diag()`
-        # investigation): TE-nf4's own ~21GB is real, live, referenced memory, not
-        # reclaimable via `empty_cache()` alone, and it is not needed by either decode
-        # step (MiniMaxH3VideoDecodeStep/MiniMaxH3AudioDecodeStep only touch
-        # vae/audio_vae/video_processor). `force_free_te` was already True and did the
-        # force-free earlier in this method (before denoise, per its own definition
-        # above) in the non-group-mode branches, but H3_LOWVRAM_GROUP always has
-        # `force_free_te=False` (transformer_ref's tiny footprint never needed it
-        # before denoise) -- so it has to be freed here, at decode, instead.
-        def _restore_decode_steady_state_ref():
-            # generate() の `_restore_decode_steady_state()` と同じ役割の ref2va 版。
-            # 正常系と decode 例外時の両方から呼ぶ(例外時に復元しないと後続リクエストが
-            # 不整合な常駐セットを引き継いで連鎖 OOM する -- generate() 側の同名 closure の
-            # コメント参照)。
-            if not (_keep_ref2va_active() and H3_KEEP_REF2VA_VAE):
-                self._vae_to_cpu()
-            if TE_QUANT == "bnb-4bit" and not H3_LOWVRAM_ANY:
-                with self._load_lock:
-                    self._ensure_transformer_ref(progress)
-                    if force_free_te:
-                        # Restore the bnb-4bit steady state (transformer_ref + TE-nf4 both
-                        # resident) for the *next* request -- this request force-freed TE-nf4
-                        # before denoise to make room for the reference-lengthened sequence's
-                        # attention activations (see above). Reloaded after transformer_ref so
-                        # the two big reloads are not competing for VRAM at the same time,
-                        # mirroring generate()'s own force_free_te reload ordering.
+        # --- H3_DECODE_STREAM / H3_DECODE_DEVICE (既定 OFF): decode を denoise から分離する ---
+        # 条件を満たすときだけ、denoise 直後に生成ロックを手放し、decode + uint8 変換を専用
+        # ストリーム/別 GPU で行う (`_decode_ref2va_deferred` の docstring に安全性の根拠)。
+        # 満たさない/フラグ OFF なら下の従来経路 (インライン decode) がそのまま走る。
+        _decode_deferred = self.decode_deferred_active()
+        decode_info = None
+        if _decode_deferred:
+            _holder = [state.get("latents"), state.get("audio_latents")]
+            # 重い参照を手放してから (= 次リクエストに VRAM を返してから) 生成ロックを解放する。
+            state = prompt_embeds = text_token_tags = encoded = vocal_lock_latents = None
+            (frames_uint8, audio_np, sampling_rate, rms, peak, peak_vram, decode_time,
+             decode_info) = self._decode_ref2va_deferred(pipe, _holder, progress, on_denoise_done)
+        else:
+            if progress:
+                progress.update(phase="decoding", message="動画/音声をデコード中...")
+            # bf16 mode: transformer_ref(66.3) + TE-nf4(21.0) + vae pair(11.0) would exceed
+            # this card's ~95.6GB (same three-way conflict as everywhere else in this
+            # file), so transformer_ref is dropped for this short decode window and
+            # reloaded right after (see below).
+            # int8 both-resident mode: `transformer` (t2va's) was already freed at this
+            # method's entry and never reloaded before now (see the entry-section and
+            # force_free_te comments above) -- resident set going into decode is just
+            # transformer_ref(34) + TE-nf4(21) = 55GB, and adding the vae pair(11) is only
+            # 66GB, comfortably under budget. So transformer_ref does NOT need to be
+            # dropped here in this mode; it is left alone (stays resident straight through
+            # decode and into the next request, which is the whole point of int8 mode for
+            # ref2va<->ref2va requests specifically).
+            # H3_LOWVRAM_GROUP: `transformer_ref` is left alone here -- same reasoning as
+            # generate()'s own decode section (a group-offloaded transformer_ref's actual
+            # GPU footprint never conflicted with the vae pair's headroom in the first
+            # place). TE-nf4 DOES need force-freeing here though, for the same reason found
+            # by this task's own 32GB-ballast diagnostic against generate()'s t2va path (see
+            # that decode section's own comment for the full `_log_gpu_tensor_diag()`
+            # investigation): TE-nf4's own ~21GB is real, live, referenced memory, not
+            # reclaimable via `empty_cache()` alone, and it is not needed by either decode
+            # step (MiniMaxH3VideoDecodeStep/MiniMaxH3AudioDecodeStep only touch
+            # vae/audio_vae/video_processor). `force_free_te` was already True and did the
+            # force-free earlier in this method (before denoise, per its own definition
+            # above) in the non-group-mode branches, but H3_LOWVRAM_GROUP always has
+            # `force_free_te=False` (transformer_ref's tiny footprint never needed it
+            # before denoise) -- so it has to be freed here, at decode, instead.
+            def _restore_decode_steady_state_ref():
+                # generate() の `_restore_decode_steady_state()` と同じ役割の ref2va 版。
+                # 正常系と decode 例外時の両方から呼ぶ(例外時に復元しないと後続リクエストが
+                # 不整合な常駐セットを引き継いで連鎖 OOM する -- generate() 側の同名 closure の
+                # コメント参照)。
+                if not (_keep_ref2va_active() and H3_KEEP_REF2VA_VAE):
+                    self._vae_to_cpu()
+                if TE_QUANT == "bnb-4bit" and not H3_LOWVRAM_ANY:
+                    with self._load_lock:
+                        self._ensure_transformer_ref(progress)
+                        if force_free_te:
+                            # Restore the bnb-4bit steady state (transformer_ref + TE-nf4 both
+                            # resident) for the *next* request -- this request force-freed TE-nf4
+                            # before denoise to make room for the reference-lengthened sequence's
+                            # attention activations (see above). Reloaded after transformer_ref so
+                            # the two big reloads are not competing for VRAM at the same time,
+                            # mirroring generate()'s own force_free_te reload ordering.
+                            self._load_text_encoder(progress)
+                        if H3_TRANSFORMER_BOTH_RESIDENT and H3_EAGER_VARIANT_RESTORE:
+                            # Restore the int8 both-resident steady state (`transformer` +
+                            # `transformer_ref` + TE-nf4 all resident) for the *next* request.
+                            # `transformer` (t2va's) was freed at this method's entry to make
+                            # room for the reference VAE-encode step and has stayed freed
+                            # through denoise/decode since (see the entry-section comment).
+                            # Now that decode's own vae-pair trip is done (`_vae_to_cpu()` just
+                            # above), there is headroom again: transformer_ref(34) + TE-nf4(21)
+                            # = 55GB resident, +34GB for this reload = 89GB, the same steady
+                            # state `generate()`'s own t2va path settles into. Reloaded last
+                            # (after transformer_ref/TE, whichever of those needed restoring)
+                            # so it is not competing with them for VRAM during their own
+                            # reloads.
+                            self._ensure_transformer(progress)
+                elif H3_LOWVRAM_GROUP:
+                    # `transformer_ref` was force-freed unconditionally at this method's entry
+                    # (see the entry-section comment) and is not reloaded here -- ref2va never
+                    # keeps a cross-request transformer_ref steady state in this mode (matches
+                    # plain bnb-4bit's own non-both-resident choice). TE-nf4 is reloaded though,
+                    # for the same reasoning as generate()'s own t2va decode tail: the next
+                    # request (t2va or ref2va) needs TE first regardless, so restoring it now
+                    # avoids paying its reload cost on that request's own critical path.
+                    with self._load_lock:
                         self._load_text_encoder(progress)
-                    if H3_TRANSFORMER_BOTH_RESIDENT and H3_EAGER_VARIANT_RESTORE:
-                        # Restore the int8 both-resident steady state (`transformer` +
-                        # `transformer_ref` + TE-nf4 all resident) for the *next* request.
-                        # `transformer` (t2va's) was freed at this method's entry to make
-                        # room for the reference VAE-encode step and has stayed freed
-                        # through denoise/decode since (see the entry-section comment).
-                        # Now that decode's own vae-pair trip is done (`_vae_to_cpu()` just
-                        # above), there is headroom again: transformer_ref(34) + TE-nf4(21)
-                        # = 55GB resident, +34GB for this reload = 89GB, the same steady
-                        # state `generate()`'s own t2va path settles into. Reloaded last
-                        # (after transformer_ref/TE, whichever of those needed restoring)
-                        # so it is not competing with them for VRAM during their own
-                        # reloads.
-                        self._ensure_transformer(progress)
+                # H3_LOWVRAM: deliberately do NOT reload transformer_ref/TE here -- same
+                # "nothing big resident between requests" reasoning as generate()'s own
+                # lowvram decode tail.
+
+            if _keep_ref2va_active():
+                # H3_KEEP_REF2VA=1: decode 窓でも transformer_ref/TE を落とさない (LOWVRAM=1 では
+                # 元々 decode 後に再ロードしないので、ここで落とすと次リクエストが丸ごと再ロードになる)。
+                logger.info("ref2va: transformer_ref/text_encoder stay resident through decode (H3_KEEP_REF2VA=1)")
+            elif TE_QUANT == "bnb-4bit" and not H3_TRANSFORMER_BOTH_RESIDENT and not H3_LOWVRAM_GROUP:
+                self._free_transformer_ref()
             elif H3_LOWVRAM_GROUP:
-                # `transformer_ref` was force-freed unconditionally at this method's entry
-                # (see the entry-section comment) and is not reloaded here -- ref2va never
-                # keeps a cross-request transformer_ref steady state in this mode (matches
-                # plain bnb-4bit's own non-both-resident choice). TE-nf4 is reloaded though,
-                # for the same reasoning as generate()'s own t2va decode tail: the next
-                # request (t2va or ref2va) needs TE first regardless, so restoring it now
-                # avoids paying its reload cost on that request's own critical path.
                 with self._load_lock:
-                    self._load_text_encoder(progress)
-            # H3_LOWVRAM: deliberately do NOT reload transformer_ref/TE here -- same
-            # "nothing big resident between requests" reasoning as generate()'s own
-            # lowvram decode tail.
-
-        if _keep_ref2va_active():
-            # H3_KEEP_REF2VA=1: decode 窓でも transformer_ref/TE を落とさない (LOWVRAM=1 では
-            # 元々 decode 後に再ロードしないので、ここで落とすと次リクエストが丸ごと再ロードになる)。
-            logger.info("ref2va: transformer_ref/text_encoder stay resident through decode (H3_KEEP_REF2VA=1)")
-        elif TE_QUANT == "bnb-4bit" and not H3_TRANSFORMER_BOTH_RESIDENT and not H3_LOWVRAM_GROUP:
-            self._free_transformer_ref()
-        elif H3_LOWVRAM_GROUP:
-            with self._load_lock:
-                self._free_text_encoder(force=True)
-        _dbg_pre_peak = 0.0
-        if H3_DEBUG_DECODE_MEM:
-            # 窓前までのピークを退避してからリセット (結果の peak_vram_gb は合成して保つ)。
-            torch.cuda.synchronize()
-            _dbg_pre_peak = torch.cuda.max_memory_allocated() / 1e9
-            logger.info("[DECODE_MEM] before vae_to_gpu: pre-window peak=%.2fGB gpu=%s", _dbg_pre_peak, gpu_mem_gb())
-            torch.cuda.reset_peak_memory_stats()
-        self._vae_to_gpu("decode")  # H3_VAE_SPLIT 時は decode 側だけ (それ以外は従来どおり全体)
-        if H3_DEBUG_DECODE_MEM:
-            logger.info("[DECODE_MEM] after vae_to_gpu: gpu=%s", gpu_mem_gb())
-        t_decode = time.time()
-        try:
-            video_decode_step = _cpu_norm_video_decode_step()
-            _, state = video_decode_step(pipe, state)
-            audio_decode_step = MiniMaxH3AudioDecodeStep()
-            _, state = audio_decode_step(pipe, state)
-            decode_time = time.time() - t_decode
-
-            videos = state.get("videos")
-            audio = state.get("audio")
-            sampling_rate = state.get("sampling_rate")
-
-            video_tensor = videos[0] if isinstance(videos, list) else videos
-            # 全長ぶんの中間テンソルを GPU に積まないよう、フレームを小分けにして
-            # CPU の出力配列へ直接書き込む (frames_to_uint8 の docstring 参照)。
-            frames_uint8 = frames_to_uint8(video_tensor)
-            audio_np = audio[0].float().cpu().numpy()
-            rms = float(np.sqrt(np.mean(audio_np**2)))
-            peak = float(np.max(np.abs(audio_np)))
-
-            peak_vram = torch.cuda.max_memory_allocated() / 1e9
+                    self._free_text_encoder(force=True)
+            _dbg_pre_peak = 0.0
             if H3_DEBUG_DECODE_MEM:
-                logger.info("[DECODE_MEM] decode window peak=%.2fGB gpu=%s", peak_vram, gpu_mem_gb())
-                peak_vram = max(peak_vram, _dbg_pre_peak)
-
-            del video_tensor, videos, audio
-            gc.collect()
-            torch.cuda.empty_cache()
-        except BaseException:
-            logger.exception(
-                "ref2va decode failed -- freeing partial buffers and restoring the steady "
-                "state before re-raising (so the next request does not inherit a corrupted "
-                "resident set)"
-            )
-            gc.collect()
-            torch.cuda.empty_cache()
+                # 窓前までのピークを退避してからリセット (結果の peak_vram_gb は合成して保つ)。
+                torch.cuda.synchronize()
+                _dbg_pre_peak = torch.cuda.max_memory_allocated() / 1e9
+                logger.info("[DECODE_MEM] before vae_to_gpu: pre-window peak=%.2fGB gpu=%s", _dbg_pre_peak, gpu_mem_gb())
+                torch.cuda.reset_peak_memory_stats()
+            self._vae_to_gpu("decode")  # H3_VAE_SPLIT 時は decode 側だけ (それ以外は従来どおり全体)
+            if H3_DEBUG_DECODE_MEM:
+                logger.info("[DECODE_MEM] after vae_to_gpu: gpu=%s", gpu_mem_gb())
+            t_decode = time.time()
             try:
-                _restore_decode_steady_state_ref()
-            except Exception:
-                # 復元自体の失敗で元の decode 例外を潰さない(原因情報は元例外側にある)。
-                logger.exception("steady-state restore after ref2va decode failure also failed")
-            raise
+                video_decode_step = _cpu_norm_video_decode_step()
+                _, state = video_decode_step(pipe, state)
+                audio_decode_step = MiniMaxH3AudioDecodeStep()
+                _, state = audio_decode_step(pipe, state)
+                decode_time = time.time() - t_decode
 
-        _restore_decode_steady_state_ref()
+                videos = state.get("videos")
+                audio = state.get("audio")
+                sampling_rate = state.get("sampling_rate")
+
+                video_tensor = videos[0] if isinstance(videos, list) else videos
+                # 全長ぶんの中間テンソルを GPU に積まないよう、フレームを小分けにして
+                # CPU の出力配列へ直接書き込む (frames_to_uint8 の docstring 参照)。
+                frames_uint8 = frames_to_uint8(video_tensor)
+                audio_np = audio[0].float().cpu().numpy()
+                rms = float(np.sqrt(np.mean(audio_np**2)))
+                peak = float(np.max(np.abs(audio_np)))
+
+                peak_vram = torch.cuda.max_memory_allocated() / 1e9
+                if H3_DEBUG_DECODE_MEM:
+                    logger.info("[DECODE_MEM] decode window peak=%.2fGB gpu=%s", peak_vram, gpu_mem_gb())
+                    peak_vram = max(peak_vram, _dbg_pre_peak)
+
+                del video_tensor, videos, audio
+                gc.collect()
+                torch.cuda.empty_cache()
+            except BaseException:
+                logger.exception(
+                    "ref2va decode failed -- freeing partial buffers and restoring the steady "
+                    "state before re-raising (so the next request does not inherit a corrupted "
+                    "resident set)"
+                )
+                gc.collect()
+                torch.cuda.empty_cache()
+                try:
+                    _restore_decode_steady_state_ref()
+                except Exception:
+                    # 復元自体の失敗で元の decode 例外を潰さない(原因情報は元例外側にある)。
+                    logger.exception("steady-state restore after ref2va decode failure also failed")
+                raise
+
+            _restore_decode_steady_state_ref()
 
         if progress:
             progress.update(phase="muxing", message="mp4へmux中...")
         ref_mode = "ref2i" if still else "ref2va"
         job_stub = f"{ref_mode}_{int(t_start)}"
         mp4_path = self.output_dir / f"{job_stub}.mp4"
+        _t_mux0 = time.time()
         _mux_mp4(frames_uint8, audio_np, sampling_rate, FPS, mp4_path, mute=mute)
+        mux_time = time.time() - _t_mux0
 
         # 参照付き静止画モード: 中央フレームを PNG として書き出す (generate() の still と同じ)
         png_path = None
@@ -8872,6 +9278,13 @@ class MiniMaxH3Runner:
                 for index, kind in enumerate(kinds)
             ],
         }
+        # --- 以下は新フラグ (H3_REF_LATENT_CACHE / H3_DECODE_*) が有効なときだけ付く追加キー ---
+        # (フラグ OFF の既定では従来と同一のキー集合を返す)
+        if H3_REF_LATENT_CACHE:
+            result["ref_latent_cache"] = ref_latent_cache_status
+        if decode_info is not None:
+            result["decode_mode"] = decode_info
+            result["mux_time_s"] = round(mux_time, 2)
         if progress:
             progress.update(phase="done", message="完了", result_path=str(png_path) if png_path else str(mp4_path))
         logger.info("ref2va generation done: %s",
