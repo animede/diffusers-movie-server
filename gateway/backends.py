@@ -205,6 +205,49 @@ H3_PRESETS = {
                     "実カード未確認(バラスト模擬)。",
         vram_hint="ref2va peak 29.06GB / 成立する空き 29GiB / ホストRAM pinned ~15GiB",
     ),
+    "dual-realtime-ref2va": Preset(
+        name="dual-realtime-ref2va",
+        # ref2va の連続生成をリアルタイム化する 2GPU 構成(GPU0=denoise、GPU1=decode)。
+        # **gpus="0,1" 必須**(H3_DECODE_DEVICE=cuda:1 が2枚目の可視GPUを指す)。
+        # 実測根拠(2026-10-05、RTX PRO 6000 + RTX PRO 5000、commits 579b761/9c67d90):
+        #   384×704・7.29s クリップ(175f)・turbo(lightx2v)4step・短辺1024・連続9本:
+        #     352×640 … cadence 6.47s(実時間の 0.89 倍)/ denoise 5.4〜5.6s / GPU1 decode 4.0s
+        #     (ハーネス実測 scratchpad runs3/lx352.json。GPU0 peak 49.8GB / GPU1 5.7GB)
+        #   解像度・短辺はリクエスト側で指定する(プリセットは常駐・経路のみを決める)。
+        # 構成要素:
+        #   H3_PRUNED_QUANT=int8dyn-convrot + H3_PRUNED_COMPILE=3 … ConvRot int8 を
+        #     ブロック単位 torch.compile(初回リクエストに +10〜13s のコンパイルが乗る)
+        #   H3_REF_LATENT_CACHE … 同一参照画像の VAE エンコードをスキップ(bit 一致)
+        #   H3_DECODE_STREAM + H3_DECODE_DEVICE=cuda:1 … denoise 完了でロックを手放し
+        #     decode を GPU1 で次リクエストと並行(latent はホスト経由 4〜5MB/本)
+        #   H3_DECODE_VAE=light … LynnReal light VAE(decode 1.3倍速、同一 latent 比較
+        #     PSNR 40dB/SSIM 0.991。ライセンスは minimax-h3-community = H3 本体と同じ)
+        # 注意:
+        #  - PDMD 2-NFE LoRA(さらに高速)は品質(質感荒れ)でユーザー判断により不採用。
+        #    turbo トグル(lightx2v 4step)で使うこと。
+        #  - GPU1 decode の出力は GPU0 decode と bit 一致しない(PSNR 37.6dB、目視同等)。
+        #  - 単機 96GB+48GB での実測。HyperFlow / H3_LOWVRAM=group と排他。
+        env={
+            "H3_LOWVRAM": "1",
+            "H3_TE_PRUNE": "1",
+            "H3_VIDEO_VAE_FP16": "1",
+            "H3_TRANSFORMER_QUANT": "int8",
+            "H3_PRUNED": "1",
+            "H3_PRUNED_QUANT": "int8dyn-convrot",
+            "H3_PRUNED_COMPILE": "3",
+            "H3_KEEP_REF2VA": "1",
+            "H3_KEEP_REF2VA_VAE": "1",
+            "H3_REF_LATENT_CACHE": "1",
+            "H3_DECODE_STREAM": "1",
+            "H3_DECODE_DEVICE": "cuda:1",
+            "H3_DECODE_VAE": "light",
+        },
+        description="ref2va 連続生成のリアルタイム構成(2GPU: denoise + decode 分離、"
+                    "pruned int8 compile + latent キャッシュ + light VAE)。352×640・7.3秒"
+                    "クリップで cadence 6.47s(実時間の 0.89 倍)。gpus=\"0,1\" 必須。"
+                    "HyperFlow と排他。",
+        vram_hint="GPU0 peak ~50GB / GPU1 ~6GB / cadence 6.47s(352×640・7.3s クリップ)",
+    ),
     "48gb-dual": Preset(
         name="48gb-dual",
         # README「48GB級(推奨: 高速化フル)」そのまま(2GPU分担)。
@@ -530,6 +573,15 @@ def _validate_combination(backend_name: str, env: dict[str, str]) -> None:
                     f"{len(visible.split(','))}枚)の範囲外です。CUDA は可視GPUを "
                     "0 から再番号付けするため、例えば 2GPU分担なら gpus=\"0,1\" "
                     "(または gpus 省略)にしてください")
+        # H3_DECODE_DEVICE(decode 用 GPU)も同じ可視範囲チェック(dual-realtime-ref2va 等)。
+        dec_device = env.get("H3_DECODE_DEVICE", "")
+        m2 = re.match(r"^cuda:(\d+)$", dec_device)
+        if visible is not None and m2 is not None:
+            if int(m2.group(1)) >= len(visible.split(",")):
+                raise ValidationError(
+                    f"H3_DECODE_DEVICE={dec_device} は gpus={visible!r}(可視 "
+                    f"{len(visible.split(','))}枚)の範囲外です。2GPU 構成は "
+                    "gpus=\"0,1\"(または gpus 省略)にしてください")
     if backend_name == "ltx25":
         precision = env.get("LTX25_TRANSFORMER_PRECISION")
         if precision is not None and precision not in ("nf4", "fp8", "bf16", "nvfp4"):
