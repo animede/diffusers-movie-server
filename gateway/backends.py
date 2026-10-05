@@ -246,7 +246,52 @@ H3_PRESETS = {
                     "pruned int8 compile + latent キャッシュ + light VAE)。352×640・7.3秒"
                     "クリップで cadence 6.47s(実時間の 0.89 倍)。gpus=\"0,1\" 必須。"
                     "HyperFlow と排他。",
-        vram_hint="GPU0 peak ~50GB / GPU1 ~6GB / cadence 6.47s(352×640・7.3s クリップ)",
+        vram_hint="GPU0 peak 49.8GB(96GB級必須・48GBには不可 → -32gb 版へ)/ GPU1 ~6GB(8GB級可)/ cadence 6.47s(352×640・7.3s クリップ)",
+    ),
+    "dual-realtime-ref2va-32gb": Preset(
+        name="dual-realtime-ref2va-32gb",
+        # dual-realtime-ref2va の低VRAM版(GPU0 = 32GB 級(RTX 5090)/ 48GB 級向け)。
+        # **gpus="0,1" 必須**。GPU1 は 8GB 級で可(使用 5.6〜5.8GB を窓 7.9GiB で実測)。
+        # 実測根拠(2026-10-05 probe、GPU0 をバラストで制限、352×640・7.29s クリップ・
+        # turbo 4step・連続9本):
+        #   GPU0 窓 46GiB(48GB級) … cadence 6.97s / peak(alloc)27.3GB
+        #   GPU0 窓 30.6GiB(5090級)… cadence 7.03s / peak 27.3GB
+        #   成立下限 = GPU0 の空き約 27.5GiB(26.5GiB は denoise 活性 OOM)
+        #   出力は dual-realtime-ref2va とビット一致(低VRAM 4種は配置換えのみ)。
+        # 追加コスト: cadence +0.3〜0.6s(park 0.3s + TE_STREAM encode +0.2〜0.4s)、
+        # ホスト RAM に pinned 約13GiB + VAE CPU 常駐 約4.5GiB(RSS ~28GiB)。
+        # 注意:
+        #  - 32GB 級は GPU0 の空き 28GiB 以上が必要 = **動画エンジン専有が前提**
+        #    (TTS/LLM は CPU か別ホストへ。ltx25 nvfp4-32gb と同じ条件)。
+        #  - H3_VAE_SPLIT はこの構成で必須(無しだと 32GB 級は denoise OOM)。decode が
+        #    GPU1 に居るため decoder 4.5GiB が GPU0 に一切載らなくなる。
+        #  - H3_REF_PREFIX_PARK と decode 重ねの衝突は commit 547f7e1 で修正済み。
+        env={
+            "H3_LOWVRAM": "1",
+            "H3_TE_PRUNE": "1",
+            "H3_VIDEO_VAE_FP16": "1",
+            "H3_TRANSFORMER_QUANT": "int8",
+            "H3_PRUNED": "1",
+            "H3_PRUNED_QUANT": "int8dyn-convrot",
+            "H3_PRUNED_COMPILE": "3",
+            "H3_KEEP_REF2VA": "1",
+            "H3_KEEP_REF2VA_VAE": "1",
+            "H3_REF_LATENT_CACHE": "1",
+            "H3_DECODE_STREAM": "1",
+            "H3_DECODE_DEVICE": "cuda:1",
+            "H3_DECODE_VAE": "light",
+            "H3_TE_DIET": "1",
+            "H3_VAE_SPLIT": "1",
+            "H3_REF_PREFIX_CACHE_SINGLE": "1",
+            "H3_REF_PREFIX_PARK": "1",
+            "H3_TE_STREAM": "1",
+        },
+        description="ref2va リアルタイムの低VRAM版(GPU0 32GB/48GB 級 + GPU1 8GB 級)。"
+                    "352×640・7.3秒クリップで cadence 7.0s、GPU0 peak 27.3GB(空き 28GiB "
+                    "以上必要)。出力は dual-realtime-ref2va とビット一致。ホスト RAM "
+                    "~28GiB 使用。gpus=\"0,1\" 必須。HyperFlow と排他。",
+        vram_hint="GPU0 peak 27.3GB(空き28GiB以上・32GB級可)/ GPU1 ~6GB(8GB級可)/ "
+                  "cadence 7.0s(352×640・7.3s クリップ)/ ホストRAM ~28GiB",
     ),
     "48gb-dual": Preset(
         name="48gb-dual",
