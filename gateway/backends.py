@@ -258,6 +258,9 @@ H3_PRESETS = {
         #   GPU0 窓 30.6GiB(5090級)… cadence 7.03s / peak 27.3GB
         #   成立下限 = GPU0 の空き約 27.5GiB(26.5GiB は denoise 活性 OOM)
         #   出力は dual-realtime-ref2va とビット一致(低VRAM 4種は配置換えのみ)。
+        # **推奨解像度は 352×608**(リクエスト側で指定。同日の高さ比較実測:
+        #   352×640 cadence 7.16s(余裕 +1.8%)/ 352×608 6.91s(+5.5%)/ 352×576 6.65s。
+        #   608 は 640 と目視同等で、run 間の揺らぎ(±0.15s)を吸収できる)。
         # 追加コスト: cadence +0.3〜0.6s(park 0.3s + TE_STREAM encode +0.2〜0.4s)、
         # ホスト RAM に pinned 約13GiB + VAE CPU 常駐 約4.5GiB(RSS ~28GiB)。
         # 注意:
@@ -287,11 +290,11 @@ H3_PRESETS = {
             "H3_TE_STREAM": "1",
         },
         description="ref2va リアルタイムの低VRAM版(GPU0 32GB/48GB 級 + GPU1 8GB 級)。"
-                    "352×640・7.3秒クリップで cadence 7.0s、GPU0 peak 27.3GB(空き 28GiB "
+                    "推奨 352×608・7.3秒クリップで cadence 6.91s、GPU0 peak 27.3GB(空き 28GiB "
                     "以上必要)。出力は dual-realtime-ref2va とビット一致。ホスト RAM "
                     "~28GiB 使用。gpus=\"0,1\" 必須。HyperFlow と排他。",
         vram_hint="GPU0 peak 27.3GB(空き28GiB以上・32GB級可)/ GPU1 ~6GB(8GB級可)/ "
-                  "cadence 7.0s(352×640・7.3s クリップ)/ ホストRAM ~28GiB",
+                  "cadence 6.91s(推奨 352×608・7.3s クリップ)/ ホストRAM ~28GiB",
     ),
     "48gb-dual": Preset(
         name="48gb-dual",
