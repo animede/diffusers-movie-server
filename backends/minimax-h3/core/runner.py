@@ -5821,7 +5821,9 @@ class MiniMaxH3Runner:
         try:
             from core import pruned as pruned_mod
 
-            snapshot = pruned_mod.pruned_snapshot_dir(H3_PRUNED_REPO)
+            # weights=False: キャッシュロードに bf16 シャードは不要(remote code と
+            # config だけ解決する。シャード削除運用で 38GB の再DLを誘発しないため)。
+            snapshot = pruned_mod.pruned_snapshot_dir(H3_PRUNED_REPO, weights=False)
             tr = pruned_mod.load_pruned_ref_from_cache(
                 cache_dir, snapshot, DEVICE, H3_PRUNED_CONVROT_GROUP, quant=H3_PRUNED_QUANT
             )

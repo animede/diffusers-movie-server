@@ -222,15 +222,30 @@ def get_quant_spec(name: str | None) -> PrunedQuantSpec:
 STATE_FILENAME = PRUNED_QUANT_SPECS["int8dyn-convrot"].state_filename
 
 
-def pruned_snapshot_dir(repo: str) -> Path:
+def pruned_snapshot_dir(repo: str, weights: bool = True) -> Path:
     """pruned リポジトリの transformer_ref を含むスナップショットを解決する。
 
     キャッシュ済みなら即座に返る(snapshot_download は完全なローカルキャッシュに
     対してネットワークを叩かない)。未取得ならここでダウンロードが走る(~38GB)。
+
+    weights=False は量子化済みキャッシュからのロード用: remote code・config 等の
+    小物だけを対象にし、**bf16 重みシャード(~36GB)を対象にしない**。重みシャードは
+    ディスク節約のためキャッシュ作成後に削除してよい運用(2026-10-05、Z-Image fp32
+    削除 = CLAUDE.md 36番と同じ外科手術)にしており、weights=True のパターンで
+    解決すると snapshot_download が欠けたシャードを 38GB 再ダウンロードしてしまう。
     """
     from huggingface_hub import snapshot_download
 
-    path = snapshot_download(repo, allow_patterns=["transformer_ref/*"])
+    if weights:
+        patterns = ["transformer_ref/*"]
+    else:
+        patterns = [
+            "transformer_ref/config.json",
+            "transformer_ref/modeling_minimax_h3_pruned.py",
+            "transformer_ref/adaln_affine.safetensors",
+            "transformer_ref/diffusion_pytorch_model.safetensors.index.json",
+        ]
+    path = snapshot_download(repo, allow_patterns=patterns)
     return Path(path)
 
 
