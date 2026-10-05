@@ -2367,8 +2367,13 @@ def _park_prefix_entry(entry: "_SingleRefPrefixEntry") -> None:
             if t is not None and t.is_cuda:
                 setattr(layer, name, t.detach().to("cpu").pin_memory())
     entry.parked = True
-    gc.collect()
-    torch.cuda.empty_cache()
+    # decode を別ストリーム/別 GPU で重ねている間 (H3_DECODE_STREAM / H3_DECODE_DEVICE) は
+    # empty_cache を呼ばない: 全デバイスのキャッシュを解放するため、前リクエストの decode と
+    # 衝突して "illegal memory access" になる (2026-10-05 probe で再現: REF_PREFIX_PARK + DECODE_DEVICE)。
+    # 解放した 0.2GiB はアロケータのキャッシュに残り、次の denoise で再利用される。
+    if not (H3_DECODE_STREAM or H3_DECODE_DEVICE):
+        gc.collect()
+        torch.cuda.empty_cache()
     logger.info("single ref-prefix cache parked on CPU (%.2fGiB) in %.2fs. gpu=%s",
                 entry.nbytes / 1024**3, time.time() - t0, gpu_mem_gb())
 
