@@ -386,3 +386,124 @@ def load_pruned_ref_from_cache(
         "(%s, quant=%s, convrot re-marked=%d)", time.time() - t0, cache_dir, spec.name, n,
     )
     return tr
+
+
+# ---- H3_PRUNED_COMPILE: ConvRot 層の torch.compile(2026-10-05 probe) -----------------------
+#
+# 動機: torchao 0.17 の int8 動的量子化 eager 経路は per-token 量子化/逆量子化が未融合で
+# bf16 GEMM の 2〜3 倍遅い。torch.compile で融合すると単層 3.4〜3.6 倍速くなる(マイクロベンチ)。
+# 対象は「ConvRot Linear の forward(入力回転 + 量子化 GEMM)」だけ。LoRA ラッパー
+# (_TurboLoRALinear)・attention(sage)・FBC フックは compile に巻き込まない。
+#
+# remote code の `_rotate` は module 辞書 `_HADAMARD_CACHE`(キーは (size, str(device), dtype))
+# を参照しており、dynamo が辞書アクセスと str(device) で graph break する。同値の
+# バッファ版(Hadamard 行列を各層の非 persistent buffer として持つ)に差し替える。
+# 演算は matmul(reshape(-1, K/g, g), H) -> reshape と _rotate と完全に同一(bit 一致を
+# `check_rotate_bit_exact()` で確認できる)。remote code ファイルは書き換えず、
+# モジュールの __class__ だけをサブクラスへ差し替える(PatchifyLinear と同じ流儀)。
+# state_dict のキーは変わらず(buffer は persistent=False)、キャッシュ形式は不変。
+
+_COMPILABLE_CLS: dict[int, type] = {}
+
+
+def _compilable_cls(mod):
+    key = id(mod.MiniMaxH3ConvRotLinear)
+    if key in _COMPILABLE_CLS:
+        return _COMPILABLE_CLS[key]
+    import torch.nn.functional as F
+
+    base_cls = mod.MiniMaxH3ConvRotLinear
+
+    class MiniMaxH3ConvRotLinearBuf(base_cls):
+        """ConvRot Linear の buffer 版(compile 可能)。`_had` は [g, g] の Hadamard(入力 dtype)。"""
+
+        def forward(self, input: torch.Tensor) -> torch.Tensor:  # noqa: A002
+            had = self._had
+            if input.dtype != had.dtype:
+                # 想定外の dtype(通常 bf16 のみ)。remote code の経路へ退避(graph break するが正しい)。
+                return base_cls.forward(self, input)
+            shape = input.shape
+            g = self.convrot_groupsize
+            x = torch.matmul(input.reshape(-1, shape[-1] // g, g), had).reshape(shape)
+            return F.linear(x, self.weight, self.bias)
+
+    _COMPILABLE_CLS[key] = MiniMaxH3ConvRotLinearBuf
+    return MiniMaxH3ConvRotLinearBuf
+
+
+def patch_convrot_buffers(transformer, mod, dtype=torch.bfloat16) -> int:
+    """全 ConvRot 層を buffer 版クラスへ差し替える(重みは触らない)。差し替えた層数を返す。"""
+    cls = _compilable_cls(mod)
+    n = 0
+    shared: dict[tuple, torch.Tensor] = {}
+    for module in transformer.modules():
+        if not isinstance(module, mod.MiniMaxH3ConvRotLinear):
+            continue
+        g = module.convrot_groupsize
+        dev = module.weight.device
+        key = (g, str(dev), dtype)
+        if key not in shared:
+            # remote code と同一の関数・同一の引数で作る(= _rotate が使う行列と bit 一致)。
+            shared[key] = mod._hadamard(g, dev, dtype).clone()
+        module.__class__ = cls
+        module.register_buffer("_had", shared[key], persistent=False)
+        n += 1
+    return n
+
+
+def check_rotate_bit_exact(mod, group_size: int = 256, device="cuda", dtype=torch.bfloat16) -> bool:
+    """buffer 版の回転が remote code の `_rotate` と torch.equal で一致するか(単体確認用)。"""
+    torch.manual_seed(0)
+    ok = True
+    had = mod._hadamard(group_size, device, dtype).clone()
+    for shape in [(1, group_size * 4), (777, group_size * 21), (3, 5, group_size * 2)]:
+        x = torch.randn(*shape, device=device, dtype=dtype)
+        ref = mod._rotate(x, group_size)
+        s = x.shape
+        new = torch.matmul(x.reshape(-1, s[-1] // group_size, group_size), had).reshape(s)
+        ok = ok and torch.equal(ref, new)
+    return ok
+
+
+def compile_convrot_layers(transformer, mod, *, dynamic: bool = True, recompile_limit: int = 64) -> int:
+    """全 ConvRot 層(buffer 版)を `module.compile()` する(遅延: 初回 forward でコンパイル)。
+
+    torch.compile は dynamic=True(トークン数 M がリクエストごとに変わるため)。
+    dynamo の per-code キャッシュ上限は層の重み shape の種類 × 動的 shape で足りなくなり得る
+    ので引き上げる(プロセス全体の dynamo 設定だが、他に compile を使う箇所は無い)。
+    inductor / torch 全体の matmul precision 設定には触らない。
+    """
+    import torch._dynamo
+
+    n = patch_convrot_buffers(transformer, mod)
+    cfg = torch._dynamo.config
+    for attr in ("recompile_limit", "cache_size_limit"):
+        if hasattr(cfg, attr) and getattr(cfg, attr) < recompile_limit:
+            setattr(cfg, attr, recompile_limit)
+    if hasattr(cfg, "accumulated_recompile_limit"):
+        cfg.accumulated_recompile_limit = max(cfg.accumulated_recompile_limit, recompile_limit * 8)
+    if hasattr(cfg, "accumulated_cache_size_limit"):
+        cfg.accumulated_cache_size_limit = max(cfg.accumulated_cache_size_limit, recompile_limit * 8)
+    cls = _compilable_cls(mod)
+    m = 0
+    for module in transformer.modules():
+        if type(module) is cls:
+            module.compile(dynamic=dynamic)
+            m += 1
+    logger.info("H3_PRUNED_COMPILE: ConvRot buffer-patched %d layers, torch.compile(dynamic=%s) on %d", n, dynamic, m)
+    return m
+
+
+def compile_turbo_wrappers(transformer, wrapper_cls, *, dynamic: bool = True) -> int:
+    """(実験, H3_PRUNED_COMPILE=2) turbo LoRA ラッパーのうち base が buffer 版 ConvRot のものを compile する。
+
+    `y = base(x) + scale * B(A(x))` を 1 グラフにして mul/add を融合する。ラッパーは `.enabled`
+    (python bool)を forward で見るため、トグルで 1 回だけ再コンパイルされる。
+    """
+    n = 0
+    for module in transformer.modules():
+        if isinstance(module, wrapper_cls) and type(module.base) in _COMPILABLE_CLS.values():
+            module.compile(dynamic=dynamic)
+            n += 1
+    logger.info("H3_PRUNED_COMPILE=2: turbo LoRA wrappers compiled on %d layers", n)
+    return n

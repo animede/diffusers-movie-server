@@ -829,6 +829,22 @@ def api_ref2va(
             _current_progress = progress
         interrupt_controller.begin(job_id)
 
+        # H3_DECODE_STREAM=1 のとき、runner が denoise 完了直後 (decode 開始前) に
+        # `_release_gen_lock()` を呼ぶ。そこで生成ロックと中断コントローラを手放し、decode+mux の
+        # 間に次の /api/ref2va を受け付けられるようにする。1回だけ実行されるようにガードし、
+        # 下の finally は「まだ手放していない場合だけ」手放す (二重 release / 次ジョブの
+        # interrupt 状態の巻き添えを防ぐ)。フラグ OFF (既定) では callback は None で、
+        # 従来どおり finally が解放する。
+        _gen_lock_released = False
+
+        def _release_gen_lock():
+            nonlocal _gen_lock_released
+            if _gen_lock_released:
+                return
+            _gen_lock_released = True
+            interrupt_controller.end()
+            _generation_lock.release()
+
         try:
             result = runner.generate_ref2va(
                 prompt=prompt.strip(),
@@ -848,6 +864,7 @@ def api_ref2va(
                 still_frames=frames,
                 reference_image_short_edge=reference_image_short_edge,
                 vocal_lock=vocal_lock,
+                on_denoise_done=_release_gen_lock if runner.decode_overlap_active() else None,
             )
             result["job_id"] = job_id
             result["video_url"] = f"/outputs/{Path(result['mp4_path']).name}"
@@ -865,8 +882,7 @@ def api_ref2va(
             progress.update(phase="error", error=str(e))
             raise HTTPException(500, f"ref2va generation failed: {e}")
         finally:
-            interrupt_controller.end()
-            _generation_lock.release()
+            _release_gen_lock()
     finally:
         for tmp_path in tmp_paths:
             tmp_path.unlink(missing_ok=True)
