@@ -507,3 +507,26 @@ def compile_turbo_wrappers(transformer, wrapper_cls, *, dynamic: bool = True) ->
             n += 1
     logger.info("H3_PRUNED_COMPILE=2: turbo LoRA wrappers compiled on %d layers", n)
     return n
+
+
+def compile_transformer_blocks(transformer, *, dynamic: bool = True) -> int:
+    """(probe, H3_PRUNED_COMPILE=3) transformer の各ブロック (50) を compile する。
+
+    ブロック内の ConvRot / turbo LoRA ラッパーは既に compile 済み (level 1/2) で、外側の compile に
+    inline される。目的は eager に残る norms・AdaLN 変調 (index_select + mul/add)・残差・rope・swiglu の融合。
+    attention の本体 (`dispatch_attention_fn`: sage の CUDA 拡張) は dynamo では trace できないので
+    `torch._dynamo.disable` で包み、きれいな graph break にする。
+    """
+    import torch._dynamo
+    from diffusers.models.transformers import transformer_minimax_h3 as tm
+
+    if not getattr(tm.dispatch_attention_fn, "_h3_dynamo_disabled", False):
+        wrapped = torch._dynamo.disable(tm.dispatch_attention_fn)
+        wrapped._h3_dynamo_disabled = True
+        tm.dispatch_attention_fn = wrapped
+    n = 0
+    for block in transformer.transformer_blocks:
+        block.compile(dynamic=dynamic)
+        n += 1
+    logger.info("H3_PRUNED_COMPILE=3: %d transformer blocks compiled (dynamic=%s)", n, dynamic)
+    return n

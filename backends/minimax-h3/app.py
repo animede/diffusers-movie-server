@@ -765,6 +765,7 @@ def api_ref2va(
     プロセス再起動不要)。詳細は core/runner.py の H3_VOCAL_LOCK コメント参照。
     """
     global _current_progress
+    runner_mod._tl("api_entry")
 
     num_inference_steps = resolve_num_inference_steps(num_inference_steps, turbo)
 
@@ -819,10 +820,12 @@ def api_ref2va(
             except Exception as e:
                 raise HTTPException(400, f"references[{len(built_references)}] ({upload.filename}) の読み込みに失敗: {e}")
 
+        runner_mod._tl("api_refs_built")
         acquired = _generation_lock.acquire(blocking=False)
         if not acquired:
             raise HTTPException(409, "別の生成が進行中です。しばらく待ってから再試行してください。")
 
+        runner_mod._tl("api_lock_acquired")
         job_id = uuid.uuid4().hex[:12]
         progress = ProgressState(job_id=job_id, phase="starting", started_at=time.time())
         with _progress_guard:
