@@ -5100,6 +5100,28 @@ class MiniMaxH3Runner:
                 logger.warning("torch._C._host_emptyCache missing -- pinned host cache not released")
         logger.info("transformer_ref freed. gpu=%s ram=%s", gpu_mem_gb(), ram_gb())
 
+    def _drain_deferred_decode(self, caller: str, timeout_s: float = 30.0) -> None:
+        """base transformer のロード/解放を始める前に、実行中の deferred decode を待ち切る。
+
+        この機では「cuda:0 への大量 H2D(base 34GB のシャードロード)と cuda:1 の
+        decode(cuBLASLt)を同時に走らせる」と CUBLAS_STATUS_INTERNAL_ERROR ->
+        illegal memory access でプロセスの CUDA コンテキストごと壊れる(2026-10-06
+        実運用+ストレスで再現。P2P 全ゼロ・クロスデバイス empty_cache と並ぶ
+        このマシン固有のクロスデバイス罠)。decode は ~4s で終わるので待つのが最小対処。
+        生成ロックは呼び出し側が保持しており、待っている間に新しい decode が
+        生まれることはない(新 decode は ref2va の denoise 完了からしか始まらない)。
+        """
+        if not (self._decode_overlap_configured() if hasattr(self, "_decode_overlap_configured")
+                else (H3_DECODE_STREAM or H3_DECODE_DEVICE)):
+            return
+        if not self._decode_lock.locked():
+            return
+        t0 = time.time()
+        logger.info("%s: deferred decode の完了を待ってから base をロードします", caller)
+        while self._decode_lock.locked() and time.time() - t0 < timeout_s:
+            time.sleep(0.05)
+        logger.info("%s: deferred decode 完了 (%.2fs 待ち)", caller, time.time() - t0)
+
     def _keep_ref2va_coexist(self, caller: str) -> bool:
         """`H3_KEEP_REF2VA=1` で常駐している ref2va スタック (transformer_ref [+ TE]) を、base
         transformer を使うリクエスト (t2va/fl2va/t2i) の間も残してよいか (= 両常駐が成立するか)。
@@ -5119,8 +5141,15 @@ class MiniMaxH3Runner:
             # 32GB/48GB 級向けの低VRAM構成 (TE を CPU から流す・prefix を退避・VAE を分割配置)。
             # 常駐の意味が通常構成と異なり、base 同居は未検証かつそもそも収支が合わないので常に解放。
             return False
-        torch.cuda.empty_cache()
-        free_gb = torch.cuda.mem_get_info(DEVICE)[0] / 1024**3
+        # ここで empty_cache() を呼んではいけない: H3_DECODE_STREAM/H3_DECODE_DEVICE の
+        # 重ね実行中は前リクエストの decode が cuda:1 で走っており、empty_cache は全デバイス
+        # 対象のため "illegal memory access" で CUDA コンテキストごと壊す (2026-10-06 実運用で
+        # 発生。547f7e1 の park 側と同じ罠を本判定自身が踏んでいた)。代わりに、この
+        # プロセスのアロケータが抱える「reserved だが未割当」のキャッシュ分を空きに足し込む
+        # (empty_cache が返すのはこの分なので、測定精度は同等)。
+        free_gb = (torch.cuda.mem_get_info(DEVICE)[0]
+                   + torch.cuda.memory_reserved(DEVICE) - torch.cuda.memory_allocated(DEVICE)
+                   ) / 1024**3
         if H3_VRAM_LIMIT_GB:
             free_gb = min(free_gb, float(H3_VRAM_LIMIT_GB) * 1e9 / 1024**3 - torch.cuda.memory_reserved(DEVICE) / 1024**3)
         te_resident = self._text_encoder_loaded or self._te_external
@@ -7221,6 +7250,7 @@ class MiniMaxH3Runner:
                     self._active_variant = None
                 # H3_KEEP_REF2VA=1 + 空きVRAM十分: ref2va スタックを解放せず base を同居させる
                 # (`_keep_ref2va_coexist` の docstring / H3_KEEP_REF2VA_COEXIST のモジュールコメント)。
+                self._drain_deferred_decode("generate")
                 coexist_ref2va = self._keep_ref2va_coexist("generate")
                 if not coexist_ref2va:
                     self._free_transformer_ref()
@@ -8237,6 +8267,7 @@ class MiniMaxH3Runner:
             if not H3_KEEP_TRANSFORMER:
                 self._free_transformer()
                 self._active_variant = None
+            self._drain_deferred_decode("generate_still_batch")
             coexist_ref2va = self._keep_ref2va_coexist("generate_still_batch")
             if not coexist_ref2va:
                 self._free_transformer_ref()
