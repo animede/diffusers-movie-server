@@ -1283,6 +1283,25 @@ def _keep_ref2va_active() -> bool:
     return H3_KEEP_REF2VA and H3_LOWVRAM
 
 
+# `H3_KEEP_REF2VA=1` 専用 (2026-10-06)。**ref2va スタック (TE + transformer_ref) を常駐させたまま
+# t2va/fl2va/t2i の base transformer を同居ロードする** (両常駐)。
+#
+# 動機 (実測): r-n-v の H3 運用では、会話ターンの合間に待機プール補充 (fl2va = base transformer)
+# が走る。従来は fl2va の入口が `_free_transformer_ref()` で transformer_ref を、さらに encode 後に
+# `_free_text_encoder(force=True)` で TE を解放していたため、次の会話ターンの先頭 ref2va が TE +
+# transformer_ref の再ロードを払い、6秒 → 22〜40秒に劣化した。
+# 収支 (RTX PRO 6000 96GB): TE 17.4 + transformer_ref(pruned) 22.2 + VAE ほか ~6 = ~46〜50GB 常駐
+# + base transformer(int8) ~34.3 + denoise 活性化 ~6.4 = ~85〜90GB。96GB 級では収まるが、
+# 32GB/48GB 級 (低VRAM構成) では収まらないので、**実行時に空きVRAMを測って判定**し、足りなければ
+# 従来どおり解放する (黙って OOM させない)。判定根拠は `_keep_ref2va_coexist()` が INFO ログ1行で出す。
+#   H3_KEEP_REF2VA_COEXIST=0                : 両常駐を使わない (従来挙動: 常に解放)
+#   H3_KEEP_REF2VA_COEXIST_MIN_FREE_GB=42.7 : 同居に必要な空き (base 34.3 + 活性化 6.4 + 余裕 2.0)。
+#                                             TE 未ロードなら +17.5GB を自動加算する。
+# KEEP_REF2VA なし (既定) ではどちらも参照されず、挙動は 1 バイトも変わらない。
+H3_KEEP_REF2VA_COEXIST = os.environ.get("H3_KEEP_REF2VA_COEXIST", "1").strip() != "0"
+H3_KEEP_REF2VA_COEXIST_MIN_FREE_GB = float(os.environ.get("H3_KEEP_REF2VA_COEXIST_MIN_FREE_GB", "42.7"))
+
+
 # EXPERIMENTAL, opt-in (2026-10-01). `H3_TE_DIET=1`: bnb-4bit text_encoder の VRAM ダイエット。
 # LTX-2.5 の `LTX25_TE_DIET` (backends/ltx2_5/app/tediet.py) と同じ発想を H3 の TE
 # (Qwen3-VL-32B, H3_TE_PRUNE=1 の 51 層) に適用する。H3 が読むのは
@@ -5081,6 +5100,41 @@ class MiniMaxH3Runner:
                 logger.warning("torch._C._host_emptyCache missing -- pinned host cache not released")
         logger.info("transformer_ref freed. gpu=%s ram=%s", gpu_mem_gb(), ram_gb())
 
+    def _keep_ref2va_coexist(self, caller: str) -> bool:
+        """`H3_KEEP_REF2VA=1` で常駐している ref2va スタック (transformer_ref [+ TE]) を、base
+        transformer を使うリクエスト (t2va/fl2va/t2i) の間も残してよいか (= 両常駐が成立するか)。
+
+        True なら呼び出し側は `_free_transformer_ref()` と encode 後の `_free_text_encoder(force=True)`
+        をスキップする。False なら従来どおり解放する。判定は実行時の空きVRAMで行う:
+        空き >= `H3_KEEP_REF2VA_COEXIST_MIN_FREE_GB` (+ TE 未ロードなら 17.5GB)。
+        `H3_VRAM_LIMIT_GB` が設定されていれば (上限 - このプロセスの reserved) との小さい方を空きとする。
+        判定結果と根拠は INFO ログ 1 行。KEEP_REF2VA でない / transformer_ref が未ロード (守るものが
+        無い) ときは無言で False (従来挙動)。呼び出しは `_load_lock` の中で行うこと。
+        """
+        if not (_keep_ref2va_active() and H3_KEEP_REF2VA_COEXIST):
+            return False
+        if not self._transformer_ref_loaded:
+            return False
+        if H3_TE_STREAM or H3_REF_PREFIX_PARK or H3_VAE_SPLIT:
+            # 32GB/48GB 級向けの低VRAM構成 (TE を CPU から流す・prefix を退避・VAE を分割配置)。
+            # 常駐の意味が通常構成と異なり、base 同居は未検証かつそもそも収支が合わないので常に解放。
+            return False
+        torch.cuda.empty_cache()
+        free_gb = torch.cuda.mem_get_info(DEVICE)[0] / 1024**3
+        if H3_VRAM_LIMIT_GB:
+            free_gb = min(free_gb, float(H3_VRAM_LIMIT_GB) * 1e9 / 1024**3 - torch.cuda.memory_reserved(DEVICE) / 1024**3)
+        te_resident = self._text_encoder_loaded or self._te_external
+        need_gb = H3_KEEP_REF2VA_COEXIST_MIN_FREE_GB + (0.0 if te_resident else 17.5)
+        ok = free_gb >= need_gb
+        logger.info(
+            "%s: H3_KEEP_REF2VA 両常駐判定 -> %s (空きVRAM %.1fGB %s 必要 %.1fGB = base 34.3 + 活性化 6.4 "
+            "+ 余裕 2.0%s)。%s",
+            caller, "ref2va スタック (transformer_ref + TE) を常駐のまま base を同居ロード" if ok else "解放して従来どおり",
+            free_gb, ">=" if ok else "<", need_gb, "" if te_resident else " + TE再ロード 17.5",
+            "" if ok else "VRAM不足 (低VRAM構成) のため transformer_ref を解放する",
+        )
+        return ok
+
     # ------------------------------------------------------------------
     # Instant-apply per-request settings (cache/attn/turbo) -- see core/settings.py's
     # module docstring for the full instant-vs-reload split. Every method here is meant
@@ -7133,6 +7187,7 @@ class MiniMaxH3Runner:
         # request-overridden) turbo value, not the raw H3_TURBO_LORA env-var default.
         settings.validate_instant_settings_for_upscale(instant, do_upscale)
 
+        coexist_ref2va = False  # H3_KEEP_REF2VA 両常駐が成立したか (LOWVRAM=1 の分岐でだけ True になりうる)
         with self._load_lock:
             if H3_LOWVRAM:
                 # This mode's whole point is TE (21GB) and transformer (34GB) are never
@@ -7164,7 +7219,11 @@ class MiniMaxH3Runner:
                 if not H3_KEEP_TRANSFORMER:
                     self._free_transformer()
                     self._active_variant = None
-                self._free_transformer_ref()
+                # H3_KEEP_REF2VA=1 + 空きVRAM十分: ref2va スタックを解放せず base を同居させる
+                # (`_keep_ref2va_coexist` の docstring / H3_KEEP_REF2VA_COEXIST のモジュールコメント)。
+                coexist_ref2va = self._keep_ref2va_coexist("generate")
+                if not coexist_ref2va:
+                    self._free_transformer_ref()
                 self._ensure_vaes(progress)
                 self._load_text_encoder(progress)
             elif H3_LOWVRAM_GROUP:
@@ -7466,7 +7525,12 @@ class MiniMaxH3Runner:
                 # tensor that would have needed `_execution_device` to resolve correctly
                 # already exists, materialized on the right device, on `state`.
                 with self._load_lock:
-                    self._free_text_encoder(force=True)
+                    if coexist_ref2va:
+                        # TE も ref2va スタックの一部 (次の ref2va が再ロードを払わないよう残す)。
+                        # encode は済んでおり、収支は _keep_ref2va_coexist で確認済み。
+                        logger.info("generate: text_encoder を解放せず常駐のまま base transformer をロード (H3_KEEP_REF2VA 両常駐)")
+                    else:
+                        self._free_text_encoder(force=True)
                     self._ensure_transformer(progress)
         elif TE_QUANT == "bnb-4bit" and is_fl2va:
             # bnb-4bit + fl2va only: transformer(66.3) + TE-nf4(21.0) + vae pair(11.0)
@@ -8173,7 +8237,9 @@ class MiniMaxH3Runner:
             if not H3_KEEP_TRANSFORMER:
                 self._free_transformer()
                 self._active_variant = None
-            self._free_transformer_ref()
+            coexist_ref2va = self._keep_ref2va_coexist("generate_still_batch")
+            if not coexist_ref2va:
+                self._free_transformer_ref()
             self._ensure_vaes(progress)
             self._load_text_encoder(progress)
         torch.cuda.reset_peak_memory_stats()
@@ -8239,7 +8305,10 @@ class MiniMaxH3Runner:
 
         # --- TE を解放して transformer を1回だけロード ---
         with self._load_lock:
-            self._free_text_encoder(force=True)
+            if coexist_ref2va:
+                logger.info("generate_still_batch: text_encoder を解放せず常駐のまま base transformer をロード (H3_KEEP_REF2VA 両常駐)")
+            else:
+                self._free_text_encoder(force=True)
             self._ensure_transformer(progress)
         self.apply_instant_settings(self._pipe.transformer, instant, is_ref=False, progress=progress)
 
