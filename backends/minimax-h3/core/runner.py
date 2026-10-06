@@ -1722,8 +1722,20 @@ def _maybe_hyperflowify_denoise_step(step):
 
 
 # MINIMAX_H3_MIN_DURATION..MAX_DURATION = 5..15s at 24fps, aligned to 17*n+5.
-MIN_SECONDS = 5.0
+# H3_MIN_SECONDS: 既定 5.0(従来どおり)。r-n-v の会話初回チャンク短縮 probe 用に
+# 下限を下げられるようにした(2026-10-06)。73f=3.04s 等の短尺はモデルの学習分布外の
+# 可能性があるため、品質確認なしで本番の既定を下げないこと。
+MIN_SECONDS = float(os.environ.get("H3_MIN_SECONDS", "5.0"))
 MAX_SECONDS = 15.0
+if MIN_SECONDS < 5.0:
+    # diffusers 側にも min_duration=5.0 のバリデーションがある(before_encoder の
+    # Ref2VASetupStep と before_denoise の PrepareLayoutStep)。H3_MIN_SECONDS で
+    # 下限を下げた場合はプロセス全体でプロパティを合わせる(_relaxed_min_duration()
+    # と同じクラスプロパティ差し替え。既定 5.0 のときは一切触らない)。
+    from diffusers.modular_pipelines.minimax_h3.modular_pipeline import (
+        MiniMaxH3ModularPipeline as _MMP,
+    )
+    _MMP.min_duration = property(lambda self, _v=MIN_SECONDS: _v)
 FPS = 24
 
 # 静止画モード (`generate(still=True)`) のフレーム数の選択肢。値は align_num_frames の
