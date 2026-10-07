@@ -250,6 +250,11 @@ H3_PRESETS = {
             # これが無いと run.sh 既定の ref2v 8step が base にも転用され、待機だけ
             # ソフトな絵になる(2026-10-07 実測: ラプラシアン分散 58->100 で発話と同水準に)。
             "H3_TURBO_LORA_FILE_BASE": "minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors",
+            # 待機(fl2va)の入口は「VAE 退避(pageable 2.3s)→ base ロード 4.2s」で、
+            # ここに会話ターンが衝突すると中断が効くまで最大 ~6.5s 待つ(2026-10-07 実測)。
+            # pinned 化で退避が 0.24s になり窓が縮む。ref2va 定常(VAE 常駐)には影響なし、
+            # 出力フレーム完全一致。pinned ホスト RAM +5.4GiB(commit ae0bfe7)。
+            "H3_VAE_PINNED": "1",
         },
         description="ref2va 連続生成のリアルタイム構成(2GPU: denoise + decode 分離、"
                     "pruned int8 compile + latent キャッシュ + light VAE)。352×640・7.3秒"
@@ -301,6 +306,11 @@ H3_PRESETS = {
             # これが無いと run.sh 既定の ref2v 8step が base にも転用され、待機だけ
             # ソフトな絵になる(2026-10-07 実測: ラプラシアン分散 58->100 で発話と同水準に)。
             "H3_TURBO_LORA_FILE_BASE": "minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors",
+            # 待機(fl2va)の入口は「VAE 退避(pageable 2.3s)→ base ロード 4.2s」で、
+            # ここに会話ターンが衝突すると中断が効くまで最大 ~6.5s 待つ(2026-10-07 実測)。
+            # pinned 化で退避が 0.24s になり窓が縮む。ref2va 定常(VAE 常駐)には影響なし、
+            # 出力フレーム完全一致。pinned ホスト RAM +5.4GiB(commit ae0bfe7)。
+            "H3_VAE_PINNED": "1",
             "H3_TE_DIET": "1",
             "H3_VAE_SPLIT": "1",
             "H3_REF_PREFIX_CACHE_SINGLE": "1",
