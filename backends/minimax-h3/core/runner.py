@@ -7959,6 +7959,12 @@ class MiniMaxH3Runner:
         if os.environ.get("H3_DEBUG_MEM_DIAG") == "1":
             _log_gpu_tensor_diag("post-denoise, pre-decode (t2va)")
 
+        # denoise 後〜mux までにチェックが無いと、中断要求が届いても decode+vocoder+mux
+        # (~4s)を完走するまで GPU ロックを握り続ける。r-n-v の会話ターンが待機クリップ
+        # (fl2va)の追い生成と衝突したとき、初回チャンクが丸ごとこの分だけ遅れることを
+        # 実測で確認した(2026-10-07: 衝突ターンは 9.6〜9.9s wall、非衝突は 5.0〜6.5s)。
+        interrupt_controller.check()
+
         # --- decode ---
         if progress:
             progress.update(phase="decoding", message="動画/音声をデコード中...")
@@ -8117,6 +8123,11 @@ class MiniMaxH3Runner:
             raise
 
         _restore_decode_steady_state()
+
+        # decode 完了直後にも中断を拾う(上の pre-decode チェックと同じ理由。
+        # decode 中に届いた中断要求はここで初めて観測できる — mux は CPU 処理だが
+        # 完走まで生成ロックを握るため、ここで打ち切れば次ジョブが即座に通る)。
+        interrupt_controller.check()
 
         if progress:
             progress.update(phase="muxing", message="mp4へmux中...")
