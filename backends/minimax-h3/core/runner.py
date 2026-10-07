@@ -5904,7 +5904,7 @@ class MiniMaxH3Runner:
             name = "transformer_ref_int8" if is_ref else "transformer_int8"
         return H3_TRANSFORMER_PREQUANT_DIR / name
 
-    def _transformer_prequant_metadata(self) -> dict:
+    def _transformer_prequant_metadata(self, pruned: bool = False) -> dict:
         """キャッシュ無効化用のメタデータ。保存時に `meta.json` として書き込み、
         ロード時にこれと一致するかを確認する。一致しなければキャッシュは無効
         (作り直す) 扱い -- ソースチェックポイントが更新された、torchao がバージョン
@@ -5934,9 +5934,12 @@ class MiniMaxH3Runner:
             # 定義時点の pristine スナップショットを使う(定義箇所のコメント参照)。
             "modules_to_not_convert": sorted(_H3_INT8_MODULES_TO_NOT_CONVERT_PRISTINE),
         }
-        if H3_PRUNED:
-            # pruned 時のみキーを追加する(非 pruned のメタデータを一切変えない =
-            # 既存キャッシュ transformer_int8/transformer_ref_int8 を無効化しない)。
+        if pruned:
+            # 【2026-10-07 修正】pruned キーを足すのは「pruned キャッシュの検証/保存」の
+            # ときだけ(引数 pruned)。旧実装は H3_PRUNED(プロセス全体のフラグ)で分岐して
+            # いたため、H3_PRUNED=1 運用では base 用 transformer_int8 の meta にまで
+            # pruned の quant_config が混入し、H3_PRUNED_QUANT を切り替えただけで無関係な
+            # base キャッシュが無効化 -> 削除済み bf16 シャード 62GB の再DLが走った(実機)。
             try:
                 from huggingface_hub import try_to_load_from_cache as _ttlfc
 
@@ -5976,7 +5979,7 @@ class MiniMaxH3Runner:
             logger.warning("transformer 量子化済みキャッシュの meta.json が壊れています、"
                             "通常経路へフォールバック: %s", cache_dir)
             return False
-        current_meta = self._transformer_prequant_metadata()
+        current_meta = self._transformer_prequant_metadata(pruned=False)
         if saved_meta != current_meta:
             logger.info(
                 "transformer 量子化済みキャッシュのメタデータが現在の設定と不一致のため無効"
@@ -6034,7 +6037,7 @@ class MiniMaxH3Runner:
             logger.warning("pruned 量子化済みキャッシュの meta.json が壊れています、"
                            "通常経路へフォールバック: %s", cache_dir)
             return False
-        current_meta = self._transformer_prequant_metadata()
+        current_meta = self._transformer_prequant_metadata(pruned=True)
         if saved_meta != current_meta:
             logger.info(
                 "pruned 量子化済みキャッシュのメタデータが現在の設定と不一致のため無効"
@@ -6122,7 +6125,8 @@ class MiniMaxH3Runner:
             else:
                 transformer.save_pretrained(str(tmp_dir))
             (tmp_dir / "meta.json").write_text(
-                json.dumps(self._transformer_prequant_metadata(), indent=2, ensure_ascii=False)
+                json.dumps(self._transformer_prequant_metadata(pruned=H3_PRUNED and is_ref),
+                           indent=2, ensure_ascii=False)
             )
             # 一時ディレクトリへ書いてから rename する: 保存中にプロセスが落ちても
             # 中途半端なキャッシュが「有効」に見えてしまうのを防ぐ (config.json/meta.json
