@@ -238,8 +238,13 @@ H3_PRESETS = {
             "H3_VIDEO_VAE_FP16": "1",
             "H3_TRANSFORMER_QUANT": "int8",
             "H3_PRUNED": "1",
-            "H3_PRUNED_QUANT": "int8dyn-convrot",
-            "H3_PRUNED_COMPILE": "3",
+            # ck-w4a8(comfy-kitchen W4A8)へ切替(2026-10-07、A/B 済み):
+            # int8dyn-convrot+compile3 比で denoise 13.0->9.4s(-28%)・常駐 21.6->14.9GB・
+            # peak 28.9->20.5GB・目視品質同等(docs/h3-comfy-kitchen-w4a8-20261007.md)。
+            # kitchen カーネルは compile 不要(H3_PRUNED_COMPILE は convrot 系限定の
+            # 既存ガードで自動無効のため指定しない)。リップシンクの実会話確認は
+            # ユーザー目視待ち — 問題があれば int8dyn-convrot + COMPILE=3 へ戻す。
+            "H3_PRUNED_QUANT": "ck-w4a8",
             "H3_KEEP_REF2VA": "1",
             "H3_KEEP_REF2VA_VAE": "1",
             "H3_REF_LATENT_CACHE": "1",
@@ -294,8 +299,13 @@ H3_PRESETS = {
             "H3_VIDEO_VAE_FP16": "1",
             "H3_TRANSFORMER_QUANT": "int8",
             "H3_PRUNED": "1",
-            "H3_PRUNED_QUANT": "int8dyn-convrot",
-            "H3_PRUNED_COMPILE": "3",
+            # ck-w4a8(comfy-kitchen W4A8)へ切替(2026-10-07、A/B 済み):
+            # int8dyn-convrot+compile3 比で denoise 13.0->9.4s(-28%)・常駐 21.6->14.9GB・
+            # peak 28.9->20.5GB・目視品質同等(docs/h3-comfy-kitchen-w4a8-20261007.md)。
+            # kitchen カーネルは compile 不要(H3_PRUNED_COMPILE は convrot 系限定の
+            # 既存ガードで自動無効のため指定しない)。リップシンクの実会話確認は
+            # ユーザー目視待ち — 問題があれば int8dyn-convrot + COMPILE=3 へ戻す。
+            "H3_PRUNED_QUANT": "ck-w4a8",
             "H3_KEEP_REF2VA": "1",
             "H3_KEEP_REF2VA_VAE": "1",
             "H3_REF_LATENT_CACHE": "1",
