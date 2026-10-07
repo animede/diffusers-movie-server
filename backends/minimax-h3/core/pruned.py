@@ -93,6 +93,22 @@ def _cfg_fp8dyn():
     return Float8DynamicActivationFloat8WeightConfig(granularity=PerRow(), set_inductor_config=False)
 
 
+def _cfg_int4wo():
+    # W4(tinygemm、活性は bf16 のまま = w4a16)。Kijai/MiniMax-H3-experimental の
+    # w4a8_mixed(comfy_quant コードブック形式、ComfyUI カーネル専用で直接ロード不可)を
+    # 受けた「4bit 重みで品質が保てるか」の自前プローブ用(2026-10-07)。活性 a16 は
+    # a8 より高精度なので、これで品質が崩れるなら w4a8 はなお悪い、という安全側の判定。
+    # group_size=128 は tinygemm の標準(Kijai は group16 コードブックでより細かい)。
+    from torchao.quantization import Int4WeightOnlyConfig
+    from torchao.quantization.quantize_.workflows import Int4PackingFormat
+
+    # 既定の PLAIN パッキングは外部カーネル mslk を要求する(未導入、実機で
+    # 「Requires mslk >= 1.0.0」)。torch 内蔵 tinygemm(_weight_int4pack_mm)を使う
+    # TILE_PACKED_TO_4D に切り替える(bf16 活性前提 = 本構成と一致)。
+    return Int4WeightOnlyConfig(group_size=128, set_inductor_config=False,
+                                int4_packing_format=Int4PackingFormat.TILE_PACKED_TO_4D)
+
+
 @dataclass(frozen=True)
 class PrunedQuantSpec:
     """`H3_PRUNED_QUANT` の 1 値ぶんのレシピ。
@@ -180,6 +196,22 @@ PRUNED_QUANT_SPECS: dict[str, PrunedQuantSpec] = {
         state_filename="pruned_int8wo_convrot_state.pt",
         meta_quant_config="Int8WeightOnlyConfig(version=2, PerRow)+convrot",
         config_factory=_cfg_int8wo,
+    ),
+    "int4wo-convrot": PrunedQuantSpec(
+        name="int4wo-convrot",
+        convrot=True,
+        cache_name="transformer_ref_pruned_int4wo_convrot",
+        state_filename="pruned_int4wo_convrot_state.pt",
+        meta_quant_config="Int4WeightOnlyConfig(group_size=128, tinygemm)+convrot",
+        config_factory=_cfg_int4wo,
+    ),
+    "int4wo": PrunedQuantSpec(
+        name="int4wo",
+        convrot=False,
+        cache_name="transformer_ref_pruned_int4wo",
+        state_filename="pruned_int4wo_state.pt",
+        meta_quant_config="Int4WeightOnlyConfig(group_size=128, tinygemm)",
+        config_factory=_cfg_int4wo,
     ),
     "fp8": PrunedQuantSpec(
         name="fp8",
