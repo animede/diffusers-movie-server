@@ -130,10 +130,16 @@ class PrunedQuantSpec:
     state_filename: str | None
     meta_quant_config: str
     config_factory: Callable[[], object] | None
+    # comfy-kitchen 経路(torchao を使わない)。True なら量子化は
+    # `_quantize_kitchen()`(ck.quantize_w4a8_int8_weight + CKW4A8Linear 差し替え)、
+    # キャッシュ再ロードは `_install_kitchen_shells()` を経由する。convrot は必ず False
+    # (kitchen の w4a8 カーネルは convrot_groupsize=256 の回転を内部に持つ自己完結設計で、
+    # remote code の mark_convrot と併用してはいけない)。
+    kitchen: bool = False
 
     @property
     def quantized(self) -> bool:
-        return self.config_factory is not None
+        return self.config_factory is not None or self.kitchen
 
     @property
     def cacheable(self) -> bool:
@@ -150,6 +156,22 @@ class PrunedQuantSpec:
         """
         if not self.quantized:
             return
+        if self.kitchen:
+            try:
+                import comfy_kitchen as ck
+
+                backends = ck.list_backends()
+                capable = [n for n, b in backends.items()
+                           if b.get("available") and "w4a8_int8_linear" in b.get("capabilities", [])]
+                if not capable:
+                    raise RuntimeError(f"w4a8_int8_linear を提供するバックエンドがありません: {backends}")
+                logger.info("comfy-kitchen w4a8 backends: %s", capable)
+            except Exception as e:
+                raise RuntimeError(
+                    f"H3_PRUNED_QUANT={self.name!r} には comfy-kitchen が必要です"
+                    f"(pip install comfy-kitchen==0.2.37): {e!r}"
+                ) from e
+            return
         try:
             self.make_config()
         except (ImportError, AttributeError, TypeError) as e:
@@ -163,6 +185,8 @@ class PrunedQuantSpec:
     def describe(self, group_size: int) -> str:
         if not self.quantized:
             return "bf16 (no quantization, ~40GB resident, no cache)"
+        if self.kitchen:
+            return f"{self.meta_quant_config}, cache={self.cache_name}"
         rot = f" + ConvRot(group={group_size})" if self.convrot else " (no ConvRot)"
         return f"{self.meta_quant_config.removesuffix('+convrot')}{rot}, cache={self.cache_name}"
 
@@ -196,6 +220,18 @@ PRUNED_QUANT_SPECS: dict[str, PrunedQuantSpec] = {
         state_filename="pruned_int8wo_convrot_state.pt",
         meta_quant_config="Int8WeightOnlyConfig(version=2, PerRow)+convrot",
         config_factory=_cfg_int8wo,
+    ),
+    # comfy-kitchen の W4A8(4bit 重み codebook+group16 fp8 スケール、int8-convrot 活性)。
+    # 2026-10-07 マイクロベンチ: H3 形状の大 M GEMM で bf16 比 1.7〜1.9 倍速
+    # (torchao tinygemm の int4wo は 5.5 倍遅 — docs/h3-comfy-kitchen-w4a8-20261007.md)。
+    "ck-w4a8": PrunedQuantSpec(
+        name="ck-w4a8",
+        convrot=False,
+        cache_name="transformer_ref_pruned_ck_w4a8",
+        state_filename="pruned_ck_w4a8_state.pt",
+        meta_quant_config="comfy-kitchen asym_w4a8_int8 (bits=4, group16, codebook, convrot256)",
+        config_factory=None,
+        kitchen=True,
     ),
     "int4wo-convrot": PrunedQuantSpec(
         name="int4wo-convrot",
@@ -314,6 +350,118 @@ def mark_convrot(transformer, mod, group_size: int) -> int:
     return len(names)
 
 
+class CKW4A8Linear(torch.nn.Linear):
+    """comfy-kitchen W4A8 の推論専用 Linear(重みは 4bit パック + スケール群のバッファ)。
+
+    nn.Linear を継承するのは turbo LoRA 適用(`_apply_turbo_lora_*` の
+    `isinstance(base_linear, torch.nn.Linear)` と in/out_features 参照)を素通しする
+    ため。`weight` パラメータは __init__ 直後に除去する(forward は全面差し替え、
+    state_dict にも現れない)。バッファは shape 既知(in/out から決まる)なので
+    meta 構築 -> `load_state_dict(assign=True)` のキャッシュ再ロードがそのまま通る。
+
+    注意: `.to(dtype=...)` を親モデルに掛けると浮動小数バッファ(s_rel fp8 /
+    s_channel f32 / codebook f32)が巻き込まれて壊れる。pruned 経路は device 移動
+    (`.to(device)`)しか行わないので現状安全だが、dtype キャストを足すときは
+    このクラスを除外すること。
+    """
+
+    GROUP_SIZE = 16
+    CONVROT_GROUPSIZE = 256
+
+    def __init__(self, in_features: int, out_features: int, bias: bool):
+        super().__init__(in_features, out_features, bias=False, device="meta")
+        del self._parameters["weight"]
+        if bias:
+            self.bias = torch.nn.Parameter(
+                torch.empty(out_features, dtype=torch.bfloat16, device="meta"), requires_grad=False
+            )
+        self.register_buffer("qdata", torch.empty(out_features, in_features // 2,
+                                                  dtype=torch.int8, device="meta"))
+        self.register_buffer("s_rel", torch.empty(out_features, in_features // self.GROUP_SIZE,
+                                                  dtype=torch.float8_e4m3fn, device="meta"))
+        self.register_buffer("s_channel", torch.empty(out_features, dtype=torch.float32, device="meta"))
+        self.register_buffer("codebook", torch.empty(16, dtype=torch.float32, device="meta"))
+
+    @classmethod
+    def from_linear(cls, module: torch.nn.Linear, device) -> "CKW4A8Linear":
+        """bf16 nn.Linear を層単位で GPU 量子化して置換用モジュールを作る(結果は CPU 常駐、
+        呼び出し側の最後の `tr.to(device)` で GPU へ移る — `_quantize_plain` と同じ流儀)。"""
+        import comfy_kitchen as ck
+
+        w = module.weight.data.to(device)
+        qdata, s_rel, s_channel, correction, codebook = ck.quantize_w4a8_int8_weight(
+            w, group_size=cls.GROUP_SIZE, convrot_groupsize=cls.CONVROT_GROUPSIZE
+        )
+        if correction is not None:
+            # 既定引数では None(実機確認済み)。付いて返る条件が増えたら保存形式ごと
+            # 見直しが要るので、黙って捨てずに落とす。
+            raise RuntimeError("quantize_w4a8_int8_weight が correction を返しました(未対応)")
+        new = cls(module.in_features, module.out_features, module.bias is not None)
+        new.qdata = qdata.to("cpu")
+        new.s_rel = s_rel.to("cpu")
+        new.s_channel = s_channel.to("cpu")
+        new.codebook = codebook.to("cpu")
+        if module.bias is not None:
+            new.bias = torch.nn.Parameter(
+                module.bias.data.detach().to("cpu", torch.bfloat16), requires_grad=False
+            )
+        del w
+        return new
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        import comfy_kitchen as ck
+
+        shape = x.shape
+        y = ck.w4a8_int8_linear(
+            x.reshape(-1, shape[-1]),
+            self.qdata, self.s_rel, self.s_channel,
+            codebook=self.codebook, correction=None, bias=self.bias,
+            group_size=self.GROUP_SIZE, convrot_groupsize=self.CONVROT_GROUPSIZE,
+            out_dtype=x.dtype,
+        )
+        return y.reshape(*shape[:-1], y.shape[-1])
+
+
+def _set_module_by_path(root: torch.nn.Module, path: str, value: torch.nn.Module) -> None:
+    parts = path.split(".")
+    parent = root
+    for part in parts[:-1]:
+        parent = getattr(parent, part)
+    setattr(parent, parts[-1], value)
+
+
+def _quantize_kitchen(transformer, device) -> list[str]:
+    """ConvRot 対象と同じ 300 層を comfy-kitchen W4A8 の CKW4A8Linear へ置換する。
+
+    `_quantize_plain` と同様に層単位で GPU 量子化する(CPU 上の bf16 40GB モデルに
+    対して GPU 一時確保を重み1枚ぶんに抑える)。remote code の ConvRot 機構
+    (mark_convrot / _convrot_layers)は一切使わない(kitchen カーネルが回転を内包)。
+    """
+    names = transformer.convrot_layers()
+    lookup = dict(transformer.named_modules())
+    for name in names:
+        module = lookup[name]
+        if not type(module) in (torch.nn.Linear,):
+            raise RuntimeError(f"{name} は既に置換済みです({type(module).__name__})")
+        _set_module_by_path(transformer, name, CKW4A8Linear.from_linear(module, device))
+    return names
+
+
+def _install_kitchen_shells(transformer) -> int:
+    """キャッシュ再ロード用: meta 構築済みモデルの ConvRot 対象層を CKW4A8Linear の
+    空シェル(meta、正しい shape)へ差し替える。続く `load_state_dict(assign=True)` が
+    qdata/s_rel/s_channel/codebook(/bias)を実体化する。"""
+    names = transformer.convrot_layers()
+    lookup = dict(transformer.named_modules())
+    for name in names:
+        module = lookup[name]
+        _set_module_by_path(
+            transformer, name,
+            CKW4A8Linear(module.in_features, module.out_features, module.bias is not None),
+        )
+    return len(names)
+
+
 def _quantize_plain(transformer, config, device) -> list[str]:
     """ConvRot を掛けずに、ConvRot 対象と同じ 300 層へ torchao `quantize_` を層単位で適用する。
 
@@ -360,6 +508,12 @@ def load_pruned_ref_fresh(snapshot: Path, device, group_size: int, quant: str = 
     t1 = time.time()
     if not spec.quantized:
         logger.info("pruned transformer_ref: quant=%s -> 量子化せず bf16 のまま GPU へ載せます", spec.name)
+    elif spec.kitchen:
+        names = _quantize_kitchen(tr, device)
+        logger.info(
+            "pruned kitchen W4A8 quantize done in %.1fs (quant=%s, layers=%d)",
+            time.time() - t1, spec.name, len(names),
+        )
     elif spec.convrot:
         tr.quantize_8bit(config=spec.make_config(), device=device, group_size=group_size)
         logger.info(
@@ -424,6 +578,9 @@ def load_pruned_ref_from_cache(
     config = cls.load_config(str(cache_dir))
     with init_empty_weights():
         tr = cls.from_config(config)
+    if spec.kitchen:
+        n_shell = _install_kitchen_shells(tr)
+        logger.info("kitchen W4A8 shells installed for cache reload: %d layers", n_shell)
     sd = torch.load(str(cache_dir / spec.state_filename), map_location="cpu", weights_only=False)
     tr.load_state_dict(sd, assign=True)
     tr = tr.to(device)

@@ -70,3 +70,6 @@ MAX_JOBS=4 NVCC_THREADS=2 TORCH_CUDA_ARCH_LIST="12.0" \
 4. prequant キャッシュ(`models/prequant`、symlink 先 36GB)がそのまま読めること
    (torchao のバージョンを変えた場合はキャッシュ再生成が必要になる可能性がある。
    起動ログで prequant のロード成否を確認する)。
+
+## 追加依存(2026-10-07)
+- `pip install comfy-kitchen==0.2.37 --no-deps`(H3_PRUNED_QUANT=ck-w4a8 の W4A8 カーネル。Apache-2.0・依存なし・torch 2.9 で動作確認済み)
