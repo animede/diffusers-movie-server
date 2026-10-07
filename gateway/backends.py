@@ -198,6 +198,11 @@ H3_PRESETS = {
             "H3_REF_PREFIX_CACHE_SINGLE": "1",
             "H3_REF_PREFIX_PARK": "1",
             "H3_TE_STREAM": "1",
+            # VAE 退避の pinned CPU マスター方式(commit ae0bfe7)。この構成は VAE 非常駐で
+            # 毎リクエスト GPU<->CPU 往復(実測 3.9s)があり、pinned 化で 25.5s -> 24.0s
+            # (-1.4s、出力フレーム完全一致、2026-10-07 GPU1 実カード A/B)。代償は
+            # pinned ホスト RAM +5.4GiB(docs/h3-single-gpu-32gb-20261007.md §4)。
+            "H3_VAE_PINNED": "1",
         },
         description="48GB/32GB 級の ref2va 低VRAMフル(pruned + 全常駐 + TE_DIET/VAE_SPLIT/"
                     "PREFIX_PARK/TE_STREAM)。peak 29.06GB・定常 27.5s(現行 int8 は 41.1GB・"
@@ -262,9 +267,14 @@ H3_PRESETS = {
         #   GPU0 窓 30.6GiB(5090級)… cadence 7.03s / peak 27.3GB
         #   成立下限 = GPU0 の空き約 27.5GiB(26.5GiB は denoise 活性 OOM)
         #   出力は dual-realtime-ref2va とビット一致(低VRAM 4種は配置換えのみ)。
-        # **推奨解像度は 352×608**(リクエスト側で指定。同日の高さ比較実測:
-        #   352×640 cadence 7.16s(余裕 +1.8%)/ 352×608 6.91s(+5.5%)/ 352×576 6.65s。
-        #   608 は 640 と目視同等で、run 間の揺らぎ(±0.15s)を吸収できる)。
+        # **推奨解像度は 352×640**(リクエスト側で指定)。2026-10-05 の高さ比較では
+        #   608(6.91s、余裕+5.5%)を揺らぎ吸収のため推奨していたが、2026-10-07 の
+        #   重ね投入 cadence 再計測(scripts/ref2va_cadence_probe.py、GPU0 空き30GiB +
+        #   GPU1 空き7.9GiB)で 352×608=6.34s / 352×640=6.77s(0.93x)/ 384×640=7.40s
+        #   (1.015x、境界)と 640 でも十分な余裕が確認できたため 640 へ引き上げた
+        #   (docs/h3-single-gpu-32gb-20261007.md §3)。保守的に行くなら 608。
+        #   384×640 以上は計算律速でリアルタイム境界〜超過(VRAM は 384×704 でも
+        #   peak 27.7GB で問題にならない)。
         # 追加コスト: cadence +0.3〜0.6s(park 0.3s + TE_STREAM encode +0.2〜0.4s)、
         # ホスト RAM に pinned 約13GiB + VAE CPU 常駐 約4.5GiB(RSS ~28GiB)。
         # 注意:
@@ -298,11 +308,11 @@ H3_PRESETS = {
             "H3_TE_STREAM": "1",
         },
         description="ref2va リアルタイムの低VRAM版(GPU0 32GB/48GB 級 + GPU1 8GB 級)。"
-                    "推奨 352×608・7.3秒クリップで cadence 6.91s、GPU0 peak 27.3GB(空き 28GiB "
+                    "推奨 352×640・7.3秒クリップで cadence 6.77s、GPU0 peak 27.3GB(空き 28GiB "
                     "以上必要)。出力は dual-realtime-ref2va とビット一致。ホスト RAM "
                     "~28GiB 使用。gpus=\"0,1\" 必須。HyperFlow と排他。",
         vram_hint="GPU0 peak 27.3GB(空き28GiB以上・32GB級可)/ GPU1 ~6GB(8GB級可)/ "
-                  "cadence 6.91s(推奨 352×608・7.3s クリップ)/ ホストRAM ~28GiB",
+                  "cadence 6.77s(推奨 352×640・7.3s クリップ)/ ホストRAM ~28GiB",
     ),
     "48gb-dual": Preset(
         name="48gb-dual",
