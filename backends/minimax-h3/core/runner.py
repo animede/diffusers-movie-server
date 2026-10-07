@@ -1594,6 +1594,14 @@ H3_TURBO_LORA_REPO = os.environ.get("H3_TURBO_LORA_REPO", "lightx2v/Minimax-h3-T
 H3_TURBO_LORA_FILE = os.environ.get(
     "H3_TURBO_LORA_FILE", "minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors"
 )
+# 【2026-10-07 追加】base transformer (t2va/fl2va) 専用の turbo LoRA 指定。未指定 (既定) は
+# 従来どおり上の REPO/FILE が base/ref 両 transformer に共通適用される (挙動不変)。
+# 動機: 両常駐運用 (run.sh 既定 = ref2v 8step) だと待機 (fl2va = base transformer) にも
+# ref2v 用 LoRA が転用され、かつファイル名が `_fl2v_` でないため video shift 6 の自動切替も
+# 効かない。`H3_TURBO_LORA_FILE_BASE=minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors`
+# なら base だけ fl2v 4step LoRA + shift 6、ref2va 側は従来どおり。
+H3_TURBO_LORA_REPO_BASE = os.environ.get("H3_TURBO_LORA_REPO_BASE", "").strip() or H3_TURBO_LORA_REPO
+H3_TURBO_LORA_FILE_BASE = os.environ.get("H3_TURBO_LORA_FILE_BASE", "").strip() or H3_TURBO_LORA_FILE
 
 # 既知の comfy (融合QKV) 形式リポジトリ。int8 との組み合わせ拒否 (import 時と
 # リクエスト時の両方) はこの形式のときだけ必要 -- diffusers ネイティブ形式は
@@ -1666,6 +1674,14 @@ elif "_fl2v_" in H3_TURBO_LORA_FILE and "_768p" in H3_TURBO_LORA_FILE:
     H3_TURBO_VIDEO_SHIFT = 6.0
 else:
     H3_TURBO_VIDEO_SHIFT = None
+# base transformer (generate/generate_still_batch) 用の shift。明示指定 (RAW) は base/ref 共通、
+# なければ H3_TURBO_LORA_FILE_BASE のファイル名から判定 (BASE 未指定なら上と同一 = 不変)。
+if H3_TURBO_VIDEO_SHIFT_RAW:
+    H3_TURBO_VIDEO_SHIFT_BASE: float | None = H3_TURBO_VIDEO_SHIFT
+elif "_fl2v_" in H3_TURBO_LORA_FILE_BASE and "_768p" in H3_TURBO_LORA_FILE_BASE:
+    H3_TURBO_VIDEO_SHIFT_BASE = 6.0
+else:
+    H3_TURBO_VIDEO_SHIFT_BASE = None
 if H3_TURBO_LORA and H3_TURBO_LORA_REPO in _TURBO_COMFY_REPOS and (H3_LOWVRAM_ANY or H3_TRANSFORMER_BOTH_RESIDENT):
     raise RuntimeError(
         "H3_TURBO_LORA=1 with the comfy-format (fused-QKV) LoRA "
@@ -4122,6 +4138,8 @@ class MiniMaxH3Runner:
         # H3_TURBO_LORA only: cached local path of the downloaded turbo LoRA safetensors,
         # resolved once per process by `_download_turbo_lora_if_needed()`.
         self._turbo_lora_path: str | None = None
+        # H3_TURBO_LORA_FILE_BASE (base transformer 専用) を別指定したときだけ使う。
+        self._turbo_lora_path_base: str | None = None
         # H3_TE_PROJ only: cached local path of the resolved projection safetensors,
         # resolved once per process by `_resolve_te_proj_path()`. The projection
         # instance itself is cached on `self._pipe._te_projection` (not here), since
@@ -4498,7 +4516,7 @@ class MiniMaxH3Runner:
             # three. `H3_CACHE == "fbc"` is force-skipped below (not just "left at its
             # default") regardless of the env var's own value -- see `H3_TURBO_LORA`'s
             # module comment for why a handful of turbo steps leaves FBC no safe window.
-            n = self._apply_turbo_lora_checkpoint(self._pipe.transformer)
+            n = self._apply_turbo_lora_checkpoint(self._pipe.transformer, is_ref=False)
             self._turbo_lora_wrapped = True
             logger.info("H3_TURBO_LORA=1: applied turbo LoRA (%d layers wrapped), FBC force-disabled", n)
         if H3_ATTN_BACKEND:
@@ -4532,7 +4550,7 @@ class MiniMaxH3Runner:
         # フェーズ境界での中断チェック(loading_transformer)。
         interrupt_controller.check()
 
-    def _apply_turbo_lora_checkpoint(self, transformer) -> int:
+    def _apply_turbo_lora_checkpoint(self, transformer, is_ref: bool = False) -> int:
         """設定済みの turbo LoRA をダウンロード → キー形式を判定 → 形式に応じた適用
         関数へディスパッチする (`_ensure_transformer` の起動時適用と
         `_apply_turbo_setting` の遅延適用、両呼び出し元の共通化)。
@@ -4540,8 +4558,8 @@ class MiniMaxH3Runner:
         comfy 形式 (Ostris 版) × int8 はここで明確に拒否する -- import 時のガードは
         リポジトリ名の予備判定 (`_TURBO_COMFY_REPOS`) しかできないため、未知リポジトリの
         comfy 形式チェックポイントはこの実ファイル判定が最後の砦。"""
-        self._download_turbo_lora_if_needed()
-        lora_format = detect_turbo_lora_format(self._turbo_lora_path)
+        lora_path = self._download_turbo_lora_if_needed(is_ref=is_ref)
+        lora_format = detect_turbo_lora_format(lora_path)
         if lora_format == "comfy":
             if H3_TRANSFORMER_QUANT == "int8":
                 raise ValueError(
@@ -4550,35 +4568,47 @@ class MiniMaxH3Runner:
                     "diffusers ネイティブ形式 (lightx2v/Minimax-h3-Turbo) を使うか、"
                     "int8/低VRAM を無効にしてください。"
                 )
-            return apply_turbo_lora(transformer, self._turbo_lora_path)
+            return apply_turbo_lora(transformer, lora_path)
         return apply_diffusers_turbo_lora(
-            transformer, self._turbo_lora_path,
-            resolve_turbo_lora_scale(lora_format, self._turbo_lora_path),
+            transformer, lora_path,
+            resolve_turbo_lora_scale(lora_format, lora_path),
         )
 
-    def _download_turbo_lora_if_needed(self):
+    def _download_turbo_lora_if_needed(self, is_ref: bool = True) -> str:
         """Resolve (downloading if necessary, via the normal HF cache) the turbo LoRA
         safetensors path once per process, caching it on `self._turbo_lora_path`. Split
         out from `_ensure_transformer` only so the download (network I/O, ~780MB) is not
         interleaved with that method's own docstring-documented load-order reasoning.
         """
-        if getattr(self, "_turbo_lora_path", None) is not None:
-            return
+        # is_ref=False (base transformer) は H3_TURBO_LORA_{REPO,FILE}_BASE を使う
+        # (未指定なら共通値 = 従来挙動)。is_ref=True (既定) は従来の共通 REPO/FILE。
+        # 結果は is_ref ごとに別キャッシュする。BASE が共通と同一なら同じパスを共有する。
+        if is_ref:
+            repo, fname, attr = H3_TURBO_LORA_REPO, H3_TURBO_LORA_FILE, "_turbo_lora_path"
+        else:
+            repo, fname, attr = H3_TURBO_LORA_REPO_BASE, H3_TURBO_LORA_FILE_BASE, "_turbo_lora_path_base"
+            if (repo, fname) == (H3_TURBO_LORA_REPO, H3_TURBO_LORA_FILE):
+                attr = "_turbo_lora_path"
+        cached = getattr(self, attr, None)
+        if cached is not None:
+            return cached
         # H3_TE_PROJ と同じ流儀: H3_TURBO_LORA_FILE が実在する絶対パスならローカル
         # ファイルとして直接使う (HF に無い自作/フィルタ済み LoRA の A/B 用。
         # 2026-09-10、FastH3 dense LoRA の adaln 除外版検証で追加)。
-        if os.path.isabs(H3_TURBO_LORA_FILE) and os.path.isfile(H3_TURBO_LORA_FILE):
-            self._turbo_lora_path = H3_TURBO_LORA_FILE
-            logger.info("turbo LoRA checkpoint resolved: %s (local file)", H3_TURBO_LORA_FILE)
-            return
+        if os.path.isabs(fname) and os.path.isfile(fname):
+            setattr(self, attr, fname)
+            logger.info("turbo LoRA checkpoint resolved (%s): %s (local file)", "ref" if is_ref else "base", fname)
+            return fname
         from huggingface_hub import hf_hub_download
 
         t0 = time.time()
-        self._turbo_lora_path = hf_hub_download(H3_TURBO_LORA_REPO, H3_TURBO_LORA_FILE)
+        path = hf_hub_download(repo, fname)
+        setattr(self, attr, path)
         logger.info(
-            "turbo LoRA checkpoint resolved: %s (%.1fs, repo=%s file=%s)",
-            self._turbo_lora_path, time.time() - t0, H3_TURBO_LORA_REPO, H3_TURBO_LORA_FILE,
+            "turbo LoRA checkpoint resolved (%s): %s (%.1fs, repo=%s file=%s)",
+            "ref" if is_ref else "base", path, time.time() - t0, repo, fname,
         )
+        return path
 
     def _ensure_hyperflow_ref(self, progress: ProgressState | None = None) -> None:
         """H3_HYPERFLOW 時、transformer_ref に HyperFlow LoRA + TwoTimeEmbedder を適用する。
@@ -5259,7 +5289,7 @@ class MiniMaxH3Runner:
         if turbo and not getattr(self, wrapped_attr):
             if progress:
                 progress.update(message=f"turbo LoRA を {label} へ適用中...")
-            n = self._apply_turbo_lora_checkpoint(transformer)
+            n = self._apply_turbo_lora_checkpoint(transformer, is_ref=is_ref)
             setattr(self, wrapped_attr, True)
             if is_ref and H3_PRUNED_COMPILE_LEVEL >= 2:
                 from core import pruned as pruned_mod
@@ -5276,7 +5306,7 @@ class MiniMaxH3Runner:
         # else: turbo requested False and it was never wrapped in the first place --
         # nothing to do, the transformer's Linears are still the plain unwrapped ones.
 
-    def _apply_turbo_video_shift(self, turbo_effective: bool) -> None:
+    def _apply_turbo_video_shift(self, turbo_effective: bool, is_ref: bool = True) -> None:
         """Switch the (process-wide, shared) video scheduler's shift for this request,
         based on the request's *resolved* turbo state (`instant["turbo"]`) -- turbo is a
         per-request instant-apply setting (like `cache`/`attn`), so the shift a
@@ -5308,9 +5338,18 @@ class MiniMaxH3Runner:
         12.0/audio 3.0 is the shared baseline, and the 768p checkpoint's own upstream
         spec table only lists a different *video* training shift).
         """
-        if H3_TURBO_VIDEO_SHIFT is None:
+        # is_ref=False (generate/generate_still_batch = base transformer) は
+        # H3_TURBO_LORA_FILE_BASE 由来の shift (未指定なら ref と同一 = 従来挙動)。
+        turbo_shift = H3_TURBO_VIDEO_SHIFT if is_ref else H3_TURBO_VIDEO_SHIFT_BASE
+        if turbo_shift is None:
+            # このバリアントの LoRA は shift 切替なし。ただし scheduler は base/ref 共有なので、
+            # 直前の別バリアントのリクエストが shift を切り替えたままなら元に戻す。
+            if (H3_TURBO_VIDEO_SHIFT is not None or H3_TURBO_VIDEO_SHIFT_BASE is not None) \
+                    and self._pipe.scheduler.shift != self._base_video_shift:
+                self._pipe.scheduler.set_shift(self._base_video_shift)
+                logger.info("turbo video scheduler shift restored: %.3f (variant has no turbo shift)", self._base_video_shift)
             return
-        desired = H3_TURBO_VIDEO_SHIFT if turbo_effective else self._base_video_shift
+        desired = turbo_shift if turbo_effective else self._base_video_shift
         scheduler = self._pipe.scheduler
         if scheduler.shift == desired:
             return
@@ -5318,7 +5357,7 @@ class MiniMaxH3Runner:
         logger.info(
             "turbo video scheduler shift %s: %.3f (turbo=%s, H3_TURBO_VIDEO_SHIFT=%.3f, base=%.3f)",
             "applied" if turbo_effective else "restored", desired, turbo_effective,
-            H3_TURBO_VIDEO_SHIFT, self._base_video_shift,
+            turbo_shift, self._base_video_shift,
         )
 
     def apply_instant_settings(
@@ -6736,6 +6775,8 @@ class MiniMaxH3Runner:
             "turbo_lora": H3_TURBO_LORA,
             "turbo_lora_repo": H3_TURBO_LORA_REPO if H3_TURBO_LORA else None,
             "turbo_lora_path": self._turbo_lora_path,
+            "turbo_lora_path_base": self._turbo_lora_path_base,
+            "turbo_lora_file_base": H3_TURBO_LORA_FILE_BASE if H3_TURBO_LORA else None,
             # **`H3_TURBO_LORA` で出し分けしないこと** (2026-08-20 修正): turbo は
             # リクエスト単位の即反映設定 (`_apply_turbo_setting`、LoRA は初回 ON 時に
             # 遅延ロードされる) なので、起動時 `H3_TURBO_LORA=0` でも UI のチェック
@@ -7297,7 +7338,7 @@ class MiniMaxH3Runner:
         # Must run before this request's `MiniMaxH3SetTimestepsStep` call (further down,
         # inside the mode-specific branches below) -- see `_apply_turbo_video_shift`'s
         # own docstring for why per-request rather than process-wide.
-        self._apply_turbo_video_shift(instant["turbo"])
+        self._apply_turbo_video_shift(instant["turbo"], is_ref=False)
 
         pipe = self._pipe
 
@@ -8277,7 +8318,7 @@ class MiniMaxH3Runner:
         # バッチは場面ループの外・リクエスト先頭で1回 (全場面共通の turbo 状態 -- この
         # メソッドはプロンプト以外のパラメータが全場面共通という前提そのもの)。以降の
         # 場面ループ内で回る `MiniMaxH3SetTimestepsStep` より前に必ず適用しておく。
-        self._apply_turbo_video_shift(instant["turbo"])
+        self._apply_turbo_video_shift(instant["turbo"], is_ref=False)
         pipe = self._pipe
 
         # --- encode 位相: TE 常駐のまま全場面を準備 ---
@@ -8767,7 +8808,7 @@ class MiniMaxH3Runner:
         # Must run before this request's `MiniMaxH3SetTimestepsStep` call (further down,
         # inside the mode-specific branches below) -- see `generate()`'s matching call
         # site and `_apply_turbo_video_shift`'s own docstring.
-        self._apply_turbo_video_shift(instant["turbo"])
+        self._apply_turbo_video_shift(instant["turbo"], is_ref=True)
 
         pipe = self._pipe_ref
 
@@ -9607,7 +9648,7 @@ class MiniMaxH3Runner:
         # バッチは場面ループの外・リクエスト先頭で1回 (generate_still_batch() と同じ
         # 理由 -- 全場面共通の turbo 状態を、以降の場面ループ内で回る
         # `MiniMaxH3SetTimestepsStep` より前に適用しておく)。
-        self._apply_turbo_video_shift(instant["turbo"])
+        self._apply_turbo_video_shift(instant["turbo"], is_ref=True)
         pipe = self._pipe_ref
 
         # Same per-request override as generate_ref2va() (see that call site's comment
