@@ -7692,6 +7692,10 @@ class MiniMaxH3Runner:
                 # Only now is it safe to free TE and load the (int8) transformer: every
                 # tensor that would have needed `_execution_device` to resolve correctly
                 # already exists, materialized on the right device, on `state`.
+                # transformer ロード (prequant キャッシュでも ~4.2s、途中中断不可) に入る前に
+                # 中断を拾う。r-n-v の会話ターンが待機 (fl2va) の「VAE 退避 + base ロード」
+                # 窓 (~6.5s、2026-10-07 実測 turn@8) と衝突したときの待ちを縮めるため。
+                interrupt_controller.check()
                 with self._load_lock:
                     if coexist_ref2va:
                         # TE も ref2va スタックの一部 (次の ref2va が再ロードを払わないよう残す)。
@@ -8484,6 +8488,7 @@ class MiniMaxH3Runner:
         encode_time = time.time() - t_encode
 
         # --- TE を解放して transformer を1回だけロード ---
+        interrupt_controller.check()  # ロード (~4.2s、途中中断不可) 前に中断を拾う (generate() と同じ理由)
         with self._load_lock:
             if coexist_ref2va:
                 logger.info("generate_still_batch: text_encoder を解放せず常駐のまま base transformer をロード (H3_KEEP_REF2VA 両常駐)")
