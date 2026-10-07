@@ -105,6 +105,7 @@ from __future__ import annotations
 import gc
 import hashlib
 import io
+import itertools
 import json
 import logging
 import os
@@ -1368,6 +1369,15 @@ H3_DEBUG_DECODE_MEM = os.environ.get("H3_DEBUG_DECODE_MEM", "0").strip() == "1"
 # 割り当て 41.1GB -> 窓内 46.9GB、denoise 自体は窓より低い)。配置換えのみなので出力はビット一致。
 # 既定 (0) は挙動不変。
 H3_VAE_SPLIT = os.environ.get("H3_VAE_SPLIT", "0").strip() == "1"
+
+# `H3_VAE_PINNED=1`: VAE の GPU<->CPU 退避 (`_vae_to_gpu`/`_vae_to_cpu`) を pinned CPU
+# マスター方式にする。VAE の重みは推論中に変化しないので、初回に pinned CPU コピー
+# (マスター) を作って以後は (1) ->CPU は `p.data` をマスターへ付け替えるだけ
+# (D2H コピー自体を省略)、(2) ->GPU は pinned からの高速 H2D、にできる。
+# 動機 = 単機 32GB 構成 (KEEP_REF2VA_VAE=0 で毎チャンク pageable 往復 2.4s が固定費、
+# 2026-10-07 実測: ->GPU 0.83s + ->CPU 1.61s @ 141f)。ホスト RAM を VAE サイズぶん
+# (~5-6GiB) pinned で常駐消費する。既定 0 = 従来どおり `.to()` で挙動不変。
+H3_VAE_PINNED = os.environ.get("H3_VAE_PINNED", "0").strip() == "1"
 
 
 def _apply_te_diet(text_encoder) -> float:
@@ -4093,6 +4103,9 @@ class MiniMaxH3Runner:
         # H3_VAE_SPLIT: VAE のうち今 GPU にいる部分 ("encode"/"decode" の部分集合)。
         # `_vae_on_gpu` は「どれかが GPU にいる」の意味 (全部とは限らない)。
         self._vae_gpu_parts: set[str] = set()
+        # H3_VAE_PINNED: param/buffer -> pinned CPU マスター。初回の退避時に遅延構築。
+        self._vae_pin_map: dict = {}
+        self._vae_pin_disabled = False
         # H3_DECODE_DEVICE: decode 専用 VAE コピー (別 GPU 常駐) と、decode の直列化ロック・
         # 専用ストリーム。フラグ OFF の既定では一切使われない (None のまま)。
         self._decode_vae = None
@@ -4366,6 +4379,74 @@ class MiniMaxH3Runner:
                 getattr(module, name).to(device)
         return True
 
+    # ---- H3_VAE_PINNED (pinned CPU マスター方式の VAE 退避) ----------------------
+
+    def _vae_pin_masters(self) -> dict | None:
+        """pinned CPU マスターを遅延構築して返す。失敗したら以後無効化して None
+        (呼び出し側は従来の `.to()` 経路へ退避する)。重みが変化しない前提のため、
+        もし将来 VAE を finetune/再キャストする経路を足すならマスターを破棄すること。"""
+        if self._vae_pin_disabled:
+            return None
+        if self._vae_pin_map:
+            return self._vae_pin_map
+        try:
+            t0 = time.time()
+            m: dict = {}
+            for attr in ("vae", "audio_vae"):
+                module = getattr(self._pipe, attr)
+                for t in itertools.chain(module.parameters(), module.buffers()):
+                    m[t] = t.data.detach().to(CPU, copy=True).pin_memory()
+                    t.data = m[t]  # 以後 CPU 側の実体は常にこのマスター
+            gib = sum(x.numel() * x.element_size() for x in m.values()) / 2**30
+            logger.info("H3_VAE_PINNED: pinned CPU masters built (%.2fGiB, %d tensors, %.2fs)",
+                        gib, len(m), time.time() - t0)
+            self._vae_pin_map = m
+            return m
+        except Exception:
+            logger.exception("H3_VAE_PINNED: pinned マスター作成に失敗、従来の .to() 経路へ退避")
+            self._vae_pin_map = {}
+            self._vae_pin_disabled = True
+            return None
+
+    def _vae_pin_tensor_list(self, parts: set[str] | None):
+        """移動対象の param/buffer を列挙する。`parts` None = vae/audio_vae 全体。
+        parts 指定時は `_move_vae_part` と同じ「未知の子モジュールがあれば None」
+        (呼び出し側が全体移動へ退避する) の保守則に従う。"""
+        out = []
+        for attr, table in (("vae", self._VAE_PARTS["vae"]), ("audio_vae", self._VAE_PARTS["audio_vae"])):
+            module = getattr(self._pipe, attr)
+            if parts is None:
+                out.extend(module.parameters())
+                out.extend(module.buffers())
+                continue
+            known = set(table["encode"]) | set(table["decode"])
+            if any(name not in known for name, _ in module.named_children()) or \
+                    any(True for _ in module.named_parameters(recurse=False)) or \
+                    any(True for _ in module.named_buffers(recurse=False)):
+                return None
+            for part in sorted(parts):
+                for name in table[part]:
+                    child = getattr(module, name)
+                    out.extend(child.parameters())
+                    out.extend(child.buffers())
+        return out
+
+    def _vae_pinned_move(self, tensors, device) -> None:
+        """pinned マスター方式の移動。->CPU は data の付け替えのみ (D2H 無し)、
+        ->GPU は pinned からの non_blocking H2D (同一ストリーム順序なので後続カーネルと
+        の整合は保たれるが、所要時間ログの正確さのため最後に同期する)。"""
+        pin = self._vae_pin_map
+        to_cpu = torch.device(device).type == "cpu"
+        for t in tensors:
+            master = pin.get(t)
+            if to_cpu:
+                t.data = master if master is not None else t.data.to(CPU)
+            else:
+                src = master if master is not None else t.data
+                t.data = src.to(device, non_blocking=master is not None)
+        if not to_cpu:
+            torch.cuda.synchronize()
+
     def _vae_to_gpu(self, part: str = "all"):
         """bnb-4bit mode only: move the (small, fp32, ~11GB) VAEs onto GPU for their active
         phase. A single short one-way trip, not a standing swap -- see module docstring.
@@ -4383,13 +4464,24 @@ class MiniMaxH3Runner:
         if not need:
             return
         t0 = time.time()
-        if split and all(self._move_vae_part(p, DEVICE) for p in sorted(need)):
-            self._vae_gpu_parts |= need
-        else:
-            # 従来経路 (または未知の子モジュールがあるときの退避): 全体を移す。
-            self._pipe.vae.to(DEVICE)
-            self._pipe.audio_vae.to(DEVICE)
-            self._vae_gpu_parts = {"encode", "decode"}
+        moved = False
+        if H3_VAE_PINNED and self._vae_pin_masters() is not None:
+            tensors = self._vae_pin_tensor_list(need if split else None)
+            if tensors is None and split:
+                tensors = self._vae_pin_tensor_list(None)  # 未知の子モジュール: 全体移動へ退避
+                need = {"encode", "decode"}
+            if tensors is not None:
+                self._vae_pinned_move(tensors, DEVICE)
+                self._vae_gpu_parts |= need if split else {"encode", "decode"}
+                moved = True
+        if not moved:
+            if split and all(self._move_vae_part(p, DEVICE) for p in sorted(need)):
+                self._vae_gpu_parts |= need
+            else:
+                # 従来経路 (または未知の子モジュールがあるときの退避): 全体を移す。
+                self._pipe.vae.to(DEVICE)
+                self._pipe.audio_vae.to(DEVICE)
+                self._vae_gpu_parts = {"encode", "decode"}
         self._vae_on_gpu = True
         logger.info("vae/audio_vae -> GPU (%s) in %.2fs. gpu=%s",
                     "+".join(sorted(self._vae_gpu_parts)), time.time() - t0, gpu_mem_gb())
@@ -4401,8 +4493,11 @@ class MiniMaxH3Runner:
         if TE_QUANT != "bnb-4bit" or not self._vae_on_gpu:
             return
         t0 = time.time()
-        self._pipe.vae.to(CPU)
-        self._pipe.audio_vae.to(CPU)
+        if H3_VAE_PINNED and self._vae_pin_masters() is not None:
+            self._vae_pinned_move(self._vae_pin_tensor_list(None), CPU)
+        else:
+            self._pipe.vae.to(CPU)
+            self._pipe.audio_vae.to(CPU)
         self._vae_on_gpu = False
         self._vae_gpu_parts = set()
         gc.collect()
@@ -6377,6 +6472,8 @@ class MiniMaxH3Runner:
         if getattr(self._pipe, "audio_vae", None) is not None:
             del self._pipe.audio_vae
             self._pipe.audio_vae = None
+        # H3_VAE_PINNED: モジュールを捨てるのでマスターも破棄 (pinned ホスト RAM を返す)。
+        self._vae_pin_map = {}
         self._vae_loaded = False
         self._vae_on_gpu = False
         self._vae_gpu_parts = set()
