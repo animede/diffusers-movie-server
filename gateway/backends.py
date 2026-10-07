@@ -241,6 +241,10 @@ H3_PRESETS = {
             "H3_DECODE_STREAM": "1",
             "H3_DECODE_DEVICE": "cuda:1",
             "H3_DECODE_VAE": "light",
+            # 待機(fl2va)用の turbo を fl2v 専用 4step にする(shift 6 自動切替込み)。
+            # これが無いと run.sh 既定の ref2v 8step が base にも転用され、待機だけ
+            # ソフトな絵になる(2026-10-07 実測: ラプラシアン分散 58->100 で発話と同水準に)。
+            "H3_TURBO_LORA_FILE_BASE": "minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors",
         },
         description="ref2va 連続生成のリアルタイム構成(2GPU: denoise + decode 分離、"
                     "pruned int8 compile + latent キャッシュ + light VAE)。352×640・7.3秒"
@@ -283,6 +287,10 @@ H3_PRESETS = {
             "H3_DECODE_STREAM": "1",
             "H3_DECODE_DEVICE": "cuda:1",
             "H3_DECODE_VAE": "light",
+            # 待機(fl2va)用の turbo を fl2v 専用 4step にする(shift 6 自動切替込み)。
+            # これが無いと run.sh 既定の ref2v 8step が base にも転用され、待機だけ
+            # ソフトな絵になる(2026-10-07 実測: ラプラシアン分散 58->100 で発話と同水準に)。
+            "H3_TURBO_LORA_FILE_BASE": "minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors",
             "H3_TE_DIET": "1",
             "H3_VAE_SPLIT": "1",
             "H3_REF_PREFIX_CACHE_SINGLE": "1",
