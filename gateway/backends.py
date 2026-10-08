@@ -742,8 +742,10 @@ def _validate_combination(backend_name: str, env: dict[str, str]) -> None:
         if env.get("H3_PRUNED") == "1":
             # core/runner.py 側の起動時 RuntimeError を先取りして 400 にする。
             problems = []
-            if env.get("H3_TRANSFORMER_QUANT") != "int8":
-                problems.append("H3_TRANSFORMER_QUANT=int8 が必要")
+            if env.get("H3_TRANSFORMER_QUANT") not in ("int8", "ck-w4a8"):
+                # runner 側ガード(core/runner.py ~1122)と同期: ck-w4a8 base
+                # (Kijai pruned 変換、2026-10-08)も可。
+                problems.append("H3_TRANSFORMER_QUANT=int8 または ck-w4a8 が必要")
             if env.get("H3_HYPERFLOW") == "1":
                 problems.append("H3_HYPERFLOW=1 と併用不可")
             if env.get("H3_LOWVRAM") == "group":
