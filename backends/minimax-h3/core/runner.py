@@ -1386,6 +1386,28 @@ H3_VAE_SPLIT = os.environ.get("H3_VAE_SPLIT", "0").strip() == "1"
 # (~5-6GiB) pinned で常駐消費する。既定 0 = 従来どおり `.to()` で挙動不変。
 H3_VAE_PINNED = os.environ.get("H3_VAE_PINNED", "0").strip() == "1"
 
+# `H3_BASE_PINNED=1`: base transformer (t2va/fl2va) の解放・再ロードを pinned CPU
+# マスター方式の退避に置き換える (H3_VAE_PINNED と同型のポインタ付け替え)。
+# H3_LOWVRAM の振り付けは待機 (fl2va) のたびに base を `_free_transformer()` ->
+# `_ensure_transformer()` で作り直すが、ck-w4a8 base はこの再ロードが毎回 7.7〜8.4s
+# (12.5GB キャッシュの torch.load + H2D。int8 時代の 4.2s より悪化) かかる。重みは
+# 推論中に不変なので、モジュールを壊さず保持し、重み実体だけを pinned CPU マスターと
+# GPU の間で付け替える: 退避は `p.data = master` のみ (D2H 無し・一時二重化無し =
+# CLAUDE.md #33 の丸ごと `.to()` スワップとは異なり RAM スパイクしない)、復帰は
+# pinned H2D (~12.5GB で実測 0.5s 級)。turbo LoRA ラップ・attention backend 設定も
+# モジュールごと保持されるので再適用も不要になる。
+# ck-w4a8 (pruned base ~12.5GB) 専用: int8 base (~33GB) を pinned 常駐させる設計は
+# 未検証のため、quant が ck-w4a8 以外 (または group mode) では無効化して警告する。
+# ホスト RAM を ~12.5GiB pinned で常駐消費する。既定 0 = 従来どおり。
+H3_BASE_PINNED = os.environ.get("H3_BASE_PINNED", "0").strip() == "1"
+if H3_BASE_PINNED and (H3_TRANSFORMER_QUANT != "ck-w4a8" or H3_LOWVRAM_GROUP):
+    logger.warning(
+        "H3_BASE_PINNED=1 は H3_TRANSFORMER_QUANT=ck-w4a8 (非 group) 専用です "
+        "(quant=%r, group=%s) -- 無効化して従来のロード経路を使います",
+        H3_TRANSFORMER_QUANT, H3_LOWVRAM_GROUP,
+    )
+    H3_BASE_PINNED = False
+
 
 def _apply_te_diet(text_encoder) -> float:
     """`H3_TE_DIET`: lm_head の重みを解放し、embed_tokens を CPU ブリッジ化する。
@@ -4113,6 +4135,12 @@ class MiniMaxH3Runner:
         # H3_VAE_PINNED: param/buffer -> pinned CPU マスター。初回の退避時に遅延構築。
         self._vae_pin_map: dict = {}
         self._vae_pin_disabled = False
+        # H3_BASE_PINNED: base transformer をモジュールごと保持し、重み実体だけ
+        # pinned CPU マスター <-> GPU で付け替える (初回 _free_transformer で遅延構築)。
+        # _base_pin_module が非 None の間、turbo LoRA ラップ等の構造はそのまま生きている。
+        self._base_pin_module = None
+        self._base_pin_tensors: list = []   # (tensor, pinned_master) の対
+        self._base_pin_disabled = False
         # H3_DECODE_DEVICE: decode 専用 VAE コピー (別 GPU 常駐) と、decode の直列化ロック・
         # 専用ストリーム。フラグ OFF の既定では一切使われない (None のまま)。
         self._decode_vae = None
@@ -4554,6 +4582,23 @@ class MiniMaxH3Runner:
             self._free_text_encoder()
         if progress:
             progress.update(phase="loading_transformer", message="transformer をロード中...")
+        if self._base_pin_module is not None:
+            # H3_BASE_PINNED: 退避中のモジュールを pinned H2D で復帰させる。構造
+            # (turbo LoRA ラップ・attention backend) はモジュールに保持済みのため、
+            # 下の新規ロード経路の再適用は一切通らない。
+            t0 = time.time()
+            for t, master in self._base_pin_tensors:
+                t.data = master.to(DEVICE, non_blocking=True)
+            torch.cuda.synchronize()
+            self._pipe.transformer = self._base_pin_module
+            self._transformer_loaded = True
+            self._turbo_lora_wrapped = True
+            self._active_variant = "t2va"
+            logger.info(
+                "H3_BASE_PINNED: transformer restored from pinned masters in %.2fs. gpu=%s",
+                time.time() - t0, gpu_mem_gb(),
+            )
+            return
         t0 = time.time()
         loaded_from_prequant = False
         if H3_TRANSFORMER_QUANT == "int8":
@@ -4578,37 +4623,27 @@ class MiniMaxH3Runner:
                     device_map={"transformer": "cuda"},
                 )
         elif H3_TRANSFORMER_QUANT == "ck-w4a8":
-            # base の W4A8(comfy-kitchen)。pruned の ck-w4a8 と同じ流儀:
-            # キャッシュ優先、無ければ bf16 を CPU に実体化して層単位で GPU 量子化する
-            # (一度きりのロード時 staging。生成中の往復ではないので CLAUDE.md #33 の
-            # 禁止パターンには当たらない — pruned の fresh 経路と同じ前例)。
-            if H3_TRANSFORMER_PREQUANT and self._load_transformer_from_prequant(
-                self._transformer_prequant_dir(is_ref=False), is_ref=False, progress=progress
-            ):
-                loaded_from_prequant = True
-            else:
-                avail_ram = ram_gb()["avail_gb"]
-                if avail_ram < 75.0:
-                    raise RuntimeError(
-                        f"ck-w4a8 base の初回量子化には bf16 重み ~66GB を CPU に置く必要が"
-                        f"ありますが、空きホストRAMが {avail_ram:.1f}GB しかありません"
-                        "(キャッシュ作成後は不要になります)。"
-                    )
-                from diffusers import MiniMaxH3Transformer3DModel
+            # base = Kijai の AdaLN-pruned W4A8(fl2va_pruned_w4a8_mixed)を
+            # scripts/convert_kijai_w4a8.py で変換したキャッシュからロードする。
+            # アーキは pruned ref と同一(remote code クラス)なので pruned の
+            # ロード機構をそのまま使う。fresh 量子化経路は存在しない(ソースが
+            # Kijai の量子化済み配布物のため。フル 33B の直 W4 化は adaln_proj の
+            # K=2688 が回転カーネル 256 固定に非対応で不成立 — commit c56ed36 参照)。
+            from core import pruned as pruned_mod
 
-                from core import pruned as pruned_mod
-
-                t_fresh = time.time()
-                tr = MiniMaxH3Transformer3DModel.from_pretrained(
-                    MODEL_ID, subfolder="transformer", torch_dtype=torch.bfloat16
+            cache_dir = H3_TRANSFORMER_PREQUANT_DIR / "transformer_base_pruned_ck_w4a8"
+            if not (cache_dir / "pruned_ck_w4a8_state.pt").exists():
+                raise RuntimeError(
+                    f"ck-w4a8 base のキャッシュがありません: {cache_dir}。"
+                    "scripts/convert_kijai_w4a8.py で "
+                    "Kijai/MiniMax-H3-experimental の minimax_h3_fl2va_pruned_w4a8_mixed."
+                    "safetensors を変換してください。"
                 )
-                logger.info("base transformer bf16 loaded (CPU) in %.1fs", time.time() - t_fresh)
-                names = pruned_mod.kitchen_linear_names(tr, H3_INT8_MODULES_TO_NOT_CONVERT)
-                t_q = time.time()
-                pruned_mod.quantize_kitchen_names(tr, names, DEVICE)
-                logger.info("base kitchen W4A8 quantize done in %.1fs (layers=%d)",
-                            time.time() - t_q, len(names))
-                self._pipe.transformer = tr.to(DEVICE)
+            snapshot = pruned_mod.pruned_snapshot_dir(H3_PRUNED_REPO, weights=False)
+            self._pipe.transformer = pruned_mod.load_pruned_ref_from_cache(
+                cache_dir, snapshot, DEVICE, H3_PRUNED_CONVROT_GROUP, quant="ck-w4a8"
+            )
+            loaded_from_prequant = True
         else:
             self._pipe.load_components(names=["transformer"], dtype=torch.bfloat16)
             self._pipe.transformer.to(DEVICE)
@@ -4635,8 +4670,7 @@ class MiniMaxH3Runner:
         # おき、次回以降のロードを短縮する。turbo LoRA の構造的 wrap や attention
         # backend/FBC/AdaLN precompute の設定 (いずれも下記) より**前**、量子化直後の
         # まっさらな状態で保存する (H3_TRANSFORMER_PREQUANT の module docstring 参照)。
-        if (H3_TRANSFORMER_QUANT in ("int8", "ck-w4a8") and H3_TRANSFORMER_PREQUANT
-                and not loaded_from_prequant):
+        if H3_TRANSFORMER_QUANT == "int8" and H3_TRANSFORMER_PREQUANT and not loaded_from_prequant:
             self._save_transformer_prequant(
                 self._transformer_prequant_dir(is_ref=False), self._pipe.transformer, is_ref=False
             )
@@ -4955,9 +4989,65 @@ class MiniMaxH3Runner:
         self._pipe.transformer.enable_cache(FirstBlockCacheConfig(threshold=H3_CACHE_THRESHOLD))
         logger.info("FirstBlockCache enabled on transformer (threshold=%s)", H3_CACHE_THRESHOLD)
 
+    def _park_transformer_pinned(self):
+        """H3_BASE_PINNED: base transformer をモジュールごと保持したまま、GPU 上の
+        重み実体だけを pinned CPU マスターへ付け替えて VRAM を解放する。初回のみ
+        マスター構築 (D2H コピー)、2回目以降は `p.data = master` のポインタ付け替え
+        のみ (コピー無し・一時二重化無し)。復帰は `_ensure_transformer` 冒頭の
+        pinned H2D 経路。turbo LoRA の lora_a/b は buffer 登録 (persistent=False)
+        のため `module.buffers()` で漏れなく対象になる。"""
+        module = self._pipe.transformer
+        if self._base_pin_module is None:
+            t0 = time.time()
+            seen: set[int] = set()
+            pairs: list = []
+            for t in itertools.chain(module.parameters(), module.buffers()):
+                if id(t) in seen or t.device.type != "cuda":
+                    continue
+                seen.add(id(t))
+                master = t.data.detach().to(CPU, copy=True).pin_memory()
+                pairs.append((t, master))
+                t.data = master
+            self._base_pin_tensors = pairs
+            self._base_pin_module = module
+            gib = sum(m.numel() * m.element_size() for _, m in pairs) / 2**30
+            build_s = time.time() - t0
+        else:
+            t0 = time.time()
+            for t, master in self._base_pin_tensors:
+                t.data = master
+            gib = build_s = None
+        self._pipe.transformer = None
+        self._transformer_loaded = False
+        # ラップ構造自体は保持されるが、「今 GPU で使える transformer に適用済みか」
+        # という意味では False (復帰時に True へ戻す)。
+        self._turbo_lora_wrapped = False
+        torch.cuda.empty_cache()
+        if gib is not None:
+            logger.info(
+                "H3_BASE_PINNED: pinned masters built + transformer parked "
+                "(%.2fGiB, %d tensors, %.2fs). gpu=%s ram=%s",
+                gib, len(self._base_pin_tensors), build_s, gpu_mem_gb(), ram_gb(),
+            )
+        else:
+            logger.info(
+                "H3_BASE_PINNED: transformer parked (pointer swap, %.3fs). gpu=%s",
+                time.time() - t0, gpu_mem_gb(),
+            )
+
     def _free_transformer(self):
         if not self._transformer_loaded:
             return
+        if H3_BASE_PINNED and not self._base_pin_disabled and not H3_LOWVRAM_GROUP:
+            try:
+                self._park_transformer_pinned()
+                return
+            except Exception:
+                logger.exception(
+                    "H3_BASE_PINNED: pinned 退避に失敗、従来の解放経路へ退避 (以後無効化)")
+                self._base_pin_disabled = True
+                self._base_pin_module = None
+                self._base_pin_tensors = []
         # Drop in place, no CPU staging (same reasoning as _free_text_encoder). In
         # H3_LOWVRAM_GROUP mode the module's parameters mostly live on CPU already (only
         # ~1-2 group-offloaded blocks are ever GPU-resident at a time), so this call
@@ -5941,8 +6031,6 @@ class MiniMaxH3Runner:
                 raise RuntimeError(
                     f"H3_PRUNED_QUANT={H3_PRUNED_QUANT!r} はキャッシュ対象外です(呼び出し側のバグ)"
                 )
-        elif H3_TRANSFORMER_QUANT == "ck-w4a8":
-            name = "transformer_ref_ck_w4a8" if is_ref else "transformer_ck_w4a8"
         else:
             name = "transformer_ref_int8" if is_ref else "transformer_int8"
         return H3_TRANSFORMER_PREQUANT_DIR / name
@@ -5972,10 +6060,7 @@ class MiniMaxH3Runner:
             "source_snapshot": source_snapshot,
             "torchao_version": importlib.metadata.version("torchao"),
             "torch_version": torch.__version__,
-            "quant_config": (
-                "comfy-kitchen asym_w4a8_int8 (bits=4, group16, codebook, convrot256)"
-                if H3_TRANSFORMER_QUANT == "ck-w4a8" else "Int8WeightOnlyConfig(version=2)"
-            ),
+            "quant_config": "Int8WeightOnlyConfig(version=2)",
             # プロセス内で mutate されうる H3_INT8_MODULES_TO_NOT_CONVERT ではなく、
             # 定義時点の pristine スナップショットを使う(定義箇所のコメント参照)。
             "modules_to_not_convert": sorted(_H3_INT8_MODULES_TO_NOT_CONVERT_PRISTINE),
@@ -6043,24 +6128,7 @@ class MiniMaxH3Runner:
         try:
             from diffusers import MiniMaxH3Transformer3DModel
 
-            if H3_TRANSFORMER_QUANT == "ck-w4a8":
-                # ck-w4a8 は torchao/hf_quantizer を介さないので safetensors 形式ではなく
-                # pruned キャッシュと同じ「from_config(meta) -> シェル差し替え ->
-                # torch.load + load_state_dict(assign=True)」で実体化する。
-                from accelerate import init_empty_weights
-
-                from core import pruned as pruned_mod
-
-                config = MiniMaxH3Transformer3DModel.load_config(str(cache_dir))
-                with init_empty_weights():
-                    tr = MiniMaxH3Transformer3DModel.from_config(config)
-                names = pruned_mod.kitchen_linear_names(tr, H3_INT8_MODULES_TO_NOT_CONVERT)
-                pruned_mod.install_kitchen_shells_names(tr, names)
-                sd = torch.load(str(cache_dir / "ck_w4a8_state.pt"), map_location="cpu",
-                                weights_only=False)
-                tr.load_state_dict(sd, assign=True)
-            else:
-                tr = MiniMaxH3Transformer3DModel.from_pretrained(str(cache_dir), torch_dtype=torch.bfloat16)
+            tr = MiniMaxH3Transformer3DModel.from_pretrained(str(cache_dir), torch_dtype=torch.bfloat16)
             tr = tr.to(DEVICE)
         except Exception:
             logger.exception(
@@ -6185,12 +6253,6 @@ class MiniMaxH3Runner:
                 from core import pruned as pruned_mod
 
                 pruned_mod.save_pruned_ref_cache(transformer, tmp_dir, quant=H3_PRUNED_QUANT)
-            elif H3_TRANSFORMER_QUANT == "ck-w4a8":
-                # ck-w4a8 base: バッファは plain tensor だが、pruned と同じ
-                # config + torch.save(state_dict) 形式に揃える(ローダと対)。
-                tmp_dir.mkdir(parents=True, exist_ok=True)
-                transformer.save_config(str(tmp_dir))
-                torch.save(transformer.state_dict(), str(tmp_dir / "ck_w4a8_state.pt"))
             else:
                 transformer.save_pretrained(str(tmp_dir))
             (tmp_dir / "meta.json").write_text(

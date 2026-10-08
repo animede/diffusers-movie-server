@@ -259,6 +259,9 @@ H3_PRESETS = {
             # ここに会話ターンが衝突すると中断が効くまで最大 ~6.5s 待つ(2026-10-07 実測)。
             # pinned 化で退避が 0.24s になり窓が縮む。ref2va 定常(VAE 常駐)には影響なし、
             # 出力フレーム完全一致。pinned ホスト RAM +5.4GiB(commit ae0bfe7)。
+            # 注: base も ck-w4a8 pruned + H3_BASE_PINNED にする選択肢あり(-32gb 版で
+            # 採用済み、base ロード 4.2s -> restore 2.0s)。この 96GB 版は待機品質の
+            # 確実性を優先して int8 フル base を維持(ユーザー判断で切替可)。
             "H3_VAE_PINNED": "1",
         },
         description="ref2va 連続生成のリアルタイム構成(2GPU: denoise + decode 分離、"
@@ -297,7 +300,20 @@ H3_PRESETS = {
             "H3_LOWVRAM": "1",
             "H3_TE_PRUNE": "1",
             "H3_VIDEO_VAE_FP16": "1",
-            "H3_TRANSFORMER_QUANT": "int8",
+            # base(t2va/fl2va 待機)も ck-w4a8 pruned 化(2026-10-08)。Kijai の
+            # fl2va_pruned_w4a8_mixed を scripts/convert_kijai_w4a8.py で変換した
+            # キャッシュ(models/prequant/transformer_base_pruned_ck_w4a8)を使う。
+            # int8 フル base(33GB)は 32GB 窓に載らず待機生成が不可だったが、ck base
+            # (12.5GB)で初めて 32GB 単騎でも待機が成立する: 実測(GPU1、320×448)
+            # fl 窓 peak 15.97GB / 352×640 で 16.75GB、ref 窓 peak 20.31GB。品質は
+            # 同一 seed で int8 フル base と mean diff 8.9/255(4step の揺らぎ水準)・
+            # シャープさ同等。fl2v turbo(lightx2v)は attn/ff の 312 層のみで AdaLN
+            # 因子を持たないため pruned でもそのまま適用できる。
+            "H3_TRANSFORMER_QUANT": "ck-w4a8",
+            # base の都度ロード(ck キャッシュ 8.5s)を pinned CPU マスター退避に置換:
+            # park 0.27s(ポインタ付替えのみ)/ restore 2.0s(13GiB pinned H2D)。
+            # 初回のみマスター構築 9.6s。ホスト RAM +13GiB pinned(2026-10-08 実測)。
+            "H3_BASE_PINNED": "1",
             "H3_PRUNED": "1",
             # ck-w4a8(comfy-kitchen W4A8)へ切替(2026-10-07、A/B 済み):
             # int8dyn-convrot+compile3 比で denoise 13.0->9.4s(-28%)・常駐 21.6->14.9GB・
@@ -329,10 +345,11 @@ H3_PRESETS = {
         },
         description="ref2va リアルタイムの低VRAM版(GPU0 32GB/48GB 級 + GPU1 8GB 級)。"
                     "推奨 352×640・7.3秒クリップで cadence 6.77s、GPU0 peak 27.3GB(空き 28GiB "
-                    "以上必要)。出力は dual-realtime-ref2va とビット一致。ホスト RAM "
-                    "~28GiB 使用。gpus=\"0,1\" 必須。HyperFlow と排他。",
+                    "以上必要)。2026-10-08: base も ck-w4a8 pruned + pinned 退避になり、"
+                    "32GB 単騎で待機(fl2va)生成も成立(fl 窓 peak ~17GB)。ホスト RAM "
+                    "~41GiB 使用(pinned base +13GiB)。gpus=\"0,1\" 必須。HyperFlow と排他。",
         vram_hint="GPU0 peak 27.3GB(空き28GiB以上・32GB級可)/ GPU1 ~6GB(8GB級可)/ "
-                  "cadence 6.77s(推奨 352×640・7.3s クリップ)/ ホストRAM ~28GiB",
+                  "cadence 6.77s(推奨 352×640・7.3s クリップ)/ ホストRAM ~41GiB(pinned base 込み)",
     ),
     "48gb-dual": Preset(
         name="48gb-dual",
