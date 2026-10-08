@@ -13,3 +13,11 @@ LTX-2.5-Diffusers-bnb-4bit
 scratch*/
 gateway/run/
 gateway/data/
+
+# 日々の作業 docs は非公開(ローカル保持のみ、2026-10-08 運用変更)。
+# 公開に残すのは API 仕様と技術章のみ。
+docs/*
+!docs/API_SPEC.md
+!docs/lowvram-techniques.md
+backends/minimax-h3/docs/h3-single-frame-vae-eval-20260827.md
+backends/minimax-h3/docs/h3-transformer-prequant-20260827.md
