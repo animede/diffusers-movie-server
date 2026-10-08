@@ -5,10 +5,10 @@ MiniMax-H3(旧 `/home/animede/minimax-h3`、port 8611)と LTX-2.5
 動画+音声生成サーバ。torch のメジャーバージョンが衝突する2バックエンドを
 「専用 venv の別プロセス + 統一ゲートウェイ」で共存させる。
 
-- 計画・経緯: `docs/INTEGRATION_PLAN.md`
+- 計画・経緯: `docs/INTEGRATION_PLAN.md`(非公開・ローカル)
 - API 完全仕様: `docs/API_SPEC.md`
-- 旧サーバからの移行: `docs/MIGRATION.md`
-- 各フェーズの作業記録: `docs/phase0-*.md` 〜 `docs/phase4-acceptance.md`
+- 旧サーバからの移行: `docs/MIGRATION.md`(非公開・ローカル)
+- 各フェーズの作業記録: `docs/phase0-*.md` 〜(非公開・ローカル)
 
 > ### `diffusers-server`(8601)との切り分け(2026-08-26 方針決定)
 >
@@ -48,7 +48,7 @@ MiniMax-H3(旧 `/home/animede/minimax-h3`、port 8611)と LTX-2.5
 ```
 
 1プロセス統合が不可能な理由(torch/diffusers/transformers の非互換)は
-`docs/INTEGRATION_PLAN.md` 冒頭の表を参照。
+`docs/INTEGRATION_PLAN.md`(非公開・ローカル)冒頭の表を参照。
 
 ## ポート表
 
@@ -267,7 +267,7 @@ kill -TERM <gateway PID> && ./run.sh   # 起動時に adopt_orphans() が走る
    たびに base のロードが走り、24GB では窮屈になる。
 6. **`ref2va-only-24gb` の `H3_KEEP_REF2VA_VAE=0` を 1 に変えないこと**: 発話の
    連投は通っても、発話⇄待機のプロンプト切替(prefix 再エンコード)で OOM する
-   (実機再現済み。詳細 docs/h3-single-gpu-32gb-20261007.md)。
+   (実機再現済み)。
 
 - トグル: `turbo`(`H3_TURBO_LORA=1`)。int8 量子化・`H3_LOWVRAM=group` とは併用不可(400)
 - overrides は `H3_` プレフィックスのみ許可
@@ -329,7 +329,7 @@ curl -X POST http://127.0.0.1:8630/api/v1/prompt/enhance \
 ## 既存 API 対応表(旧サーバ → 新 URL)
 
 旧クライアントはパススルー URL に置き換えるだけで移行できる(API 仕様は不変)。
-詳細は `docs/MIGRATION.md`。
+詳細は `docs/MIGRATION.md`(非公開・ローカル)。
 
 ### 旧 minimax-h3(`http://<host>:8611`)
 
@@ -366,9 +366,9 @@ curl -X POST http://127.0.0.1:8630/api/v1/prompt/enhance \
   起動オーバーレイ(別バックエンド稼働中は確認ダイアログ付き切替)
 - 管理タブ: 状態カード(アクティブ/preset/PID/VRAM バー)・起動/切替/アンロード・
   統一ジョブ一覧(進捗バー・成果物リンク、DOM 差分更新でちらつきなし)
-- 詳細・検証記録: `docs/phase3-gui.md`
+- 詳細・検証記録: `docs/phase3-gui.md`(非公開・ローカル)
 
-## 実測ベンチ(GPU:0 = RTX PRO 6000 Blackwell 96GB、詳細: docs/phase4-acceptance.md)
+## 実測ベンチ(GPU:0 = RTX PRO 6000 Blackwell 96GB)
 
 | 操作 | 所要時間 | VRAM |
 |---|---|---|
@@ -409,7 +409,7 @@ curl -X POST http://127.0.0.1:8630/api/v1/prompt/enhance \
    (`height=512&width=512` を明示。統一 API は常に width/height を明示送信する)。
 9. h3 の `negative_prompt` / `guidance_scale` / `fps` は無視される(notes に記録)。
 10. venv・モデルは旧ディレクトリへの symlink 共有 — **旧ディレクトリ削除禁止**
-    (`docs/MIGRATION.md` 参照)。
+    (`docs/MIGRATION.md`(非公開・ローカル)参照)。
 
 ## ライセンス
 
