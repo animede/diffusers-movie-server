@@ -377,6 +377,90 @@ H3_PRESETS = {
         vram_hint="GPU0 peak 27.3GB(空き28GiB以上・32GB級可)/ GPU1 ~6GB(8GB級可)/ "
                   "cadence 6.77s(推奨 352×640・7.3s クリップ)/ ホストRAM ~55GiB(pinned 計 ~45GiB)",
     ),
+    "ref2va-only-32gb": Preset(
+        name="ref2va-only-32gb",
+        # ref2va 単独モード(fl2va 待機を使わない)の単機 32GB 級版(2026-10-08)。
+        # 待機は**無音 ref2va**(audio 無し・mute=true・待機用プロンプト)で代替する。
+        # base transformer が一切ロードされないため:
+        #   - base⇄ref のスワップが構造的に消滅(衝突窓の問題クラスごと不要)
+        #   - ホスト RAM: base pinned 13GiB 不要(pinned 計 ~32GiB)
+        #   - ディスク: base の ck キャッシュ 12GB 不要
+        # 実測(GPU1 をバラストで空き 30GiB に制限、320×448、seed 701-705):
+        #   speech(音声 3.46s/90f)定常 13.7s / 無音待機 5s(124f)15.4s /
+        #   speech⇄待機のプロンプト切替時 +2.7s(single prefix cache の再エンコード)/
+        #   peak 25.6GB(切替時の prefix MISS エンコード窓。余裕 4.6GB)
+        # 単機(DECODE_DEVICE 無し・decode ローカル)。VAE は常駐(KEEP_REF2VA_VAE=1)。
+        # 注意: 無音 ref2va の待機クリップは fl2va と違い first=last の完全ループに
+        # ならない(クリップ切替で絵がジャンプしうる。クライアント側でクロスフェード等
+        # の緩和を推奨)。TRANSFORMER_QUANT/BASE_PINNED は「万一 fl2va を呼ばれても
+        # 32GB で破綻しない」ための保険(通常は base 未ロードのまま)。
+        env={
+            "H3_LOWVRAM": "1",
+            "H3_TE_PRUNE": "1",
+            "H3_VIDEO_VAE_FP16": "1",
+            "H3_TRANSFORMER_QUANT": "ck-w4a8",
+            "H3_BASE_PINNED": "1",
+            "H3_PRUNED": "1",
+            "H3_PRUNED_QUANT": "ck-w4a8",
+            "H3_REF_PINNED": "1",
+            "H3_FL2VA_KEEP_TE": "1",
+            "H3_KEEP_REF2VA": "1",
+            "H3_KEEP_REF2VA_VAE": "1",
+            "H3_REF_LATENT_CACHE": "1",
+            "H3_DECODE_STREAM": "1",
+            "H3_DECODE_VAE": "light",
+            "H3_VAE_PINNED": "1",
+            "H3_TE_DIET": "1",
+            "H3_VAE_SPLIT": "1",
+            "H3_REF_PREFIX_CACHE_SINGLE": "1",
+            "H3_REF_PREFIX_PARK": "1",
+            "H3_TE_STREAM": "1",
+        },
+        description="ref2va 単独モードの単機 32GB 級版(待機は無音 ref2va で代替、"
+                    "fl2va/base 不使用 = スワップ消滅)。320×448 で speech 定常 13.7s / "
+                    "無音待機 15.4s、peak 25.6GB(空き 28GiB 以上)。単機 1GPU で完結。"
+                    "ホスト RAM ~42GiB(pinned 計 ~32GiB)。",
+        vram_hint="peak 25.6GB(空き28GiB以上・32GB級可)/ 単機 1GPU / speech 13.7s・"
+                  "待機 15.4s(320×448)/ ホストRAM ~42GiB(pinned 計 ~32GiB)",
+    ),
+    "ref2va-only-24gb": Preset(
+        name="ref2va-only-24gb",
+        # ref2va 単独モードの単機 24GB 級(4090 等)版(2026-10-08)。-32gb 版との差分は
+        # KEEP_REF2VA_VAE=0(VAE をフェーズごとに pinned 退避)のみ。
+        # 実測(GPU1 をバラストで空き 23GiB に制限、320×448、seed 601-607):
+        #   speech 定常 15.4〜15.8s / 無音待機 5s 17.4s / プロンプト切替時 +2.6s /
+        #   peak 20.42GB(余裕 2.6GB)。OOM なし(speech 2連→無音3連→speech 2連の混在)。
+        # **VAE=1(常駐)は 24GB 窓では不可**: speech⇄待機のプロンプト切替で
+        # single prefix cache が MISS になり、TE の前置きエンコード活性が
+        # 余裕 1.6GB に収まらず OOM する(実機で再現)。VAE=0 が正解。
+        env={
+            "H3_LOWVRAM": "1",
+            "H3_TE_PRUNE": "1",
+            "H3_VIDEO_VAE_FP16": "1",
+            "H3_TRANSFORMER_QUANT": "ck-w4a8",
+            "H3_BASE_PINNED": "1",
+            "H3_PRUNED": "1",
+            "H3_PRUNED_QUANT": "ck-w4a8",
+            "H3_REF_PINNED": "1",
+            "H3_FL2VA_KEEP_TE": "1",
+            "H3_KEEP_REF2VA": "1",
+            "H3_KEEP_REF2VA_VAE": "0",
+            "H3_REF_LATENT_CACHE": "1",
+            "H3_DECODE_STREAM": "1",
+            "H3_DECODE_VAE": "light",
+            "H3_VAE_PINNED": "1",
+            "H3_TE_DIET": "1",
+            "H3_VAE_SPLIT": "1",
+            "H3_REF_PREFIX_CACHE_SINGLE": "1",
+            "H3_REF_PREFIX_PARK": "1",
+            "H3_TE_STREAM": "1",
+        },
+        description="ref2va 単独モードの単機 24GB 級版(4090 等。待機は無音 ref2va、"
+                    "VAE はフェーズごと pinned 退避)。320×448 で speech 定常 15.4s / "
+                    "無音待機 17.4s、peak 20.4GB(空き 23GiB 以上)。単機 1GPU で完結。",
+        vram_hint="peak 20.4GB(空き23GiB以上・24GB級可)/ 単機 1GPU / speech 15.4s・"
+                  "待機 17.4s(320×448)/ ホストRAM ~42GiB(pinned 計 ~32GiB)",
+    ),
     "48gb-dual": Preset(
         name="48gb-dual",
         # README「48GB級(推奨: 高速化フル)」そのまま(2GPU分担)。
