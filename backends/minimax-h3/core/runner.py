@@ -880,8 +880,9 @@ def _resolve_ref_image_short_edge(override: int | None) -> int:
 # Only the transformer is affected; transformer_ref (ref2va) and the text_encoder
 # (H3_TE_QUANT, already bnb-4bit nf4 by default) are untouched by this flag.
 H3_TRANSFORMER_QUANT = os.environ.get("H3_TRANSFORMER_QUANT", "none").strip().lower()
-if H3_TRANSFORMER_QUANT not in ("none", "int8"):
-    raise ValueError(f"H3_TRANSFORMER_QUANT must be 'none' or 'int8', got {H3_TRANSFORMER_QUANT!r}")
+if H3_TRANSFORMER_QUANT not in ("none", "int8", "ck-w4a8"):
+    raise ValueError(
+        f"H3_TRANSFORMER_QUANT must be 'none', 'int8' or 'ck-w4a8', got {H3_TRANSFORMER_QUANT!r}")
 
 # Upstream PR #14355's documented int8 recipe for the MiniMax-H3 transformer: skip
 # quantizing these modules (small, and/or numerically sensitive input/output
@@ -915,7 +916,7 @@ _H3_INT8_MODULES_TO_NOT_CONVERT_PRISTINE = tuple(H3_INT8_MODULES_TO_NOT_CONVERT)
 # skip freeing the other variant's transformer when this is True). Only meaningful
 # together with `H3_TRANSFORMER_QUANT=int8`; bf16 mode (~66.3GB each) cannot fit both
 # at once and keeps the existing one-resident-at-a-time behaviour unchanged.
-H3_TRANSFORMER_BOTH_RESIDENT = H3_TRANSFORMER_QUANT == "int8"
+H3_TRANSFORMER_BOTH_RESIDENT = H3_TRANSFORMER_QUANT in ("int8", "ck-w4a8")
 
 # 量子化済み transformer/transformer_ref のディスクキャッシュ (既定ON、H3_TE_PREQUANT と
 # 同じ設計思想)。
@@ -1056,7 +1057,8 @@ if H3_LOWVRAM_ANY:
             "(it will default to int8 under H3_LOWVRAM) or set "
             "H3_TRANSFORMER_QUANT=int8 explicitly."
         )
-    H3_TRANSFORMER_QUANT = "int8"
+    if H3_TRANSFORMER_QUANT == "none":
+        H3_TRANSFORMER_QUANT = "int8"
     H3_TRANSFORMER_BOTH_RESIDENT = False
     # Every `H3_LOWVRAM`/`H3_LOWVRAM_GROUP` branch further down in this file
     # (generate()/generate_ref2va()) is written assuming TE_QUANT == "bnb-4bit" (it is
@@ -1087,6 +1089,11 @@ H3_PRUNED_CONVROT_GROUP = int(os.environ.get("H3_PRUNED_CONVROT_GROUP", "256"))
 # `fp8`・`fp8-convrot`・`bf16` も選べる。キャッシュ dir 名・meta.json は方式ごとに別
 # (旧既定 int8dyn-convrot のキャッシュも従来のまま使える)。
 # 未知の値・torchao に無い config は初回リクエストまで持ち越さず、起動時にここで落とす。
+if H3_TRANSFORMER_QUANT == "ck-w4a8" and not H3_PRUNED:
+    raise RuntimeError(
+        "H3_TRANSFORMER_QUANT=ck-w4a8 は現状 H3_PRUNED=1 と併用してください"
+        "(非 pruned の transformer_ref への ck-w4a8 適用は未実装。base(t2va/fl2va)側のみ対応)。"
+    )
 H3_PRUNED_QUANT = os.environ.get("H3_PRUNED_QUANT", "int8wo").strip().lower()
 if H3_PRUNED:
     from core import pruned as _pruned_mod
@@ -1112,7 +1119,7 @@ if H3_PRUNED_COMPILE and not (H3_PRUNED and H3_PRUNED_QUANT_SPEC is not None and
     )
     H3_PRUNED_COMPILE = False
     H3_PRUNED_COMPILE_LEVEL = 0
-if H3_PRUNED and H3_TRANSFORMER_QUANT != "int8":
+if H3_PRUNED and H3_TRANSFORMER_QUANT not in ("int8", "ck-w4a8"):
     # pruned は ref2va の transformer_ref 専用で、その量子化方式は H3_PRUNED_QUANT が決める。
     # H3_TRANSFORMER_QUANT は t2va 側の transformer と両常駐(H3_TRANSFORMER_BOTH_RESIDENT)
     # / LOWVRAM 経路を決めるため別軸だが、pruned との組み合わせは int8 でしか検証して
@@ -1870,7 +1877,7 @@ H3_VAE_SMALLCLIP_FIX = os.environ.get("H3_VAE_SMALLCLIP_FIX", "1").strip() == "1
 # heuristic would miss but that later, key-level check would still catch).
 H3_ADALN_PRECOMP = os.environ.get("H3_ADALN_PRECOMP", "0").strip() == "1"
 if H3_ADALN_PRECOMP:
-    if H3_TRANSFORMER_QUANT == "int8":
+    if H3_TRANSFORMER_QUANT != "none":
         raise RuntimeError(
             "H3_ADALN_PRECOMP=1 と H3_TRANSFORMER_QUANT=int8 は併用できません "
             "(int8 は adaln_proj も含め全 Linear を torchao Int8Tensor へ量子化するため、"
@@ -4570,6 +4577,38 @@ class MiniMaxH3Runner:
                     quantization_config={"transformer": quant_config},
                     device_map={"transformer": "cuda"},
                 )
+        elif H3_TRANSFORMER_QUANT == "ck-w4a8":
+            # base の W4A8(comfy-kitchen)。pruned の ck-w4a8 と同じ流儀:
+            # キャッシュ優先、無ければ bf16 を CPU に実体化して層単位で GPU 量子化する
+            # (一度きりのロード時 staging。生成中の往復ではないので CLAUDE.md #33 の
+            # 禁止パターンには当たらない — pruned の fresh 経路と同じ前例)。
+            if H3_TRANSFORMER_PREQUANT and self._load_transformer_from_prequant(
+                self._transformer_prequant_dir(is_ref=False), is_ref=False, progress=progress
+            ):
+                loaded_from_prequant = True
+            else:
+                avail_ram = ram_gb()["avail_gb"]
+                if avail_ram < 75.0:
+                    raise RuntimeError(
+                        f"ck-w4a8 base の初回量子化には bf16 重み ~66GB を CPU に置く必要が"
+                        f"ありますが、空きホストRAMが {avail_ram:.1f}GB しかありません"
+                        "(キャッシュ作成後は不要になります)。"
+                    )
+                from diffusers import MiniMaxH3Transformer3DModel
+
+                from core import pruned as pruned_mod
+
+                t_fresh = time.time()
+                tr = MiniMaxH3Transformer3DModel.from_pretrained(
+                    MODEL_ID, subfolder="transformer", torch_dtype=torch.bfloat16
+                )
+                logger.info("base transformer bf16 loaded (CPU) in %.1fs", time.time() - t_fresh)
+                names = pruned_mod.kitchen_linear_names(tr, H3_INT8_MODULES_TO_NOT_CONVERT)
+                t_q = time.time()
+                pruned_mod.quantize_kitchen_names(tr, names, DEVICE)
+                logger.info("base kitchen W4A8 quantize done in %.1fs (layers=%d)",
+                            time.time() - t_q, len(names))
+                self._pipe.transformer = tr.to(DEVICE)
         else:
             self._pipe.load_components(names=["transformer"], dtype=torch.bfloat16)
             self._pipe.transformer.to(DEVICE)
@@ -4596,10 +4635,12 @@ class MiniMaxH3Runner:
         # おき、次回以降のロードを短縮する。turbo LoRA の構造的 wrap や attention
         # backend/FBC/AdaLN precompute の設定 (いずれも下記) より**前**、量子化直後の
         # まっさらな状態で保存する (H3_TRANSFORMER_PREQUANT の module docstring 参照)。
-        if H3_TRANSFORMER_QUANT == "int8" and H3_TRANSFORMER_PREQUANT and not loaded_from_prequant:
+        if (H3_TRANSFORMER_QUANT in ("int8", "ck-w4a8") and H3_TRANSFORMER_PREQUANT
+                and not loaded_from_prequant):
             self._save_transformer_prequant(
                 self._transformer_prequant_dir(is_ref=False), self._pipe.transformer, is_ref=False
             )
+
         self._transformer_loaded = True
         self._active_variant = "t2va"
         if H3_TURBO_LORA:
@@ -5900,6 +5941,8 @@ class MiniMaxH3Runner:
                 raise RuntimeError(
                     f"H3_PRUNED_QUANT={H3_PRUNED_QUANT!r} はキャッシュ対象外です(呼び出し側のバグ)"
                 )
+        elif H3_TRANSFORMER_QUANT == "ck-w4a8":
+            name = "transformer_ref_ck_w4a8" if is_ref else "transformer_ck_w4a8"
         else:
             name = "transformer_ref_int8" if is_ref else "transformer_int8"
         return H3_TRANSFORMER_PREQUANT_DIR / name
@@ -5929,7 +5972,10 @@ class MiniMaxH3Runner:
             "source_snapshot": source_snapshot,
             "torchao_version": importlib.metadata.version("torchao"),
             "torch_version": torch.__version__,
-            "quant_config": "Int8WeightOnlyConfig(version=2)",
+            "quant_config": (
+                "comfy-kitchen asym_w4a8_int8 (bits=4, group16, codebook, convrot256)"
+                if H3_TRANSFORMER_QUANT == "ck-w4a8" else "Int8WeightOnlyConfig(version=2)"
+            ),
             # プロセス内で mutate されうる H3_INT8_MODULES_TO_NOT_CONVERT ではなく、
             # 定義時点の pristine スナップショットを使う(定義箇所のコメント参照)。
             "modules_to_not_convert": sorted(_H3_INT8_MODULES_TO_NOT_CONVERT_PRISTINE),
@@ -5997,7 +6043,24 @@ class MiniMaxH3Runner:
         try:
             from diffusers import MiniMaxH3Transformer3DModel
 
-            tr = MiniMaxH3Transformer3DModel.from_pretrained(str(cache_dir), torch_dtype=torch.bfloat16)
+            if H3_TRANSFORMER_QUANT == "ck-w4a8":
+                # ck-w4a8 は torchao/hf_quantizer を介さないので safetensors 形式ではなく
+                # pruned キャッシュと同じ「from_config(meta) -> シェル差し替え ->
+                # torch.load + load_state_dict(assign=True)」で実体化する。
+                from accelerate import init_empty_weights
+
+                from core import pruned as pruned_mod
+
+                config = MiniMaxH3Transformer3DModel.load_config(str(cache_dir))
+                with init_empty_weights():
+                    tr = MiniMaxH3Transformer3DModel.from_config(config)
+                names = pruned_mod.kitchen_linear_names(tr, H3_INT8_MODULES_TO_NOT_CONVERT)
+                pruned_mod.install_kitchen_shells_names(tr, names)
+                sd = torch.load(str(cache_dir / "ck_w4a8_state.pt"), map_location="cpu",
+                                weights_only=False)
+                tr.load_state_dict(sd, assign=True)
+            else:
+                tr = MiniMaxH3Transformer3DModel.from_pretrained(str(cache_dir), torch_dtype=torch.bfloat16)
             tr = tr.to(DEVICE)
         except Exception:
             logger.exception(
@@ -6122,6 +6185,12 @@ class MiniMaxH3Runner:
                 from core import pruned as pruned_mod
 
                 pruned_mod.save_pruned_ref_cache(transformer, tmp_dir, quant=H3_PRUNED_QUANT)
+            elif H3_TRANSFORMER_QUANT == "ck-w4a8":
+                # ck-w4a8 base: バッファは plain tensor だが、pruned と同じ
+                # config + torch.save(state_dict) 形式に揃える(ローダと対)。
+                tmp_dir.mkdir(parents=True, exist_ok=True)
+                transformer.save_config(str(tmp_dir))
+                torch.save(transformer.state_dict(), str(tmp_dir / "ck_w4a8_state.pt"))
             else:
                 transformer.save_pretrained(str(tmp_dir))
             (tmp_dir / "meta.json").write_text(
