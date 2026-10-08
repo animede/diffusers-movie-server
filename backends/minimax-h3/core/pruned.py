@@ -366,10 +366,21 @@ class CKW4A8Linear(torch.nn.Linear):
     """
 
     GROUP_SIZE = 16
-    CONVROT_GROUPSIZE = 256
+
+    @staticmethod
+    def convrot_groupsize_for(in_features: int) -> int:
+        """K(in_features)を割り切る最大の回転グループ。pruned の対象層は全て 256 だが、
+        base(非 pruned)には K=2688 など 256 で割り切れない層がある(実機で検出)。
+        in_features から決定的に導出するので、キャッシュ再ロードのシェル側でも
+        同じ値が再現される(state_dict に持たせる必要がない)。"""
+        for g in (256, 128, 64, 32, 16):
+            if in_features % g == 0:
+                return g
+        raise RuntimeError(f"in_features={in_features} は 16 で割り切れず W4A8 化できません")
 
     def __init__(self, in_features: int, out_features: int, bias: bool):
         super().__init__(in_features, out_features, bias=False, device="meta")
+        self.convrot_groupsize = self.convrot_groupsize_for(in_features)
         del self._parameters["weight"]
         if bias:
             self.bias = torch.nn.Parameter(
@@ -390,7 +401,8 @@ class CKW4A8Linear(torch.nn.Linear):
 
         w = module.weight.data.to(device)
         qdata, s_rel, s_channel, correction, codebook = ck.quantize_w4a8_int8_weight(
-            w, group_size=cls.GROUP_SIZE, convrot_groupsize=cls.CONVROT_GROUPSIZE
+            w, group_size=cls.GROUP_SIZE,
+            convrot_groupsize=cls.convrot_groupsize_for(module.in_features),
         )
         if correction is not None:
             # 既定引数では None(実機確認済み)。付いて返る条件が増えたら保存形式ごと
@@ -416,7 +428,7 @@ class CKW4A8Linear(torch.nn.Linear):
             x.reshape(-1, shape[-1]),
             self.qdata, self.s_rel, self.s_channel,
             codebook=self.codebook, correction=None, bias=self.bias,
-            group_size=self.GROUP_SIZE, convrot_groupsize=self.CONVROT_GROUPSIZE,
+            group_size=self.GROUP_SIZE, convrot_groupsize=self.convrot_groupsize,
             out_dtype=x.dtype,
         )
         return y.reshape(*shape[:-1], y.shape[-1])
@@ -430,6 +442,39 @@ def _set_module_by_path(root: torch.nn.Module, path: str, value: torch.nn.Module
     setattr(parent, parts[-1], value)
 
 
+def kitchen_linear_names(model, exclude_substrings) -> list[str]:
+    """ck-w4a8 の対象 nn.Linear 名を列挙する(base = 非 pruned transformer 用)。
+
+    除外は torchao の modules_to_not_convert と同じ部分一致セマンティクス
+    (`any(sub in name)`) — int8 経路とレシピの除外集合を揃えるため。
+    `type(module) is nn.Linear` 判定なのは、既に置換/ラップ済みモジュールを
+    二重変換しないため(_quantize_plain と同じ構造保証)。"""
+    return [
+        name for name, module in model.named_modules()
+        if type(module) is torch.nn.Linear and not any(sub in name for sub in exclude_substrings)
+    ]
+
+
+def quantize_kitchen_names(model, names: list[str], device) -> None:
+    """名前リストで指定した Linear 群を CKW4A8Linear へ置換する(層単位 GPU 量子化)。"""
+    lookup = dict(model.named_modules())
+    for name in names:
+        module = lookup[name]
+        if type(module) is not torch.nn.Linear:
+            raise RuntimeError(f"{name} は既に置換済みです({type(module).__name__})")
+        _set_module_by_path(model, name, CKW4A8Linear.from_linear(module, device))
+
+
+def install_kitchen_shells_names(model, names: list[str]) -> int:
+    """キャッシュ再ロード用: 指定 Linear 群を meta の CKW4A8Linear 空シェルへ差し替える。"""
+    lookup = dict(model.named_modules())
+    for name in names:
+        module = lookup[name]
+        _set_module_by_path(model, name, CKW4A8Linear(
+            module.in_features, module.out_features, module.bias is not None))
+    return len(names)
+
+
 def _quantize_kitchen(transformer, device) -> list[str]:
     """ConvRot 対象と同じ 300 層を comfy-kitchen W4A8 の CKW4A8Linear へ置換する。
 
@@ -438,12 +483,7 @@ def _quantize_kitchen(transformer, device) -> list[str]:
     (mark_convrot / _convrot_layers)は一切使わない(kitchen カーネルが回転を内包)。
     """
     names = transformer.convrot_layers()
-    lookup = dict(transformer.named_modules())
-    for name in names:
-        module = lookup[name]
-        if not type(module) in (torch.nn.Linear,):
-            raise RuntimeError(f"{name} は既に置換済みです({type(module).__name__})")
-        _set_module_by_path(transformer, name, CKW4A8Linear.from_linear(module, device))
+    quantize_kitchen_names(transformer, names, device)
     return names
 
 
@@ -452,14 +492,7 @@ def _install_kitchen_shells(transformer) -> int:
     空シェル(meta、正しい shape)へ差し替える。続く `load_state_dict(assign=True)` が
     qdata/s_rel/s_channel/codebook(/bias)を実体化する。"""
     names = transformer.convrot_layers()
-    lookup = dict(transformer.named_modules())
-    for name in names:
-        module = lookup[name]
-        _set_module_by_path(
-            transformer, name,
-            CKW4A8Linear(module.in_features, module.out_features, module.bias is not None),
-        )
-    return len(names)
+    return install_kitchen_shells_names(transformer, names)
 
 
 def _quantize_plain(transformer, config, device) -> list[str]:
