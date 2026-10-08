@@ -240,6 +240,34 @@ kill -TERM <gateway PID> && ./run.sh   # 起動時に adopt_orphans() が走る
 | `48gb-lowvram` | `H3_LOWVRAM=1 H3_TE_PRUNE=1 H3_VIDEO_VAE_FP16=1` | t2v peak ~38.9GB |
 | `32gb-group` | `H3_LOWVRAM=group H3_TE_PRUNE=1` | peak ~17.7〜28.7GB |
 | `16gb-proj` | `H3_LOWVRAM=group H3_TE_PROJ=… H3_VIDEO_VAE_FP16=1 H3_ATTN_BACKEND=default` | peak ~11.4GB |
+| `dual-realtime-ref2va` | pruned ck-w4a8 + 2GPU decode 分離ほか(backends.py 参照) | ref2va リアルタイム(0.89x)。GPU0 96GB 級 + GPU1 8GB 級 |
+| `dual-realtime-ref2va-32gb` | 同上の低VRAM版 | GPU0 peak 27.3GB(32GB 級可)+ GPU1 8GB 級、0.93x |
+| `ref2va-only-32gb` | ref2va 単独(待機 = 無音 ref2va、base 不使用) | **単機 1GPU**、peak 25.6GB、320×448 で 0.95x |
+| `ref2va-only-24gb` | 同上の 24GB 版(VAE 退避) | **単機 1GPU**、peak 20.4GB、320×448 で 1.21x |
+
+#### ⚠ 24GB / 32GB 級 VRAM で動かす場合の注意点(必読)
+
+1. **GPU 専有が前提**: 空き VRAM が 24GB 級は 23GiB 以上、32GB 級は 28GiB 以上
+   必要。**TTS・LLM は同じ GPU に同居できない**(CPU か別ホストへ)。
+   デスクトップ描画が同じ GPU に乗っている場合はその分も差し引くこと。
+2. **初回はキャッシュ作成の要件が別にある**(2回目以降は不要):
+   - ref 側 ck-w4a8 キャッシュ: `multimodalart/MiniMax-H3-Pruned` の bf16(~38GB DL)
+     から初回リクエスト時に自動量子化。**空きホスト RAM 45GB 以上が必要**
+     (当方は 48GB 級 GPU 上で作成。24GB カード上での初回量子化は未検証)
+   - base 側 ck-w4a8 キャッシュ: `Kijai/MiniMax-H3-experimental` の
+     `minimax_h3_fl2va_pruned_w4a8_mixed.safetensors`(12.5GB)をダウンロードして
+     `backends/minimax-h3/scripts/convert_kijai_w4a8.py` で変換(GPU 不要)
+3. **ホスト RAM**: pinned 常駐を合計 ~32〜45GiB 消費する(TE_STREAM 13 +
+   base 13 + ref 13.6 + VAE 5.4)。**RAM 64GB 機では `H3_REF_PINNED` か
+   `H3_TE_STREAM` のどちらかを overrides で外すこと**(128GB 機は問題なし)。
+4. **解像度は 320×448 推奨**(32GB 単騎リアルタイム 0.95x の実測点)。352×640 も
+   動くが 1.55x(非リアルタイムの画質枠)。
+5. **会話アプリ(r-n-v)と組む場合**: `ref2va-only-*` では待機動画の生成方式を
+   `silent_ref2va`(UI のライブ設定)にすること。既定の fl2va のままだと待機の
+   たびに base のロードが走り、24GB では窮屈になる。
+6. **`ref2va-only-24gb` の `H3_KEEP_REF2VA_VAE=0` を 1 に変えないこと**: 発話の
+   連投は通っても、発話⇄待機のプロンプト切替(prefix 再エンコード)で OOM する
+   (実機再現済み。詳細 docs/h3-single-gpu-32gb-20261007.md)。
 
 - トグル: `turbo`(`H3_TURBO_LORA=1`)。int8 量子化・`H3_LOWVRAM=group` とは併用不可(400)
 - overrides は `H3_` プレフィックスのみ許可
