@@ -263,6 +263,15 @@ H3_PRESETS = {
             # 採用済み、base ロード 4.2s -> restore 2.0s)。この 96GB 版は待機品質の
             # 確実性を優先して int8 フル base を維持(ユーザー判断で切替可)。
             "H3_VAE_PINNED": "1",
+            # ref(ck-w4a8 pruned)の pinned 退避。96GB では通常 KEEP_REF2VA 両常駐
+            # (coexist)が成立して free 自体が呼ばれないが、空きVRAMが閾値(42.7GB)を
+            # 割った窓では従来 ck 再ロード 9.5s に落ちていた — その退避を park 0.06s /
+            # restore 2.0s に置換する保険。ホスト RAM +13.6GiB pinned(2026-10-08)。
+            "H3_REF_PINNED": "1",
+            # 同じく coexist 不成立窓の保険: fl2va の encode 後 TE 解放をスキップし、
+            # 次の会話ターンの TE 再ロード(~15s)と ref-prefix 再エンコードを防ぐ。
+            # coexist 成立時は元々 TE を残すため挙動不変。
+            "H3_FL2VA_KEEP_TE": "1",
         },
         description="ref2va 連続生成のリアルタイム構成(2GPU: denoise + decode 分離、"
                     "pruned int8 compile + latent キャッシュ + light VAE)。352×640・7.3秒"
@@ -314,6 +323,22 @@ H3_PRESETS = {
             # park 0.27s(ポインタ付替えのみ)/ restore 2.0s(13GiB pinned H2D)。
             # 初回のみマスター構築 9.6s。ホスト RAM +13GiB pinned(2026-10-08 実測)。
             "H3_BASE_PINNED": "1",
+            # ref 側も同じ pinned 退避(この低VRRAM構成では decode 窓・fl2va 入口の
+            # _free_transformer_ref() により**連続会話ターンでも毎回 ck 再ロード 9.5s を
+            # 払っていた**)。park 0.06s / restore 2.0s。ホスト RAM +13.6GiB pinned。
+            "H3_REF_PINNED": "1",
+            # fl2va(待機)の encode 後 TE 解放をスキップ(ck base 13GB なら TE
+            # ~4GB と同居できる)。TE 再ロード 8s + DIET/STREAM 再適用 7s +
+            # ref-prefix 再エンコード 3s が会話ターンから消える。
+            # 3点セットの実測(2026-10-08、バラスト制限 speech⇄idle サイクル):
+            #   32GB 窓(空き30GiB): speech 定常 41.7->15.8s / idle 15.5->13.8s、
+            #     peak speech 23.31GB / idle 21.08GB(余裕 6.7GB)
+            #   24GB 窓(空き23GiB、KEEP_REF2VA_VAE=0): speech 43.6->17.5s /
+            #     idle 13.7s、peak 20.31GB(余裕 2.7GB)
+            # 代償: ホスト RAM pinned 合計 ~45GiB(TE_STREAM 13 + base 13 + ref 13.6 +
+            # VAE 5.4)。RAM 64GB 機では REF_PINNED か TE_STREAM のどちらかを削ること
+            # (131GB 機の実測で avail 14GB まで低下、スワップ増加なし)。
+            "H3_FL2VA_KEEP_TE": "1",
             "H3_PRUNED": "1",
             # ck-w4a8(comfy-kitchen W4A8)へ切替(2026-10-07、A/B 済み):
             # int8dyn-convrot+compile3 比で denoise 13.0->9.4s(-28%)・常駐 21.6->14.9GB・
@@ -345,11 +370,12 @@ H3_PRESETS = {
         },
         description="ref2va リアルタイムの低VRAM版(GPU0 32GB/48GB 級 + GPU1 8GB 級)。"
                     "推奨 352×640・7.3秒クリップで cadence 6.77s、GPU0 peak 27.3GB(空き 28GiB "
-                    "以上必要)。2026-10-08: base も ck-w4a8 pruned + pinned 退避になり、"
-                    "32GB 単騎で待機(fl2va)生成も成立(fl 窓 peak ~17GB)。ホスト RAM "
-                    "~41GiB 使用(pinned base +13GiB)。gpus=\"0,1\" 必須。HyperFlow と排他。",
+                    "以上必要)。2026-10-08: base も ck-w4a8 pruned 化 + base/ref pinned 退避 + "
+                    "fl2va TE 保持で、32GB 単騎の speech⇄idle サイクルが成立"
+                    "(320×448 で speech 定常 15.8s / idle 13.8s、peak 23.3GB)。ホスト RAM "
+                    "~55GiB 使用(pinned 計 ~45GiB)。gpus=\"0,1\" 必須。HyperFlow と排他。",
         vram_hint="GPU0 peak 27.3GB(空き28GiB以上・32GB級可)/ GPU1 ~6GB(8GB級可)/ "
-                  "cadence 6.77s(推奨 352×640・7.3s クリップ)/ ホストRAM ~41GiB(pinned base 込み)",
+                  "cadence 6.77s(推奨 352×640・7.3s クリップ)/ ホストRAM ~55GiB(pinned 計 ~45GiB)",
     ),
     "48gb-dual": Preset(
         name="48gb-dual",

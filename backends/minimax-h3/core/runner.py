@@ -1408,6 +1408,33 @@ if H3_BASE_PINNED and (H3_TRANSFORMER_QUANT != "ck-w4a8" or H3_LOWVRAM_GROUP):
     )
     H3_BASE_PINNED = False
 
+# `H3_REF_PINNED=1`: transformer_ref (ref2va) にも H3_BASE_PINNED と同じ pinned CPU
+# マスター退避を適用する。H3_LOWVRAM の低VRAM構成 (TE_STREAM/VAE_SPLIT 系) では
+# decode 窓と fl2va 入口の `_free_transformer_ref()` が走るため、**連続する会話ターン
+# ですら毎回 ck キャッシュの再ロード ~9.5s を払っていた** (2026-10-08 の 32GB/24GB 窓
+# サイクル実測)。pinned 退避で park 0.3s / restore ~2s に縮む。
+# ck-w4a8 pruned ref (~13GB) 専用 (int8wo pruned 20GB の pinned 常駐は未検証)。
+# ホスト RAM を ~13.6GiB pinned で常駐消費する。既定 0 = 従来どおり。
+H3_REF_PINNED = os.environ.get("H3_REF_PINNED", "0").strip() == "1"
+if H3_REF_PINNED and (not H3_PRUNED or H3_PRUNED_QUANT != "ck-w4a8" or H3_LOWVRAM_GROUP):
+    logger.warning(
+        "H3_REF_PINNED=1 は H3_PRUNED=1 + H3_PRUNED_QUANT=ck-w4a8 (非 group) 専用です "
+        "(pruned=%s, pruned_quant=%r, group=%s) -- 無効化して従来のロード経路を使います",
+        H3_PRUNED, H3_PRUNED_QUANT, H3_LOWVRAM_GROUP,
+    )
+    H3_REF_PINNED = False
+
+# `H3_FL2VA_KEEP_TE=1`: H3_LOWVRAM の t2va/fl2va が encode 後に行う
+# `_free_text_encoder(force=True)` をスキップし、TE (bnb-4bit、TE_STREAM 後の GPU
+# 常駐 ~4GB) を待機生成の間も残す。TE を解放すると次の会話ターンが TE 再ロード
+# (8s) + TE_DIET/TE_STREAM 再適用 (7s) + ref-prefix 再エンコード (3s、prefix cache
+# は TE free で消される) を払う (2026-10-08 実測、speech 定常 43s の主因)。
+# int8 base 33GB 時代は TE と base の同居余地が無く解放が必須だったが、ck-w4a8
+# base (13GB) なら fl 窓 peak +~4.3GB で済む (24GB 窓でも収支が合う)。
+# 既定 0 = 従来どおり。KEEP_REF2VA 両常駐 (coexist) が成立する環境では不要
+# (coexist が TE ごと残すため、このフラグは coexist 不成立時の部分的 keep)。
+H3_FL2VA_KEEP_TE = os.environ.get("H3_FL2VA_KEEP_TE", "0").strip() == "1"
+
 
 def _apply_te_diet(text_encoder) -> float:
     """`H3_TE_DIET`: lm_head の重みを解放し、embed_tokens を CPU ブリッジ化する。
@@ -4135,12 +4162,13 @@ class MiniMaxH3Runner:
         # H3_VAE_PINNED: param/buffer -> pinned CPU マスター。初回の退避時に遅延構築。
         self._vae_pin_map: dict = {}
         self._vae_pin_disabled = False
-        # H3_BASE_PINNED: base transformer をモジュールごと保持し、重み実体だけ
-        # pinned CPU マスター <-> GPU で付け替える (初回 _free_transformer で遅延構築)。
-        # _base_pin_module が非 None の間、turbo LoRA ラップ等の構造はそのまま生きている。
-        self._base_pin_module = None
-        self._base_pin_tensors: list = []   # (tensor, pinned_master) の対
-        self._base_pin_disabled = False
+        # H3_BASE_PINNED / H3_REF_PINNED: transformer をモジュールごと保持し、重み実体
+        # だけ pinned CPU マスター <-> GPU で付け替える (初回の park で遅延構築)。
+        # slot = {"module", "pairs" [(tensor, pinned_master)], "wrapped" (park 時点の
+        # turbo LoRA 適用状態)}。slot が存在する間、ラップ等の構造はモジュールに
+        # そのまま生きている。キーは "base" / "ref"。
+        self._pin_slots: dict[str, dict] = {}
+        self._pin_disabled: set[str] = set()
         # H3_DECODE_DEVICE: decode 専用 VAE コピー (別 GPU 常駐) と、decode の直列化ロック・
         # 専用ストリーム。フラグ OFF の既定では一切使われない (None のまま)。
         self._decode_vae = None
@@ -4582,22 +4610,15 @@ class MiniMaxH3Runner:
             self._free_text_encoder()
         if progress:
             progress.update(phase="loading_transformer", message="transformer をロード中...")
-        if self._base_pin_module is not None:
+        if "base" in self._pin_slots:
             # H3_BASE_PINNED: 退避中のモジュールを pinned H2D で復帰させる。構造
             # (turbo LoRA ラップ・attention backend) はモジュールに保持済みのため、
             # 下の新規ロード経路の再適用は一切通らない。
-            t0 = time.time()
-            for t, master in self._base_pin_tensors:
-                t.data = master.to(DEVICE, non_blocking=True)
-            torch.cuda.synchronize()
-            self._pipe.transformer = self._base_pin_module
+            module, wrapped = self._pinned_restore("base")
+            self._pipe.transformer = module
             self._transformer_loaded = True
-            self._turbo_lora_wrapped = True
+            self._turbo_lora_wrapped = wrapped
             self._active_variant = "t2va"
-            logger.info(
-                "H3_BASE_PINNED: transformer restored from pinned masters in %.2fs. gpu=%s",
-                time.time() - t0, gpu_mem_gb(),
-            )
             return
         t0 = time.time()
         loaded_from_prequant = False
@@ -4989,15 +5010,16 @@ class MiniMaxH3Runner:
         self._pipe.transformer.enable_cache(FirstBlockCacheConfig(threshold=H3_CACHE_THRESHOLD))
         logger.info("FirstBlockCache enabled on transformer (threshold=%s)", H3_CACHE_THRESHOLD)
 
-    def _park_transformer_pinned(self):
-        """H3_BASE_PINNED: base transformer をモジュールごと保持したまま、GPU 上の
-        重み実体だけを pinned CPU マスターへ付け替えて VRAM を解放する。初回のみ
-        マスター構築 (D2H コピー)、2回目以降は `p.data = master` のポインタ付け替え
-        のみ (コピー無し・一時二重化無し)。復帰は `_ensure_transformer` 冒頭の
-        pinned H2D 経路。turbo LoRA の lora_a/b は buffer 登録 (persistent=False)
-        のため `module.buffers()` で漏れなく対象になる。"""
-        module = self._pipe.transformer
-        if self._base_pin_module is None:
+    def _pinned_park(self, name: str, module, wrapped: bool) -> None:
+        """H3_BASE_PINNED / H3_REF_PINNED: transformer をモジュールごと保持したまま、
+        GPU 上の重み実体だけを pinned CPU マスターへ付け替えて VRAM を解放する。
+        初回のみマスター構築 (D2H コピー)、2回目以降は `p.data = master` のポインタ
+        付け替えのみ (コピー無し・一時二重化無し)。復帰は `_pinned_restore`。
+        turbo LoRA の lora_a/b は buffer 登録 (persistent=False) のため
+        `module.buffers()` で漏れなく対象になる。`wrapped` = park 時点で turbo LoRA
+        が構造適用済みか (restore 時にフラグへ戻す)。"""
+        slot = self._pin_slots.get(name)
+        if slot is None:
             t0 = time.time()
             seen: set[int] = set()
             pairs: list = []
@@ -5008,46 +5030,54 @@ class MiniMaxH3Runner:
                 master = t.data.detach().to(CPU, copy=True).pin_memory()
                 pairs.append((t, master))
                 t.data = master
-            self._base_pin_tensors = pairs
-            self._base_pin_module = module
+            self._pin_slots[name] = {"module": module, "pairs": pairs, "wrapped": wrapped}
+            torch.cuda.empty_cache()
             gib = sum(m.numel() * m.element_size() for _, m in pairs) / 2**30
-            build_s = time.time() - t0
+            logger.info(
+                "H3_%s_PINNED: pinned masters built + transformer parked "
+                "(%.2fGiB, %d tensors, %.2fs). gpu=%s ram=%s",
+                name.upper(), gib, len(pairs), time.time() - t0, gpu_mem_gb(), ram_gb(),
+            )
         else:
             t0 = time.time()
-            for t, master in self._base_pin_tensors:
+            for t, master in slot["pairs"]:
                 t.data = master
-            gib = build_s = None
-        self._pipe.transformer = None
-        self._transformer_loaded = False
-        # ラップ構造自体は保持されるが、「今 GPU で使える transformer に適用済みか」
-        # という意味では False (復帰時に True へ戻す)。
-        self._turbo_lora_wrapped = False
-        torch.cuda.empty_cache()
-        if gib is not None:
+            slot["wrapped"] = wrapped
+            torch.cuda.empty_cache()
             logger.info(
-                "H3_BASE_PINNED: pinned masters built + transformer parked "
-                "(%.2fGiB, %d tensors, %.2fs). gpu=%s ram=%s",
-                gib, len(self._base_pin_tensors), build_s, gpu_mem_gb(), ram_gb(),
+                "H3_%s_PINNED: transformer parked (pointer swap, %.3fs). gpu=%s",
+                name.upper(), time.time() - t0, gpu_mem_gb(),
             )
-        else:
-            logger.info(
-                "H3_BASE_PINNED: transformer parked (pointer swap, %.3fs). gpu=%s",
-                time.time() - t0, gpu_mem_gb(),
-            )
+
+    def _pinned_restore(self, name: str):
+        """pinned マスターから GPU へ復帰させ、(module, wrapped) を返す。
+        構造 (turbo LoRA ラップ・attention backend 設定) はモジュールに保持済み。"""
+        slot = self._pin_slots[name]
+        t0 = time.time()
+        for t, master in slot["pairs"]:
+            t.data = master.to(DEVICE, non_blocking=True)
+        torch.cuda.synchronize()
+        logger.info(
+            "H3_%s_PINNED: transformer restored from pinned masters in %.2fs. gpu=%s",
+            name.upper(), time.time() - t0, gpu_mem_gb(),
+        )
+        return slot["module"], slot["wrapped"]
 
     def _free_transformer(self):
         if not self._transformer_loaded:
             return
-        if H3_BASE_PINNED and not self._base_pin_disabled and not H3_LOWVRAM_GROUP:
+        if H3_BASE_PINNED and "base" not in self._pin_disabled and not H3_LOWVRAM_GROUP:
             try:
-                self._park_transformer_pinned()
+                self._pinned_park("base", self._pipe.transformer, self._turbo_lora_wrapped)
+                self._pipe.transformer = None
+                self._transformer_loaded = False
+                self._turbo_lora_wrapped = False
                 return
             except Exception:
                 logger.exception(
                     "H3_BASE_PINNED: pinned 退避に失敗、従来の解放経路へ退避 (以後無効化)")
-                self._base_pin_disabled = True
-                self._base_pin_module = None
-                self._base_pin_tensors = []
+                self._pin_disabled.add("base")
+                self._pin_slots.pop("base", None)
         # Drop in place, no CPU staging (same reasoning as _free_text_encoder). In
         # H3_LOWVRAM_GROUP mode the module's parameters mostly live on CPU already (only
         # ~1-2 group-offloaded blocks are ever GPU-resident at a time), so this call
@@ -5120,6 +5150,16 @@ class MiniMaxH3Runner:
             # `_active_variant` even on the cached-return path, for int8 both-resident
             # mode's `_switch_to_variant` early-return check.
             self._active_variant = "ref2va"
+            return
+        if "ref" in self._pin_slots:
+            # H3_REF_PINNED: 退避中のモジュールを pinned H2D で復帰 (base 側と同型)。
+            # turbo LoRA ラップ・attention backend・FBC はモジュールに保持済み。
+            module, wrapped = self._pinned_restore("ref")
+            self._pipe_ref.transformer_ref = module
+            self._transformer_ref_loaded = True
+            self._turbo_lora_wrapped_ref = wrapped
+            self._active_variant = "ref2va"
+            interrupt_controller.check()
             return
         if progress:
             progress.update(phase="loading_transformer", message="transformer_ref (ref2va) をロード中...")
@@ -5335,6 +5375,18 @@ class MiniMaxH3Runner:
     def _free_transformer_ref(self):
         if not self._transformer_ref_loaded:
             return
+        if H3_REF_PINNED and "ref" not in self._pin_disabled:
+            try:
+                self._pinned_park("ref", self._pipe_ref.transformer_ref, self._turbo_lora_wrapped_ref)
+                self._pipe_ref.transformer_ref = None
+                self._transformer_ref_loaded = False
+                self._turbo_lora_wrapped_ref = False
+                return
+            except Exception:
+                logger.exception(
+                    "H3_REF_PINNED: pinned 退避に失敗、従来の解放経路へ退避 (以後無効化)")
+                self._pin_disabled.add("ref")
+                self._pin_slots.pop("ref", None)
         # Drop in place, no CPU staging -- same reasoning as _free_transformer /
         # _free_text_encoder (CLAUDE.md #33: no whole-module CPU-staging trips for
         # 60GB+ modules on this box). In H3_LOWVRAM_GROUP mode this reclaims host RAM
@@ -6636,6 +6688,17 @@ class MiniMaxH3Runner:
         t0 = time.time()
         self._free_transformer()
         self._free_transformer_ref()
+        if self._pin_slots:
+            # H3_BASE_PINNED/H3_REF_PINNED: 上の free は park (モジュール保持) になる
+            # が、unload_all は設定変更リロードの前段 = 完全破棄が必要 (park したまま
+            # だと新しい turbo/attn 設定が restore 経路で再適用されない)。スロットごと
+            # 捨てて pinned ホスト RAM も返す。
+            self._pin_slots.clear()
+            gc.collect()
+            _host_empty_cache = getattr(torch._C, "_host_emptyCache", None)
+            if _host_empty_cache is not None:
+                _host_empty_cache()
+            logger.info("unload_all: pinned park slots purged")
         self._free_text_encoder(force=True)
         # `_free_text_encoder` は TE 外部常駐 (`H3_TE_DEVICE`) では早期 return するので、
         # そちらの構成でも確実に捨てるためここでも呼ぶ (既定 OFF なら no-op)。
@@ -7836,6 +7899,12 @@ class MiniMaxH3Runner:
                         # TE も ref2va スタックの一部 (次の ref2va が再ロードを払わないよう残す)。
                         # encode は済んでおり、収支は _keep_ref2va_coexist で確認済み。
                         logger.info("generate: text_encoder を解放せず常駐のまま base transformer をロード (H3_KEEP_REF2VA 両常駐)")
+                    elif H3_FL2VA_KEEP_TE:
+                        # 部分的 keep (H3_FL2VA_KEEP_TE のモジュールコメント参照):
+                        # coexist 不成立の低VRAM構成でも、TE (TE_STREAM 後 ~4GB) だけは
+                        # 残して次の会話ターンの TE 再ロード (~15s) と ref-prefix 再
+                        # エンコードを省く。ref/transformer_ref は従来どおり解放済み。
+                        logger.info("generate: H3_FL2VA_KEEP_TE=1 -- text_encoder を解放せず base transformer をロード")
                     else:
                         self._free_text_encoder(force=True)
                     self._ensure_transformer(progress)
