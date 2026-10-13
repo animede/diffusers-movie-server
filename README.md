@@ -413,6 +413,8 @@ curl -X POST http://127.0.0.1:8630/api/v1/prompt/enhance \
 
 ## ライセンス
 
+本リポジトリのソースコードの著作権者: © 2026 YUZUKI (animede)。著作権表示と [NOTICE](NOTICE) の内容は、Apache-2.0 第4条に基づき再配布時も保持してください。
+
 このリポジトリで独自に実装したアプリケーションコードは [Apache License 2.0](LICENSE) で提供します。
 
 > [!IMPORTANT]
