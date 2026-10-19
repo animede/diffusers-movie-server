@@ -963,6 +963,25 @@ H3_TRANSFORMER_PREQUANT = os.environ.get("H3_TRANSFORMER_PREQUANT", "1").strip()
 H3_TRANSFORMER_PREQUANT_DIR = Path(
     os.environ.get("H3_TRANSFORMER_PREQUANT_DIR", str(H3_TE_PREQUANT_DIR))
 )
+
+# transformer / transformer_ref の bf16 重み(各 ~66GB)を HF から取りに行くのは
+# H3_ALLOW_WEIGHT_DOWNLOAD=1 のときだけ (2026-10-19 追加、既定 OFF)。
+#
+# 動機: 重みは `main` で解決するため、上流 (MiniMaxAI/MiniMax-H3) が更新されると
+# ローカルの refs/main が新コミットへ進み、bf16 ロード経路 (bf16 プリセット、または
+# int8 量子化済みキャッシュの meta 不一致によるフォールバック) が**黙って**計 ~133GB の
+# 再DLを始める (起動中に数十分、gateway も応答しなくなる)。既定ではキャッシュ済みの
+# ファイルだけで読み (`local_files_only=True`)、無ければ再DLせずエラーにする。
+# HF_HUB_OFFLINE=1 で全体を止める案は diffusers 0.40.0.dev0 がシャード分割 VAE の
+# 読み込みで API を呼んで壊れるため不可 (revert 96c4719)。transformer にだけ効かせる。
+H3_ALLOW_WEIGHT_DOWNLOAD = os.environ.get("H3_ALLOW_WEIGHT_DOWNLOAD", "0").strip() == "1"
+_TRANSFORMER_HUB_KWARGS = {} if H3_ALLOW_WEIGHT_DOWNLOAD else {"local_files_only": True}
+_TRANSFORMER_DOWNLOAD_HINT = (
+    "" if H3_ALLOW_WEIGHT_DOWNLOAD else
+    " If the bf16 shards are simply not cached (e.g. upstream MiniMaxAI/MiniMax-H3 was "
+    "updated), this is the H3_ALLOW_WEIGHT_DOWNLOAD guard: restart with "
+    "H3_ALLOW_WEIGHT_DOWNLOAD=1 to download them (~66GB each for transformer / transformer_ref)."
+)
 # TE (17-21GB) よりシャードがはるかに大きい (~34GB/インスタンス) ため、TE の既定 25GB
 # より大きい下限を既定にする。
 H3_TRANSFORMER_PREQUANT_MIN_FREE_GB = float(
@@ -4642,6 +4661,7 @@ class MiniMaxH3Runner:
                     dtype=torch.bfloat16,
                     quantization_config={"transformer": quant_config},
                     device_map={"transformer": "cuda"},
+                    **_TRANSFORMER_HUB_KWARGS,
                 )
         elif H3_TRANSFORMER_QUANT == "ck-w4a8":
             # base = Kijai の AdaLN-pruned W4A8(fl2va_pruned_w4a8_mixed)を
@@ -4666,8 +4686,9 @@ class MiniMaxH3Runner:
             )
             loaded_from_prequant = True
         else:
-            self._pipe.load_components(names=["transformer"], dtype=torch.bfloat16)
-            self._pipe.transformer.to(DEVICE)
+            self._pipe.load_components(names=["transformer"], dtype=torch.bfloat16, **_TRANSFORMER_HUB_KWARGS)
+            if getattr(self._pipe, "transformer", None) is not None:  # 失敗時は直下の明示チェックで報告
+                self._pipe.transformer.to(DEVICE)
         # `ModularPipeline.load_components()` swallows the underlying exception
         # internally (`modular_pipeline.py`'s `try/except Exception: ... logger.warning
         # (...); continue` around each component's `spec.load()`) and does NOT
@@ -4685,7 +4706,7 @@ class MiniMaxH3Runner:
             raise RuntimeError(
                 "transformer load failed (see the diffusers 'Failed to create component "
                 "transformer' warning above for the underlying error, often CUDA OOM) -- "
-                "self._pipe.transformer is still None after load_components()."
+                "self._pipe.transformer is still None after load_components()." + _TRANSFORMER_DOWNLOAD_HINT
             )
         # 初回のみ (量子化を実際にその場で行ったときだけ): 量子化済みの重みを保存して
         # おき、次回以降のロードを短縮する。turbo LoRA の構造的 wrap や attention
@@ -4939,12 +4960,13 @@ class MiniMaxH3Runner:
             dtype=torch.bfloat16,
             quantization_config={"transformer": quant_config},
             device_map={"transformer": "cpu"},
+            **_TRANSFORMER_HUB_KWARGS,
         )
         if getattr(self._pipe, "transformer", None) is None:
             raise RuntimeError(
                 "transformer load failed (see the diffusers 'Failed to create component "
                 "transformer' warning above for the underlying error) -- "
-                "self._pipe.transformer is still None after load_components()."
+                "self._pipe.transformer is still None after load_components()." + _TRANSFORMER_DOWNLOAD_HINT
             )
         t1 = time.time()
         logger.info(
@@ -5211,10 +5233,12 @@ class MiniMaxH3Runner:
                     dtype=torch.bfloat16,
                     quantization_config={"transformer_ref": quant_config},
                     device_map={"transformer_ref": "cuda"},
+                    **_TRANSFORMER_HUB_KWARGS,
                 )
         else:
-            self._pipe_ref.load_components(names=["transformer_ref"], dtype=torch.bfloat16)
-            self._pipe_ref.transformer_ref.to(DEVICE)
+            self._pipe_ref.load_components(names=["transformer_ref"], dtype=torch.bfloat16, **_TRANSFORMER_HUB_KWARGS)
+            if getattr(self._pipe_ref, "transformer_ref", None) is not None:  # 失敗時は直下の明示チェックで報告
+                self._pipe_ref.transformer_ref.to(DEVICE)
         # See `_ensure_transformer`'s matching check/comment: `load_components()` does
         # not re-raise on a failed component load (e.g. CUDA OOM), it only logs a
         # warning and leaves the attribute unset -- verify explicitly rather than let a
@@ -5224,7 +5248,7 @@ class MiniMaxH3Runner:
                 "transformer_ref load failed (see the diffusers 'Failed to create "
                 "component transformer_ref' warning above for the underlying error, "
                 "often CUDA OOM) -- self._pipe_ref.transformer_ref is still None after "
-                "load_components()."
+                "load_components()." + _TRANSFORMER_DOWNLOAD_HINT
             )
         # See `_ensure_transformer`'s matching save call: only on a fresh in-place
         # quantize, and before turbo LoRA/attn backend/FBC/AdaLN precompute setup below.
@@ -5336,12 +5360,13 @@ class MiniMaxH3Runner:
             dtype=torch.bfloat16,
             quantization_config={"transformer_ref": quant_config},
             device_map={"transformer_ref": "cpu"},
+            **_TRANSFORMER_HUB_KWARGS,
         )
         if getattr(self._pipe_ref, "transformer_ref", None) is None:
             raise RuntimeError(
                 "transformer_ref load failed (see the diffusers 'Failed to create "
                 "component transformer_ref' warning above for the underlying error) -- "
-                "self._pipe_ref.transformer_ref is still None after load_components()."
+                "self._pipe_ref.transformer_ref is still None after load_components()." + _TRANSFORMER_DOWNLOAD_HINT
             )
         t1 = time.time()
         logger.info(
