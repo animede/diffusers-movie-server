@@ -224,6 +224,10 @@ class ProcessManager:
         self._loaded: set[str] = set()
         self._foreign_listeners: dict[str, int] = {}  # backend name -> port
         self._lease: RealtimeLease | None = None      # リアルタイム優先リース
+        # 最後にリースが終わった(解放 / 期限切れ)時刻。リースはターン単位なので、
+        # 「会話が続いているか」はターン間の空白も含めてこれで判定してもらう
+        # (lipsync-mv が会話を乱さないよう待つ用途、2026-10-19)。
+        self._lease_last_end: float | None = None
 
     # -- 起動時の孤児処理 --------------------------------------------------
 
@@ -813,6 +817,8 @@ class ProcessManager:
         with self._lock:
             lease = self._lease
             if lease is None or not lease.alive():
+                if lease is not None:
+                    self._lease_last_end = lease.expires_at
                 self._lease = None
                 return {"result": "no-op", "detail": "有効なリースはありません"}
             if lease_id is not None and lease_id != lease.lease_id:
@@ -820,6 +826,7 @@ class ProcessManager:
                         "detail": f"lease_id が一致しないため解放しません"
                                   f"(現在の保持者: {lease.backend})"}
             self._lease = None
+            self._lease_last_end = time.time()
             logger.info("リアルタイムリース解放: %s (id=%s)", lease.backend, lease.lease_id)
             return {"result": "released", "backend": lease.backend,
                     "lease_id": lease.lease_id}
@@ -828,12 +835,19 @@ class ProcessManager:
         with self._lock:
             return self._lease_info_locked()
 
+    def lease_last_ended_at(self) -> float | None:
+        """最後にリースが終わった時刻(epoch 秒)。一度も無ければ None。"""
+        with self._lock:
+            self._lease_info_locked()  # 期限切れをここで確定させる
+            return self._lease_last_end
+
     def _lease_info_locked(self) -> dict | None:
         if self._lease is None:
             return None
         if not self._lease.alive():
             logger.info("リアルタイムリース期限切れ: %s (id=%s)",
                         self._lease.backend, self._lease.lease_id)
+            self._lease_last_end = self._lease.expires_at
             self._lease = None
             return None
         return self._lease.to_dict()
