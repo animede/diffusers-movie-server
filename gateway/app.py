@@ -138,7 +138,7 @@ class LeaseRequest(BaseModel):
 
 @app.get("/api/v1/realtime/lease")
 def api_lease_get():
-    return {"lease": manager.lease_info()}
+    return {"lease": manager.lease_info(), "last_ended_at": manager.lease_last_ended_at()}
 
 
 @app.post("/api/v1/realtime/lease")
