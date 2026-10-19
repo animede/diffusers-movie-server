@@ -45,6 +45,13 @@ export H3_TURBO_LORA_FILE="${H3_TURBO_LORA_FILE:-minimax_h3_ref2v_turbo_8step_v1
 export H3_TURBO_STEPS_DEFAULT="${H3_TURBO_STEPS_DEFAULT:-4}"
 export H3_VOCAL_LOCK="${H3_VOCAL_LOCK:-1}"
 export H3_REF_PREFIX_CACHE_SINGLE="${H3_REF_PREFIX_CACHE_SINGLE:-1}"
+#   HF_HUB_OFFLINE              2026-10-19 追加。重みは `main` で解決するため、上流
+#                               (MiniMaxAI/MiniMax-H3)が更新されると起動時に
+#                               text_encoder を再ダウンロードし、その間 gateway が
+#                               応答しなくなった(約10分)。キャッシュ済みの main だけを
+#                               使う。新しいファイルや更新を取り込むときは
+#                               HF_HUB_OFFLINE=0 を明示して起動する。
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 # ---------------------------------------------------------------------------
 
 exec venv/bin/python -u -m uvicorn app:app --host 0.0.0.0 --port "$PORT"
