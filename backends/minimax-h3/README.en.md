@@ -378,7 +378,8 @@ only set these if you want to change them permanently):
 | `H3_ATTN_BACKEND` | `sage` | The sage build is sm_120-only. **Any other GPU must use `default` (SDPA)** |
 | `H3_TURBO_LORA` | `0` | 4/8-step distilled LoRA (downloads about 780MB on first use; incompatible with `group`) |
 | `H3_VIDEO_VAE_FP16` | `0` | fp16-ify the video VAE (reduces decode peak; required at 16GB and below) |
-| `H3_LLM_URL` | `http://127.0.0.1:64650` | Local LLM used for prompt enhancement (optional feature) |
+| `H3_LLM_URL` | `http://127.0.0.1:64660` | Local LLM used for prompt enhancement (optional feature) |
+| `H3_LLM_API_KEY` | none | API key for the LLM server (sent as `Authorization: Bearer`). If unset, read from the same-named line in the git-ignored `config.local.env` at the repo root |
 
 ## VRAM/RAM design (important, based on measurements)
 
@@ -3000,7 +3001,7 @@ prompts into the H3 official guide's format. A local reproduction of the cloud H
 internal prompt-formatting layer.
 
 - Connection target: environment variable `H3_LLM_URL` (default
-  `http://127.0.0.1:64650`). Returns 502 if unreachable (does not affect the generation
+  `http://127.0.0.1:64660`). Returns 502 if unreachable (does not affect the generation
   feature)
 - `POST /api/prompt/enhance` {text, mode, seconds, task, lang}
 - Modes (the UI's "LLM enhance" button + mode selector):
