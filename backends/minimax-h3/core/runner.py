@@ -1795,6 +1795,54 @@ if H3_TURBO_LORA and H3_TURBO_LORA_REPO in _TURBO_COMFY_REPOS and (H3_LOWVRAM_AN
 #     _ensure_hyperflow_ref()(単一チョークポイント、ref2va と ref バッチ両方を通る)。
 # フェーズA probe 実測(2026-09-26): int8 prequant transformer_ref に PEFT が
 # TorchaoLoraLinear でそのまま適用可、LoRA 常駐 +2.87GB、ロード 6.5s。
+# 実験用(既定 OFF): Pika H3 Flex のサンプラー。Pika の Ref2VA/FL2VA アダプタは
+# 6 回評価・固定の時刻 (base grid 1000/750/500/250/100/40/0 を video shift 12 /
+# audio shift 3 で変換) で、各ステップの x0 予測に「新しいノイズ」を足して次の時刻へ
+# 戻す方式 (renoise) で蒸留されている。通常の Euler では同じ結果にならない
+# (Pika-Labs/Pika-H3-Flex の core/sampling.py が仕様)。アダプタ本体は既存の
+# turbo LoRA 経路で読む (H3_TURBO_LORA_REPO=Pika-Labs/Pika-H3-Flex、
+# H3_TURBO_LORA_FILE=ref2va/adapter.safetensors、H3_TURBO_LORA_SCALE=1.0)。
+H3_PIKA_RENOISE = os.environ.get("H3_PIKA_RENOISE", "0").strip() == "1"
+_PIKA_KNOTS = (1.0, 0.75, 0.5, 0.25, 0.1, 0.04, 0.0)
+
+
+def _install_pika_renoise(scheduler, shift: float) -> None:
+    """scheduler インスタンスの set_timesteps/step を Pika の renoise に差し替える。"""
+    sigmas = torch.tensor([shift * q / (1 + (shift - 1) * q) for q in _PIKA_KNOTS], dtype=torch.float32)
+    orig_set = scheduler.set_timesteps
+    state = {"gen": None}
+
+    def set_timesteps(num_inference_steps=None, device=None, sigmas_arg=None, **kw):
+        orig_set(device=device, sigmas=sigmas)
+        state["gen"] = None
+
+    def step(model_output, timestep, sample, return_dict=True):
+        if scheduler._step_index is None:
+            scheduler._step_index = scheduler.index_for_timestep(timestep)
+        i = scheduler._step_index
+        t = timestep if isinstance(timestep, torch.Tensor) else torch.tensor(timestep)
+        sigma_t = (1 - t.to(device=sample.device, dtype=torch.float32))
+        while sigma_t.ndim < sample.ndim:
+            sigma_t = sigma_t.unsqueeze(-1)
+        x0 = sample.float() + sigma_t * model_output.float()
+        sigma_next = float(scheduler.sigmas[i + 1])
+        if sigma_next > 0:
+            if state["gen"] is None:
+                # 同じ seed のリクエストなら同じノイズ列になるよう、初期潜在から決める。
+                seed = int(abs(float(sample.float().sum())) * 1000) % (2**31)
+                state["gen"] = torch.Generator(device=sample.device).manual_seed(seed)
+            eps = torch.randn(x0.shape, device=sample.device, dtype=torch.float32, generator=state["gen"])
+            prev = (1 - sigma_next) * x0 + sigma_next * eps
+        else:
+            prev = x0
+        scheduler._step_index = i + 1
+        prev = prev.to(sample.dtype)
+        return (prev,) if not return_dict else type("Out", (), {"prev_sample": prev})()
+
+    scheduler.set_timesteps = set_timesteps
+    scheduler.step = step
+
+
 H3_HYPERFLOW = os.environ.get("H3_HYPERFLOW", "0").strip() == "1"
 H3_HYPERFLOW_LORA = os.environ.get("H3_HYPERFLOW_LORA", "videorebirth/hyperflow").strip()
 if H3_HYPERFLOW and H3_TURBO_LORA:
@@ -4387,6 +4435,10 @@ class MiniMaxH3Runner:
         # 重要 -- プロセス全体の base はこの値 (H3_VIDEO_SHIFT 指定時はそれ、未指定なら
         # 配布 config の 12.0) であって、常に 12.0 ではない。
         self._base_video_shift = self._pipe.scheduler.shift
+        if H3_PIKA_RENOISE:
+            _install_pika_renoise(self._pipe.scheduler, 12.0)
+            _install_pika_renoise(self._pipe.audio_scheduler, 3.0)
+            logger.info("Pika H3 Flex renoise sampler installed (6 evals, video shift 12 / audio shift 3)")
         self._vae_loaded = True
         logger.info("vae/audio_vae loaded (%s) in %.1fs. gpu=%s ram=%s",
                      "GPU" if self._vae_on_gpu else "CPU", time.time() - t1, gpu_mem_gb(), ram_gb())
