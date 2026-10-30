@@ -355,7 +355,8 @@ H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1 \
 | `H3_ATTN_BACKEND` | `sage` | sage は sm_120 専用ビルド。**それ以外のGPUは `default`(SDPA)必須** |
 | `H3_TURBO_LORA` | `0` | 4/8ステップ蒸留LoRA(初回に約780MBをDL。group とは併用不可) |
 | `H3_VIDEO_VAE_FP16` | `0` | video VAE を fp16 化(デコードのピークを削減。16GB 以下では必須) |
-| `H3_LLM_URL` | `http://127.0.0.1:64650` | プロンプト強化に使うローカルLLM(任意機能) |
+| `H3_LLM_URL` | `http://127.0.0.1:64660` | プロンプト強化に使うローカルLLM(任意機能) |
+| `H3_LLM_API_KEY` | なし | LLMサーバのAPIキー(`Authorization: Bearer` で送る)。環境変数が無ければリポジトリ直下の `config.local.env`(git管理外)の同名行を読む |
 
 ## VRAM/RAM 設計 (重要、実測に基づく)
 
@@ -3282,7 +3283,7 @@ token_refiner は bf16 ベース + bf16 デルタ**という混在状態にな�
 ローカルLLM(gemma4-31B、OpenAI互換 `/v1/chat/completions`)で、入力プロンプトを
 H3公式ガイドの形式へ整形する。クラウド版Hailuo AIの内部プロンプト整形層のローカル再現。
 
-- 接続先: 環境変数 `H3_LLM_URL`(既定 `http://127.0.0.1:64650`)。接続不可時は502
+- 接続先: 環境変数 `H3_LLM_URL`(既定 `http://127.0.0.1:64660`)。接続不可時は502
   (生成機能には影響しない)
 - `POST /api/prompt/enhance` {text, mode, seconds, task, lang}
 - モード(UIの「LLM強化」ボタン+モード選択):
