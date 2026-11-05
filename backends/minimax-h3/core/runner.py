@@ -3240,6 +3240,20 @@ def _register_minimax_h3_block_for_fbc() -> None:
     )
 
 
+# H3_LORA_FUSE (2026-11-04 probe、既定 0 = 従来どおり): turbo LoRA ラッパーの要素ごとの演算を減らす。
+# 1 step のプロファイル(1024×768・175f・Pika)で、出力全体への `scale *`(scale=1.0 でも走る)が 0.40s、
+# base 出力への加算が 0.60s だった。
+#   1 = scale == 1.0 のとき掛け算を省く(1.0 * d は恒等なのでビット一致)。
+#   2 = 1 に加え、LoRA の B 側の GEMM を base 出力へ addmm_ で直接足す(加算カーネルが消える。
+#       丸めが 1 回減るのでビット一致ではない)。
+_h3_lf = os.environ.get("H3_LORA_FUSE", "0").strip()
+H3_LORA_FUSE = int(_h3_lf) if _h3_lf in ("1", "2") else 0
+# H3_BLOCK_COMPILE=1 (2026-11-04 probe、既定 0): turbo LoRA を巻いたあと transformer_ref の 50 ブロックを
+# torch.compile する(core/pruned.py の compile_transformer_blocks。attention 本体は graph break)。
+# H3_PRUNED_COMPILE=3 と同じ処理だが、ConvRot 系に限らず(int8wo でも)使える。
+H3_BLOCK_COMPILE = os.environ.get("H3_BLOCK_COMPILE", "0").strip() == "1"
+
+
 class _TurboLoRALinear(torch.nn.Module):
     """`y = base(x) + B(A(x))`, applied at run time (never fused into `base`'s weight).
 
@@ -3281,11 +3295,26 @@ class _TurboLoRALinear(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not self.enabled:
             return self.base(x)
+        if H3_LORA_FUSE:
+            return self._forward_fused(x)
         # scale=1.0 のとき `1.0 * delta` は IEEE 的に恒等なので、Ostris 版の従来挙動と
         # bit 単位で同一 (回帰性を保つ)。
         return self.base(x) + self.scale * torch.nn.functional.linear(
             torch.nn.functional.linear(x, self.lora_a), self.lora_b
         )
+
+    def _forward_fused(self, x: torch.Tensor) -> torch.Tensor:
+        """H3_LORA_FUSE=1/2 の経路(モジュール先頭のコメント参照)。"""
+        y = self.base(x)
+        t = torch.nn.functional.linear(x, self.lora_a)
+        if H3_LORA_FUSE >= 2 and y.is_contiguous() and t.dtype == y.dtype == self.lora_b.dtype:
+            n = y.shape[-1]
+            y.view(-1, n).addmm_(t.reshape(-1, t.shape[-1]), self.lora_b.t(), alpha=self.scale)
+            return y
+        d = torch.nn.functional.linear(t, self.lora_b)
+        if self.scale != 1.0:
+            d = self.scale * d
+        return y + d
 
     # `MiniMaxH3AdaLayerNormModulation.forward()`/`MiniMaxH3AdaLayerNormOut.forward()`
     # (transformer_minimax_h3.py) both read `self.linear.weight.dtype` directly to decide
@@ -5650,7 +5679,7 @@ class MiniMaxH3Runner:
                 from core import pruned as pruned_mod
 
                 pruned_mod.compile_turbo_wrappers(transformer, _TurboLoRALinear)
-            if is_ref and H3_PRUNED_COMPILE_LEVEL >= 3:
+            if is_ref and (H3_PRUNED_COMPILE_LEVEL >= 3 or H3_BLOCK_COMPILE):
                 from core import pruned as pruned_mod
 
                 pruned_mod.compile_transformer_blocks(transformer)
