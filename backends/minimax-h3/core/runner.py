@@ -2208,6 +2208,19 @@ H3_DECODE_STREAM_SIDE = _H3_DECODE_STREAM_RAW == "2"
 H3_DECODE_DEVICE = os.environ.get("H3_DECODE_DEVICE", "").strip()
 # 別 GPU の decode 専用 VAE コピーを native attention に固定するか (既定 0 = 本体と同じ backend)。
 H3_DECODE_NATIVE_ATTN = os.environ.get("H3_DECODE_NATIVE_ATTN", "0").strip() == "1"
+
+# 2026-11-05 実害の警告: decode の別 GPU/別スレッド化(H3_DECODE_STREAM / H3_DECODE_DEVICE)と
+# H3_TE_STREAM(TE の pinned ホストからの窓付き転送)を併用し、次リクエストのエンコードが前の decode と
+# 重なる使い方(story-studio の撮影の順送り)で、CUDA illegal memory access が 2 度発生した。
+# 1 度目は decode VAE の sage attention 内、H3_DECODE_NATIVE_ATTN=1 で SDPA に固定した後も
+# 2 度目が TE(testream の onload / qwen3_vl forward)で再発 — 原因の特定には至っていないが、
+# この組み合わせだけで再現し、TE_STREAM を持たない dual-realtime 系では長期間起きていない。
+# 併用は止めないが、採る前に専用のプローブで同時実行の安定を確かめること。
+if (H3_DECODE_STREAM or H3_DECODE_DEVICE) and H3_TE_STREAM:  # H3_TE_STREAM は上(2026-10-01 の節)で定義済み
+    logging.getLogger("minimax_h3").warning(
+        "H3_DECODE_STREAM/H3_DECODE_DEVICE と H3_TE_STREAM の併用: 次リクエストと decode が重なると "
+        "CUDA illegal memory access が出た実害があります(2026-11-05、story-studio の順送りで 2 回)。"
+        "重ねて使う構成はプローブで安定を確かめてから採ってください。")
 # H3_DECODE_VAE=light (2026-10-05, probe, 既定なし=標準 VAE): decode 専用コピーの video VAE を
 # LynnReal の蒸留版 light VAE (`stdstu123/LynnReal-Onmi-light-vae`: encoder は H3 公式と同一、
 # decoder だけ 36→26 層。latent の channel/mean/std/圧縮率は公式と同一) に差し替える。
