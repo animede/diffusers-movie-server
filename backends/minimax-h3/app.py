@@ -127,7 +127,10 @@ def resolve_num_inference_steps(num_inference_steps: Optional[int], turbo: Optio
     if num_inference_steps is not None:
         return num_inference_steps
     effective_turbo = turbo if turbo is not None else runner_mod.H3_TURBO_LORA
-    return H3_TURBO_STEPS_DEFAULT if effective_turbo else NON_TURBO_NUM_INFERENCE_STEPS
+    # H3_TURBO_STEPS_DEFAULT もモジュール属性として読む (import 時の値を焼き込むと、
+    # /api/settings/apply の turbo_preset 切替 (lightx2v=4step / pika-flex=7step) が
+    # ステップ既定に反映されない -- この docstring 自身が指摘していた罠の同種)。
+    return runner_mod.H3_TURBO_STEPS_DEFAULT if effective_turbo else NON_TURBO_NUM_INFERENCE_STEPS
 
 
 @app.get("/")
@@ -217,6 +220,7 @@ def api_settings_apply(
     video_vae_fp16: Optional[bool] = Form(None),
     te_proj: Optional[bool] = Form(None),
     te_proj_quant: Optional[str] = Form(None),
+    turbo_preset: Optional[str] = Form(None),
 ):
     """Apply a new reload-group configuration: unloads every big model and reloads
     under the new settings (core.settings.apply_reload_settings -> runner.unload_all()
@@ -241,6 +245,8 @@ def api_settings_apply(
         fields["te_proj"] = te_proj
     if te_proj_quant is not None:
         fields["te_proj_quant"] = te_proj_quant
+    if turbo_preset is not None:
+        fields["turbo_preset"] = turbo_preset
 
     acquired = _generation_lock.acquire(blocking=False)
     if not acquired:

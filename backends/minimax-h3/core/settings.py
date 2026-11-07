@@ -43,13 +43,85 @@ logger = logging.getLogger("minimax_h3.settings")
 _reload_lock = threading.Lock()
 
 INSTANT_CACHE_CHOICES = ("fbc", "none")
-RELOAD_TRANSFORMER_QUANT_CHOICES = ("none", "int8")
+# ck-w4a8 (comfy-kitchen W4A8) は 2026-10-07 の A/B を経て本採用になった方式
+# (core/runner.py:883 のランタイム受理値と一致させる)。runner と同じ制約として
+# H3_PRUNED=1 の起動構成が前提 (apply_reload_settings() で検証する)。
+RELOAD_TRANSFORMER_QUANT_CHOICES = ("none", "int8", "ck-w4a8")
 RELOAD_TE_QUANT_CHOICES = ("none", "bnb-4bit")
 RELOAD_LOWVRAM_CHOICES = ("0", "1", "group")
 # 投影TE (H3_TE_PROJ, Qwen3-VL-4B + 学習済み線形写像) 自身の量子化。既定は
 # core/runner.py の H3_TE_PROJ_QUANT と同じ "bnb-4bit" (2026-08-10 実測: 相対RMS
 # 0.61〜0.96%、cosine 1.0000、動画劣化なし)。
 RELOAD_TE_PROJ_QUANT_CHOICES = ("none", "bnb-4bit", "bnb-8bit")
+
+# ---- turbo LoRA 構成プリセット (再ロードグループ) -------------------------------
+# turbo の on/off 自体は instant (リクエスト単位) だが、「どの LoRA を使うか」
+# (repo/file/scale/renoise/steps 既定) は従来 env 起動時固定だった。検証済みの
+# 組み合わせだけをプリセットとして選択可能にする (生の repo/file を UI から
+# 自由入力させると scale/shift/renoise の整合が壊れるため、curated 方式)。
+#   - lightx2v: ref2v 4step v1.0 専用 LoRA (2026-10-22 A/B で最良) + base(fl2va 待機)は
+#     fl2v 4step 768p (video shift 6 自動)。scale はチェックポイント metadata から自動解決。
+#   - pika-flex: Pika H3 Flex (ref2va/fl2va アダプタ + renoise サンプラー、7step 既定、
+#     scale 1.0)。2026-10-30 に「バランス」として採用された構成。
+# HyperFlow (H3_HYPERFLOW) は H3_PRUNED と排他のためここには含めない (プリセット/
+# 再起動でのみ切替可能)。
+RELOAD_TURBO_PRESET_CHOICES = ("lightx2v", "pika-flex")
+TURBO_LORA_PRESETS = {
+    "lightx2v": {
+        "repo": "lightx2v/Minimax-h3-Turbo",
+        "file": "minimax_h3_ref2v_turbo_4step_v1.0_768p_bf16.safetensors",
+        "repo_base": "lightx2v/Minimax-h3-Turbo",
+        "file_base": "minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors",
+        "scale_raw": "",
+        "pika_renoise": False,
+        "steps_default": 4,
+    },
+    "pika-flex": {
+        "repo": "Pika-Labs/Pika-H3-Flex",
+        "file": "ref2va/adapter.safetensors",
+        "repo_base": "Pika-Labs/Pika-H3-Flex",
+        "file_base": "fl2va/adapter.safetensors",
+        "scale_raw": "1.0",
+        "pika_renoise": True,
+        "steps_default": 7,
+    },
+}
+
+
+def _turbo_state_tuple(runner) -> tuple:
+    return (
+        runner.H3_TURBO_LORA_REPO,
+        runner.H3_TURBO_LORA_FILE,
+        runner.H3_TURBO_LORA_REPO_BASE,
+        runner.H3_TURBO_LORA_FILE_BASE,
+        runner.H3_TURBO_LORA_SCALE_RAW,
+        runner.H3_PIKA_RENOISE,
+        runner.H3_TURBO_STEPS_DEFAULT,
+    )
+
+
+def _preset_state_tuple(preset: dict) -> tuple:
+    return (
+        preset["repo"],
+        preset["file"],
+        preset["repo_base"],
+        preset["file_base"],
+        preset["scale_raw"],
+        preset["pika_renoise"],
+        preset["steps_default"],
+    )
+
+
+def current_turbo_preset() -> str:
+    """現在の runner グローバル群がどのプリセットと一致するか。env で独自構成が
+    組まれている場合は "custom" (UI は変更しない限りそのまま維持する)。"""
+    import core.runner as runner
+
+    current = _turbo_state_tuple(runner)
+    for name, preset in TURBO_LORA_PRESETS.items():
+        if current == _preset_state_tuple(preset):
+            return name
+    return "custom"
 
 
 def resolve_instant_settings(
@@ -268,6 +340,13 @@ def current_settings_snapshot() -> dict:
             # 意味を持たない) -- UI はその理由を表示できるよう、状態自体は常に見える。
             "te_proj": bool(runner.H3_TE_PROJ),
             "te_proj_quant": runner.H3_TE_PROJ_QUANT,
+            # turbo LoRA 構成 (プリセット名、独自 env 構成なら "custom")。参考情報として
+            # 実際の repo/file/steps 既定も返す (UI のツールチップ・デバッグ用、read-only)。
+            "turbo_preset": current_turbo_preset(),
+            "turbo_lora_repo": runner.H3_TURBO_LORA_REPO,
+            "turbo_lora_file": runner.H3_TURBO_LORA_FILE,
+            "turbo_lora_file_base": runner.H3_TURBO_LORA_FILE_BASE,
+            "turbo_steps_default": runner.H3_TURBO_STEPS_DEFAULT,
         },
         "choices": {
             "cache": list(INSTANT_CACHE_CHOICES),
@@ -275,6 +354,7 @@ def current_settings_snapshot() -> dict:
             "te_quant": list(RELOAD_TE_QUANT_CHOICES),
             "te_proj_quant": list(RELOAD_TE_PROJ_QUANT_CHOICES),
             "lowvram": list(RELOAD_LOWVRAM_CHOICES),
+            "turbo_preset": list(RELOAD_TURBO_PRESET_CHOICES),
         },
         "constraints": {
             # Mirrors the exact incompatibilities core/runner.py enforces at import
@@ -330,6 +410,9 @@ RELOAD_ETA_S = {
     # (32B TE nf4 再ロード)、ON→ON量子化変更相当 27.3s。控えめに大きい方へ丸める。
     "te_proj": 50,
     "te_proj_quant": 50,
+    # turbo LoRA 構成の切替は unload_all + preload_all のみ (LoRA 本体のダウンロード・
+    # 適用は次回 turbo=1 リクエスト時に遅延実行されるため reload 自体には乗らない)。
+    "turbo_preset": 40,
 }
 
 
@@ -346,7 +429,7 @@ def apply_reload_settings(runner_instance, **fields) -> dict:
     machinery is used -- no os.execv, no self-kill).
 
     `fields` may contain any of: transformer_quant, te_quant, te_prune, lowvram,
-    video_vae_fp16, te_proj, te_proj_quant. Fields not present keep their current value
+    video_vae_fp16, te_proj, te_proj_quant, turbo_preset. Fields not present keep their current value
     (partial updates are fine -- the caller, `POST /api/settings/apply`, only sends what
     the user actually changed via its diff-against-current-snapshot logic, but this
     function itself does not require that; passing every field with its unchanged value
@@ -398,10 +481,32 @@ def apply_reload_settings(runner_instance, **fields) -> dict:
                 f"transformer_quant must be one of {RELOAD_TRANSFORMER_QUANT_CHOICES}, "
                 f"got {new_transformer_quant!r}"
             )
+        if new_transformer_quant == "ck-w4a8" and not runner.H3_PRUNED:
+            # core/runner.py の import 時ガードと同じ制約 (ck-w4a8 は pruned transformer_ref
+            # 側のみ実装)。H3_PRUNED は env 起動時固定で reload では切替できないため、
+            # 非 pruned プロセスでは選択自体を拒否する。
+            raise ValueError(
+                "transformer_quant=ck-w4a8 は H3_PRUNED=1 の起動構成が前提です"
+                "(非 pruned への適用は未実装)。gateway のプリセット"
+                "(48gb-pruned-lowvram / dual-realtime 系)で起動し直してください。"
+            )
         if new_te_quant not in RELOAD_TE_QUANT_CHOICES:
             raise ValueError(f"te_quant must be one of {RELOAD_TE_QUANT_CHOICES}, got {new_te_quant!r}")
         if new_lowvram_raw not in RELOAD_LOWVRAM_CHOICES:
             raise ValueError(f"lowvram must be one of {RELOAD_LOWVRAM_CHOICES}, got {new_lowvram_raw!r}")
+
+        # ---- turbo LoRA 構成プリセット ----
+        new_turbo_preset = fields.get("turbo_preset")
+        new_turbo: dict | None = None
+        if new_turbo_preset is not None:
+            new_turbo_preset = str(new_turbo_preset).strip().lower()
+            if new_turbo_preset not in RELOAD_TURBO_PRESET_CHOICES:
+                raise ValueError(
+                    f"turbo_preset must be one of {RELOAD_TURBO_PRESET_CHOICES}, "
+                    f"got {new_turbo_preset!r}"
+                )
+            new_turbo = TURBO_LORA_PRESETS[new_turbo_preset]
+        turbo_changed = new_turbo is not None and _turbo_state_tuple(runner) != _preset_state_tuple(new_turbo)
 
         # ---- 投影TE (te_proj) 有効化後は TE 系 (32B 用) の変更を拒否する ----
         # 判定は「このリクエスト適用後の値」(new_te_proj) で行う -- 「現在の値」
@@ -455,7 +560,10 @@ def apply_reload_settings(runner_instance, **fields) -> dict:
                     "transformer_quant from the request (it will default to int8 under "
                     "lowvram) or set transformer_quant=int8 explicitly."
                 )
-            new_transformer_quant = "int8"
+            # 旧実装は無条件で int8 へ強制していたが、ck-w4a8 + lowvram=1 は本番採用済み
+            # の実在構成 (48gb-pruned-lowvram プリセット) のため、補正は none のときに限る。
+            if new_transformer_quant == "none":
+                new_transformer_quant = "int8"
             if new_te_quant != "bnb-4bit":
                 raise ValueError(
                     f"lowvram={new_lowvram_raw!r} requires te_quant=bnb-4bit, got "
@@ -463,7 +571,11 @@ def apply_reload_settings(runner_instance, **fields) -> dict:
                     "anything else on a 24-48GB-class card."
                 )
 
-        new_transformer_both_resident = new_transformer_quant == "int8" and not new_lowvram_any
+        # core/runner.py:919 と同じ判定 (int8 / ck-w4a8 の両方が両常駐対象)。旧実装は
+        # int8 のみを見ており ck-w4a8 で不整合だった。
+        new_transformer_both_resident = (
+            new_transformer_quant in ("int8", "ck-w4a8") and not new_lowvram_any
+        )
 
         # turbo (instant-group) compatibility with the *new* reload config: reject the
         # apply outright if turbo is currently on and would become a confirmed-broken
@@ -480,9 +592,16 @@ def apply_reload_settings(runner_instance, **fields) -> dict:
         # 回帰監査で発覚)。その結果、H3_TURBO_LORA=1 のプロセスでは new_transformer_
         # both_resident が int8 で常に真になり、te_proj 切替を含む**あらゆる**
         # /api/settings/apply が一律 400 になっていた (リロード設定 UI が実質使用不能)。
+        # turbo プリセットも同時に切り替わる場合は「新しい repo」で comfy 形式かどうかを
+        # 判定する (両プリセットとも diffusers ネイティブ形式なので、comfy env 構成からの
+        # 脱出リクエストが旧 repo 判定で誤って 400 にならないようにする)。
+        if new_turbo is not None:
+            _new_turbo_is_comfy = new_turbo["repo"] in runner._TURBO_COMFY_REPOS
+        else:
+            _new_turbo_is_comfy = runner.turbo_lora_expected_format() == "comfy"
         if (
             runner.H3_TURBO_LORA
-            and runner.turbo_lora_expected_format() == "comfy"
+            and _new_turbo_is_comfy
             and (new_lowvram_any or new_transformer_both_resident)
         ):
             raise ValueError(
@@ -520,6 +639,8 @@ def apply_reload_settings(runner_instance, **fields) -> dict:
             )
             if old != new
         ]
+        if turbo_changed:
+            changed_fields.append("turbo_preset")
         if not changed_fields:
             logger.info("apply_reload_settings: no changes, skipping unload/reload")
             return {**current_settings_snapshot(), "changed_fields": [], "reload_time_s": 0.0}
@@ -556,6 +677,39 @@ def apply_reload_settings(runner_instance, **fields) -> dict:
         runner.H3_VIDEO_VAE_FP16 = new_video_vae_fp16
         runner.H3_TE_PROJ = new_te_proj_repo
         runner.H3_TE_PROJ_QUANT = new_te_proj_quant
+        if turbo_changed:
+            runner.H3_TURBO_LORA_REPO = new_turbo["repo"]
+            runner.H3_TURBO_LORA_FILE = new_turbo["file"]
+            runner.H3_TURBO_LORA_REPO_BASE = new_turbo["repo_base"]
+            runner.H3_TURBO_LORA_FILE_BASE = new_turbo["file_base"]
+            runner.H3_TURBO_LORA_SCALE_RAW = new_turbo["scale_raw"]
+            runner.H3_PIKA_RENOISE = new_turbo["pika_renoise"]
+            runner.H3_TURBO_STEPS_DEFAULT = new_turbo["steps_default"]
+            # 派生 video shift を import 時と同じファイル名規則で再計算する
+            # (`_fl2v_` かつ `_768p` のときだけ 6.0 -- core/runner.py:1755 のコメント参照)。
+            # H3_TURBO_VIDEO_SHIFT の明示 env 指定があるときは import 時同様それが最優先
+            # (再計算しない)。
+            if not runner.H3_TURBO_VIDEO_SHIFT_RAW:
+                runner.H3_TURBO_VIDEO_SHIFT = (
+                    6.0 if ("_fl2v_" in new_turbo["file"] and "_768p" in new_turbo["file"]) else None
+                )
+                runner.H3_TURBO_VIDEO_SHIFT_BASE = (
+                    6.0
+                    if ("_fl2v_" in new_turbo["file_base"] and "_768p" in new_turbo["file_base"])
+                    else None
+                )
+            # 解決済み LoRA パスは「プロセスに1回」前提のインスタンスキャッシュ
+            # (_download_turbo_lora_if_needed) に乗っているため、repo/file を変えたら
+            # 必ず無効化する (しないと旧 LoRA が適用され続ける)。
+            runner_instance._turbo_lora_path = None
+            runner_instance._turbo_lora_path_base = None
+            logger.info(
+                "apply_reload_settings: turbo preset -> %s (repo=%s file=%s file_base=%s "
+                "scale_raw=%r renoise=%s steps_default=%d)",
+                new_turbo_preset, new_turbo["repo"], new_turbo["file"],
+                new_turbo["file_base"], new_turbo["scale_raw"],
+                new_turbo["pika_renoise"], new_turbo["steps_default"],
+            )
 
         # ---- reload steady-state residents under the new config ----
         runner_instance.preload_all()

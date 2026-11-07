@@ -820,6 +820,14 @@
           <select id="reload-transformer-quant">
             <option value="none">none (bf16)</option>
             <option value="int8">int8</option>
+            <option value="ck-w4a8">ck-w4a8 (W4A8・pruned構成専用・現行本採用)</option>
+          </select>
+        </div>
+        <div class="reload-field">
+          <label data-i18n="label.turboPreset">turbo LoRA 構成</label>
+          <select id="reload-turbo-preset">
+            <option value="pika-flex">Pika H3 Flex (7step・renoise・バランス)</option>
+            <option value="lightx2v">lightx2v 4step v1.0 (ref2v専用 + base fl2v)</option>
           </select>
         </div>
         <div class="reload-field" id="row-reload-te-quant">
@@ -989,6 +997,7 @@ const I18N = {
     'status.checkingServer': 'サーバ状態を確認中...',
     'reload.summary': '再ロードが必要な設定(transformer量子化・TE量子化・低VRAMモード等)',
     'label.transformerQuant': 'transformer 量子化',
+    'label.turboPreset': 'turbo LoRA 構成',
     'label.teQuant': 'text_encoder 量子化',
     'label.tePrune': 'TEレイヤー削除(51/64層のみ構築)',
     'label.teProj': '投影TE(Qwen3-VL-4B + 学習済み線形写像で32B TEを置換)',
@@ -1183,6 +1192,7 @@ const I18N = {
     'status.checkingServer': 'Checking server status...',
     'reload.summary': 'Settings that require a reload (transformer quantization, TE quantization, low-VRAM mode, etc.)',
     'label.transformerQuant': 'transformer quantization',
+    'label.turboPreset': 'turbo LoRA preset',
     'label.teQuant': 'text_encoder quantization',
     'label.tePrune': 'Prune TE layers (build only 51/64 layers)',
     'label.teProj': 'Projected TE (Qwen3-VL-4B + learned linear map replacing the 32B TE)',
@@ -1367,13 +1377,30 @@ const rowReloadTePruneEl = document.getElementById('row-reload-te-prune');
 const rowReloadTeProjQuantEl = document.getElementById('row-reload-te-proj-quant');
 const teProjHintEl = document.getElementById('te-proj-hint');
 const reloadLowvramEl = document.getElementById('reload-lowvram');
+const reloadTurboPresetEl = document.getElementById('reload-turbo-preset');
+
+// select にサーバの現在値を反映する。値が option に無い場合 (env 独自構成の
+// "custom" や将来の未知値) は、空文字 (= 誤って「変更あり」扱い + apply 時 400) に
+// なるのを防ぐため、その値のままの option を動的に追加して選択しておく。
+function setReloadSelectValue(el, value) {
+  const v = String(value);
+  el.value = v;
+  if (el.value !== v) {
+    const opt = document.createElement('option');
+    opt.value = v;
+    opt.textContent = v + ' (現在のenv構成)';
+    el.appendChild(opt);
+    el.value = v;
+  }
+}
+
 const reloadVideoVaeFp16El = document.getElementById('reload-video-vae-fp16');
 const reloadApplyBtn = document.getElementById('reload-apply-btn');
 const reloadHintEl = document.getElementById('reload-hint');
 const upscaleEl = document.getElementById('upscale');
 
 // core/settings.py の RELOAD_ETA_S と同じ値(サーバ側が権威、これは表示専用のフォールバック)
-let RELOAD_ETA_S = { transformer_quant: 36, te_quant: 40, te_prune: 5, lowvram: 90, video_vae_fp16: 5 };
+let RELOAD_ETA_S = { transformer_quant: 36, te_quant: 40, te_prune: 5, lowvram: 90, video_vae_fp16: 5, turbo_preset: 40 };
 // サーバから取得した現在の設定 (GET /api/settings)。turbo のグレーアウト判定・
 // reload適用ボタンの活性判定(現在値との差分)に使う。
 let CURRENT_SETTINGS = null;
@@ -2031,7 +2058,8 @@ function applySettingsToControls(data) {
     cacheThresholdEl.disabled = !cacheEnabledEl.checked;
     attnSageEl.checked = (i.attn === 'sage');
     turboEnabledEl.checked = i.turbo;
-    reloadTransformerQuantEl.value = r.transformer_quant;
+    setReloadSelectValue(reloadTransformerQuantEl, r.transformer_quant);
+    setReloadSelectValue(reloadTurboPresetEl, r.turbo_preset);
     reloadTeQuantEl.value = r.te_quant;
     reloadTePruneEl.checked = r.te_prune;
     reloadTeProjEl.checked = r.te_proj;
@@ -2058,7 +2086,7 @@ async function loadSettings() {
 }
 loadSettings();
 
-[reloadTransformerQuantEl, reloadTeQuantEl, reloadTePruneEl, reloadTeProjEl, reloadTeProjQuantEl, reloadLowvramEl, reloadVideoVaeFp16El].forEach(el => {
+[reloadTransformerQuantEl, reloadTurboPresetEl, reloadTeQuantEl, reloadTePruneEl, reloadTeProjEl, reloadTeProjQuantEl, reloadLowvramEl, reloadVideoVaeFp16El].forEach(el => {
   el.addEventListener('change', () => { RELOAD_TOUCHED = true; updateTeProjAvailability(); updateReloadApplyState(); });
 });
 
@@ -2067,6 +2095,7 @@ function reloadChangedFields() {
   const r = CURRENT_SETTINGS.reload;
   const changed = [];
   if (reloadTransformerQuantEl.value !== r.transformer_quant) changed.push('transformer_quant');
+  if (reloadTurboPresetEl.value !== r.turbo_preset) changed.push('turbo_preset');
   if (reloadTeQuantEl.value !== r.te_quant) changed.push('te_quant');
   if (reloadTePruneEl.checked !== r.te_prune) changed.push('te_prune');
   if (reloadTeProjEl.checked !== r.te_proj) changed.push('te_proj');
@@ -2133,6 +2162,7 @@ reloadApplyBtn.addEventListener('click', async () => {
   reloadHintEl.textContent = t('reload.applying');
   const fd = new FormData();
   fd.append('transformer_quant', reloadTransformerQuantEl.value);
+  if (reloadTurboPresetEl.value !== 'custom') fd.append('turbo_preset', reloadTurboPresetEl.value);
   fd.append('te_quant', reloadTeQuantEl.value);
   // bool 項目は '0' を送る (空文字は不可 -- FastAPI の Optional[bool] は '' を
   // None=「変更なし」に解釈するため、'' だと OFF が**黙って無視**される。
