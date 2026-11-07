@@ -266,9 +266,10 @@ class PromptEnhanceRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=8000)
     mode: Literal[
         "t2av", "i2v", "flf2v", "condition", "iclora", "retake", "extend", "a2v",
-        "t2i", "refine_image", "ref2i",
+        "t2i", "refine_image", "ref2i", "storyboard",
     ] = "t2av"
     shots: list[str] = Field(default_factory=list, max_length=12)
+    seconds: float | None = Field(default=None, ge=1, le=60)
 
 
 class PromptEnhanceResponse(BaseModel):

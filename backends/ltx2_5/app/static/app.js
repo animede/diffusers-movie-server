@@ -595,13 +595,19 @@ async function collectConditions(selectedMode) {
 async function enhancePrompt() {
   const button = document.querySelector('#enhancePrompt');
   const status = document.querySelector('#enhanceStatus');
+  const storyboard = document.querySelector('#enhanceMode')?.value === 'storyboard';
   button.disabled = true;
   status.textContent = '外部LLMで変換中…';
   try {
+    const body = { prompt: promptInput.value, mode: storyboard ? 'storyboard' : mode.value, shots: multishot.checked ? getShots() : [] };
+    if (storyboard) {
+      const seconds = parseFloat(form.elements.duration_seconds?.value);
+      if (Number.isFinite(seconds) && seconds >= 1) body.seconds = Math.min(seconds, 60);
+    }
     const response = await fetch('/api/prompts/enhance', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt: promptInput.value, mode: mode.value, shots: multishot.checked ? getShots() : [] }),
+      body: JSON.stringify(body),
     });
     if (!response.ok) throw new Error(await responseError(response));
     const result = await response.json();

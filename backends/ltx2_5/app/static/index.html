@@ -76,7 +76,7 @@
         <section class="setting-group">
           <div class="setting-title"><span>PROMPT</span><b>演出・ショット</b></div>
           <label>プロンプト<textarea name="prompt" id="prompt" required placeholder="映画的なシーン、動き、カメラ、照明、音声を記述…"></textarea></label>
-          <div class="prompt-actions"><button type="button" id="enhancePrompt" class="secondary">AIでLTX-2.5向けに変換</button><small id="enhanceStatus">外部LLMの設定が必要です</small></div>
+          <div class="prompt-actions"><select id="enhanceMode" title="AI変換モード"><option value="enhance">LTX-2.5向けに変換</option><option value="storyboard">カット割りを生成</option></select><button type="button" id="enhancePrompt" class="secondary">AIで変換</button><small id="enhanceStatus">外部LLMの設定が必要です</small></div>
           <label class="render-toggle"><input id="multishot" type="checkbox"><span><b>Native Multishot</b><small>複数ショットを1回の生成でつなぐ</small></span></label>
           <section id="multishotEditor" class="multishot-editor" hidden><div id="shotRows"></div><button type="button" id="addShot" class="secondary">＋ ショットを追加</button></section>
         </section>

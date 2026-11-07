@@ -307,8 +307,8 @@ def api_outputs_delete(req: OutputDeleteRequest):
 class PromptEnhanceRequest(BaseModel):
     backend: str
     prompt: str
-    mode: str | None = None           # h3: brief/storyboard/translate/h3-official、ltx25: t2av/i2v/...
-    seconds: float | None = None      # h3 のみ
+    mode: str | None = None           # h3: brief/storyboard/translate/h3-official、ltx25: t2av/i2v/.../storyboard
+    seconds: float | None = None      # h3 全モード / ltx25 storyboard
     task: str | None = None           # h3 h3-official のみ
     lang: str | None = None           # h3 h3-official のみ
     shots: list[str] = Field(default_factory=list)  # ltx25 のみ
@@ -341,6 +341,8 @@ def api_prompt_enhance(req: PromptEnhanceRequest):
                                         "mode": req.mode or "t2av"}
                 if req.shots:
                     body["shots"] = req.shots
+                if req.seconds is not None:
+                    body["seconds"] = req.seconds
                 resp = client.post(base + "/api/prompts/enhance", json=body)
     except httpx.HTTPError as exc:
         raise HTTPException(502, f"バックエンド {req.backend} への転送に失敗しました: {exc}")

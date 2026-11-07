@@ -19,6 +19,7 @@
     '音声開始位置（秒）': 'Audio start (seconds)', '使用時間（秒・空欄は自動）': 'Duration (seconds; blank = automatic)',
     '演出・ショット': 'Direction and shots', 'プロンプト': 'Prompt', '映画的なシーン、動き、カメラ、照明、音声を記述…': 'Describe the cinematic scene, motion, camera, lighting, and audio…',
     'AIでLTX-2.5向けに変換': 'Optimize for LTX-2.5 with AI', '外部LLMの設定が必要です': 'External LLM configuration is required',
+    'AIで変換': 'Run AI', 'AI変換モード': 'AI conversion mode', 'LTX-2.5向けに変換': 'Optimize for LTX-2.5', 'カット割りを生成': 'Generate a storyboard',
     '複数ショットを1回の生成でつなぐ': 'Connect multiple shots in one generation', '＋ ショットを追加': '+ Add shot', 'ネガティブプロンプト': 'Negative prompt',
     '追加学習': 'Adapters', '再読込': 'Reload', 'loras/ を確認中…': 'Checking loras/…',
     'レンダリング': 'Rendering', '基準解像度': 'Base resolution', '横長': 'Landscape', '縦長': 'Portrait', '正方形': 'Square',

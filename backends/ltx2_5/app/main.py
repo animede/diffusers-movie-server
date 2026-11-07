@@ -211,24 +211,42 @@ def enhance_prompt(request: PromptEnhanceRequest):
     }
     shot_text = "\n".join(f"Shot {i + 1}: {shot}" for i, shot in enumerate(request.shots) if shot.strip())
     user_text = request.prompt + (f"\n\nRequested shot plan:\n{shot_text}" if shot_text else "")
+    if request.mode == "storyboard":
+        seconds_note = (
+            f"The total clip length is about {request.seconds:g} seconds; pace the shots so they add up to it."
+            if request.seconds is not None
+            else "Assume a total clip length of about 10 seconds."
+        )
+        system_content = (
+            "Expand the user's idea into one production-ready English multi-shot prompt for LTX-2.5 "
+            "audio-video generation. Invent a storyboard of 2 to 3 distinct shots. Describe the first shot "
+            "directly, begin every following shot with 'Hard cut to', and clearly change at least one of "
+            "scene, time of day, framing, or camera "
+            "move between shots. For every shot specify shot size (wide / medium / close-up), subject and "
+            "action, environment, lighting, camera movement, motion timing, ambience, and sound effects. "
+            "Keep subject identity, wardrobe, location logic, voice, and overall style consistent across "
+            f"shots. Use present tense and concrete visual language. {seconds_note} If the user supplied a "
+            "shot plan, follow it; otherwise invent one that serves the idea. Preserve every quoted line "
+            "verbatim in its original language and state the speaker and spoken language before each quoted "
+            "line. Do not include explanations, headings, markdown, negative prompts, or parameter advice."
+        )
+    else:
+        system_content = (
+            "Rewrite the user's idea as one production-ready English prompt for LTX-2.5 audio-video "
+            "generation. Preserve intent and do not add unrelated content. Use present tense and concrete "
+            "visual language. Specify shot size, subject and action, environment, lighting, camera movement, "
+            "motion timing, ambience, sound effects, and quoted dialogue when present. For multiple shots, "
+            "write explicit 'Hard cut to' transitions and keep identity, wardrobe, location, lighting, voice, "
+            "and style consistent. Preserve every quoted line verbatim in its original language: never "
+            "translate, paraphrase, romanize, or add words to dialogue. Explicitly state the spoken language "
+            "and speaker before each quoted line. Do not include explanations, headings, markdown, negative prompts, or "
+            f"parameter advice. Generation mode note: {mode_notes[request.mode]}"
+        )
     payload = {
         "model": settings.llm_model,
         "temperature": 0.3,
         "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "Rewrite the user's idea as one production-ready English prompt for LTX-2.5 audio-video "
-                    "generation. Preserve intent and do not add unrelated content. Use present tense and concrete "
-                    "visual language. Specify shot size, subject and action, environment, lighting, camera movement, "
-                    "motion timing, ambience, sound effects, and quoted dialogue when present. For multiple shots, "
-                    "write explicit 'Hard cut to' transitions and keep identity, wardrobe, location, lighting, voice, "
-                    "and style consistent. Preserve every quoted line verbatim in its original language: never "
-                    "translate, paraphrase, romanize, or add words to dialogue. Explicitly state the spoken language "
-                    "and speaker before each quoted line. Do not include explanations, headings, markdown, negative prompts, or "
-                    f"parameter advice. Generation mode note: {mode_notes[request.mode]}"
-                ),
-            },
+            {"role": "system", "content": system_content},
             {"role": "user", "content": user_text},
         ],
     }
