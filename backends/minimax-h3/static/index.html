@@ -618,6 +618,11 @@
         <button type="button" class="llm-btn" id="undo-btn" data-i18n="btn.undo" style="display:none;">元に戻す</button>
       </div>
       <div class="hint" id="enhance-hint" data-i18n="hint.enhance.storyboard">LLM強化はローカルgemma(H3_LLM_URL)でH3公式ガイドの形式へ整形します。結果は編集してから生成できます。</div>
+      <div class="checkbox-row" id="row-multicut" style="display:none;">
+        <input type="checkbox" id="multicut-enabled">
+        <label for="multicut-enabled" style="margin:0;" data-i18n="label.multicut">カットごとに生成してFFmpegで連結(最大5カット)</label>
+      </div>
+      <div class="hint" id="multicut-info" style="display:none;"></div>
 
       <details class="guide">
         <summary data-i18n="guide.summary">プロンプトガイド(手書き用チートシート)</summary>
@@ -1021,6 +1026,13 @@ const I18N = {
     'btn.selectNone': '全解除',
     'btn.deleteSelected': '選択を削除',
     'btn.concatSelected': '選択を連結',
+    'label.multicut': 'カットごとに生成してFFmpegで連結(最大5カット)',
+    'multicut.info': '{n}カット検出: {secs} — 各カットを個別生成し、完了後に自動連結します(fl2vaは先頭画像を全カットに適用、末尾画像は無視)',
+    'multicut.truncated': '(6カット目以降は無視されます)',
+    'status.multicutGenerating': 'カット {i}/{n}({label})を生成中...',
+    'status.multicutConcat': '全カット完了。FFmpegで連結中...',
+    'err.multicut': 'マルチカット生成エラー: {msg}(完了済み {done} カットはギャラリーに残っています)',
+    'result.multicutResult': 'マルチカット連結',
     'btn.concatenating': '連結中...',
     'btn.refresh': '再読込',
     'gallery.selected': '{n}件選択',
@@ -1216,6 +1228,13 @@ const I18N = {
     'btn.selectNone': 'Deselect all',
     'btn.deleteSelected': 'Delete selected',
     'btn.concatSelected': 'Concatenate selected',
+    'label.multicut': 'Generate each cut separately and concatenate with FFmpeg (max 5 cuts)',
+    'multicut.info': '{n} cuts detected: {secs} — each cut is generated separately and auto-concatenated (FL2VA applies the first-frame image to every cut; the last-frame image is ignored)',
+    'multicut.truncated': ' (cuts beyond the 5th are ignored)',
+    'status.multicutGenerating': 'Generating cut {i}/{n} ({label})...',
+    'status.multicutConcat': 'All cuts done. Concatenating with FFmpeg...',
+    'err.multicut': 'Multi-cut error: {msg} ({done} finished cut(s) remain in the gallery)',
+    'result.multicutResult': 'Multi-cut concat',
     'btn.concatenating': 'Concatenating...',
     'btn.refresh': 'Refresh',
     'gallery.selected': '{n} selected',
@@ -1363,6 +1382,9 @@ const cacheThresholdEl = document.getElementById('cache-threshold');
 const attnSageEl = document.getElementById('attn-sage');
 const turboEnabledEl = document.getElementById('turbo-enabled');
 const muteEnabledEl = document.getElementById('mute-enabled');
+const rowMulticutEl = document.getElementById('row-multicut');
+const multicutEnabledEl = document.getElementById('multicut-enabled');
+const multicutInfoEl = document.getElementById('multicut-info');
 const rowCacheEl = document.getElementById('row-cache');
 const rowAttnEl = document.getElementById('row-attn');
 const rowTurboEl = document.getElementById('row-turbo');
@@ -1564,6 +1586,7 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
       resolutionEl.value = resolutionEl.dataset.prevPreset;
     }
     updateCustomSizeVisibility();
+    updateMulticutUI();
   });
 });
 
@@ -1913,6 +1936,7 @@ enhanceBtn.addEventListener('click', async () => {
     if (!res.ok) throw new Error(data.detail || JSON.stringify(data));
     promptBackup = text;
     promptEl.value = data.result;
+    updateMulticutUI();
     undoBtn.style.display = '';
     // h3-official は検証+修復ループ付き (core/prompt_check.py)。残った違反・警告は
     // ここで見せる。生成はブロックしない — プロンプトは編集可能なので人間が最終ゲート。
@@ -1938,6 +1962,7 @@ enhanceBtn.addEventListener('click', async () => {
 undoBtn.addEventListener('click', () => {
   if (promptBackup !== null) {
     promptEl.value = promptBackup;
+    updateMulticutUI();
     promptBackup = null;
     undoBtn.style.display = 'none';
     setStatus(t('status.enhanceUndone'));
@@ -2191,12 +2216,141 @@ reloadApplyBtn.addEventListener('click', async () => {
   }
 });
 
+
+// --- マルチカット生成(方式B: LLM強化のカット割りを1カット=1生成に分割し、
+//     既存の /api/outputs/concat で連結する)。t2va / fl2va のみ対応。 ---
+const MULTICUT_MAX = 5;
+const MULTICUT_MIN_SECONDS = 5.0;     // H3 の最小尺 (120フレーム)
+const MULTICUT_MAX_SECONDS = 14.375;  // H3 の最大尺 (345フレーム。15秒は 17n+5 丸めで上限超)
+
+function clampCutSeconds(sec) {
+  return Math.min(MULTICUT_MAX_SECONDS, Math.max(MULTICUT_MIN_SECONDS, sec));
+}
+
+// "CUT n [x-y秒]: 本文..." ブロックを抽出(本文は次の CUT 行まで、複数行可)。
+// storyboard モード(core/llm.py)の出力形式に合わせるが、[0-5s] 等の表記も許容する。
+function parseStoryboardCuts(text) {
+  const re = /^[ \t]*CUT[ \t]*(\d+)[ \t]*[\[【]([0-9.]+)[ \t]*[-–~〜][ \t]*([0-9.]+)[ \t]*(?:秒|s(?:ec)?)?[\]】][ \t]*[::]/gim;
+  const ms = [...text.matchAll(re)];
+  return ms.map((m, i) => {
+    const start = parseFloat(m[2]);
+    const end = parseFloat(m[3]);
+    const bodyStart = m.index + m[0].length;
+    const bodyEnd = (i + 1 < ms.length) ? ms[i + 1].index : text.length;
+    const dur = (isFinite(start) && isFinite(end) && end > start) ? (end - start) : MULTICUT_MIN_SECONDS;
+    return { label: 'CUT ' + m[1], seconds: dur, text: text.slice(bodyStart, bodyEnd).trim() };
+  }).filter(c => c.text);
+}
+
+function updateMulticutUI() {
+  const cuts = parseStoryboardCuts(promptEl.value);
+  const visible = cuts.length >= 2 && (mode === 't2va' || mode === 'fl2va');
+  rowMulticutEl.style.display = visible ? '' : 'none';
+  if (!visible) { multicutInfoEl.style.display = 'none'; return; }
+  multicutInfoEl.style.display = multicutEnabledEl.checked ? '' : 'none';
+  const used = cuts.slice(0, MULTICUT_MAX);
+  const secs = used.map(c => clampCutSeconds(c.seconds).toFixed(1) + 's').join(' + ');
+  multicutInfoEl.textContent = t('multicut.info', { n: used.length, secs })
+    + (cuts.length > MULTICUT_MAX ? t('multicut.truncated') : '');
+}
+multicutEnabledEl.addEventListener('change', updateMulticutUI);
+promptEl.addEventListener('input', updateMulticutUI);
+updateMulticutUI();
+
+function renderMulticutResult(data) {
+  lastResultData = null;
+  lastResultKind = null;
+  resultArea.innerHTML = `
+    <video controls autoplay loop src="${data.url}"></video>
+    <a class="dl-link" href="${data.url}" download>${t('result.dl.mp4')}</a>
+    <div class="result-meta">
+      <div><b>${t('result.multicutResult')}:</b> ${data.name}</div>
+      <div><b>${t('result.method')}:</b> ${data.method === 'concat_demuxer_copy' ? t('result.methodLossless') : t('result.methodReencode')}</div>
+      <div><b>${t('result.resolution')}:</b> ${data.width}×${data.height} / <b>${t('result.duration')}:</b> ${data.duration != null ? data.duration.toFixed(2) + 's' : '-'}</div>
+      <div><b>${t('result.inputsOrder')}:</b> ${data.inputs.join(' → ')}</div>
+    </div>`;
+}
+
+async function generateMulticut(cuts) {
+  generateBtn.disabled = true;
+  generateBtn.textContent = t('btn.generating');
+  progressOuter.style.display = 'block';
+  progressInner.style.width = '0%';
+  startPolling();
+  const names = [];
+  try {
+    for (let i = 0; i < cuts.length; i++) {
+      const cut = cuts[i];
+      setStatus(t('status.multicutGenerating', { i: i + 1, n: cuts.length, label: cut.label }));
+      const fd = new FormData();
+      fd.append('prompt', cut.text);
+      fd.append('num_inference_steps', stepsEl.value);
+      if (seedEl.value) fd.append('seed', seedEl.value);
+      fd.append('cache', cacheEnabledEl.checked ? 'fbc' : 'none');
+      if (cacheEnabledEl.checked) fd.append('cache_threshold', cacheThresholdEl.value);
+      fd.append('attn', attnSageEl.checked ? 'sage' : 'default');
+      fd.append('turbo', turboEnabledEl.checked ? '1' : '0');
+      fd.append('mute', muteEnabledEl.checked ? '1' : '0');
+      const sizeMode = resolutionEl.value;
+      if (sizeMode === 'custom') {
+        fd.append('height', roundCanvasValue(customHeightEl.value));
+        fd.append('width', roundCanvasValue(customWidthEl.value));
+      } else if (sizeMode !== 'auto') {
+        fd.append('resolution', sizeMode);
+      }
+      fd.append('seconds', String(clampCutSeconds(cut.seconds)));
+      let url = '/api/t2va';
+      if (mode === 'fl2va') {
+        url = '/api/fl2va';
+        // 先頭画像は全カットへ共通適用(商品・被写体のアンカー用途)。
+        // 末尾画像は「最終フレーム固定」が全カットに波及すると不自然なため使わない。
+        if (imageFileEl.files[0]) fd.append('image', imageFileEl.files[0]);
+      }
+      const res = await fetch(url, { method: 'POST', body: fd });
+      const data = await res.json();
+      if (!res.ok) throw new Error(cut.label + ': ' + (data.detail || JSON.stringify(data)));
+      names.push(data.mp4_filename);
+      progressInner.style.width = Math.round(((i + 1) / (cuts.length + 1)) * 100) + '%';
+    }
+    setStatus(t('status.multicutConcat'));
+    const res = await fetch('/api/outputs/concat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ names }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || JSON.stringify(data));
+    renderMulticutResult(data);
+    setStatus(t('status.done'));
+    progressInner.style.width = '100%';
+    refreshGallery();
+  } catch (e) {
+    // 途中失敗でも生成済みカットは outputs/ に残る(ギャラリーから手動連結可能)。
+    setStatus(t('err.multicut', { msg: e.message, done: names.length }), true);
+    refreshGallery();
+  } finally {
+    generateBtn.disabled = false;
+    generateBtn.textContent = t('btn.generate');
+    if (polling) { clearInterval(polling); polling = null; }
+    refreshServerStatus();
+  }
+}
+
 form.addEventListener('submit', async (ev) => {
   ev.preventDefault();
   const prompt = promptEl.value.trim();
   if (!prompt) {
     setStatus(t('err.enterPrompt'), true);
     return;
+  }
+
+  // マルチカット: チェックON かつ CUT ブロック2個以上なら分割生成+連結へ分岐
+  if (multicutEnabledEl.checked && (mode === 't2va' || mode === 'fl2va')) {
+    const cuts = parseStoryboardCuts(prompt).slice(0, MULTICUT_MAX);
+    if (cuts.length >= 2) {
+      await generateMulticut(cuts);
+      return;
+    }
   }
 
   generateBtn.disabled = true;
