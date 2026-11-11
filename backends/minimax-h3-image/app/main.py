@@ -8,6 +8,7 @@ API は ltx25 バックエンドと同じ形(gateway の「ジョブ型バック
   GET  /api/jobs?limit=N     履歴(新しい順)
   GET  /api/jobs/{id}        ジョブ状態
   DELETE /api/jobs/{id}
+  DELETE /api/outputs/{filename}  生成物の削除(履歴のジョブは image_url が外れる)
   POST /api/interrupt        {job_id?} 実行中ジョブの中断
   POST /api/admin/unload     VRAM 解放(プロセス温存、resident 切替用)。実行中は 409
   POST /api/admin/load       {steps?} 明示ロード
@@ -130,6 +131,24 @@ def get_job(job_id: str):
 def delete_job(job_id: str):
     if not manager.delete(job_id):
         raise HTTPException(status_code=404, detail="Job not found")
+
+
+@app.delete("/api/outputs/{filename}")
+def delete_output(filename: str):
+    """生成物を削除する(履歴のジョブは image_url を外して残す)。"""
+    if "/" in filename or "\\" in filename or ".." in filename or not filename:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    target = (settings.output_dir / filename).resolve()
+    if target.parent != settings.output_dir.resolve():
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="Output not found")
+    target.unlink()
+    url = f"/outputs/{filename}"
+    cleared = [j.id for j in manager.jobs.values() if j.image_url == url]
+    for jid in cleared:
+        manager.jobs[jid].image_url = None
+    return {"result": "deleted", "filename": filename, "jobs_cleared": cleared}
 
 
 @app.post("/api/interrupt")
