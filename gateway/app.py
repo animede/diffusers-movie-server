@@ -312,15 +312,14 @@ class PromptEnhanceRequest(BaseModel):
     task: str | None = None           # h3 h3-official のみ
     lang: str | None = None           # h3 h3-official のみ
     shots: list[str] = Field(default_factory=list)  # ltx25 のみ
+    conditions: list[dict[str, Any]] = Field(default_factory=list)  # h3image edit のみ([{"asset_id": ...}])
+    aspect_ratio: str | None = None   # h3image edit のみ(未指定 = adaptive)
 
 
 @app.post("/api/v1/prompt/enhance")
 def api_prompt_enhance(req: PromptEnhanceRequest):
     if req.backend not in BACKENDS:
         raise HTTPException(400, f"未知のバックエンドです: {req.backend!r}")
-    if req.backend == "h3image":
-        raise HTTPException(501, "h3image はプロンプト強化に対応していません"
-                                 "(MiniMax-H3-Image-PE は未統合)")
     if not manager.is_loaded(req.backend):
         raise HTTPException(
             502,
@@ -339,6 +338,12 @@ def api_prompt_enhance(req: PromptEnhanceRequest):
                 if req.lang is not None:
                     data["lang"] = req.lang
                 resp = client.post(base + "/api/prompt/enhance", data=data)
+            elif req.backend == "h3image":
+                body = {"prompt": req.prompt, "mode": req.mode or "t2i",
+                        "conditions": req.conditions}
+                if req.aspect_ratio:
+                    body["aspect_ratio"] = req.aspect_ratio
+                resp = client.post(base + "/api/prompts/enhance", json=body)
             else:
                 body: dict[str, Any] = {"prompt": req.prompt,
                                         "mode": req.mode or "t2av"}

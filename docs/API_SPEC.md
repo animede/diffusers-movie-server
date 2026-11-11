@@ -119,7 +119,7 @@ delete は `{"backend","filename"}`(`/` `..` を含む名前・outputs 外への
 
 ### POST /api/v1/prompt/enhance
 
-`{"backend","prompt","mode?","seconds?","task?","lang?","shots?"}` を振り分け:
+`{"backend","prompt","mode?","seconds?","task?","lang?","shots?","conditions?","aspect_ratio?"}` を振り分け:
 
 - h3 → `POST /api/prompt/enhance`(Form: text/mode/seconds/task/lang。
   mode 既定 "storyboard")
@@ -205,7 +205,7 @@ h3 に 2GPU分担プリセット `48gb-dual`(GPU0=transformer、GPU1=text_encode
   `params`: prompt / width / height / seed / steps(2|3|6)。negative_prompt / guidance_scale /
   seconds / num_frames / fps は無視(notes に記録)。`extra`: `generation_area`("native" = 最低 4MP
   キャンバス、"requested" = 要求サイズ・既定)。
-- パススルー `/h3image/*`、成果物 `/h3image/outputs/...`。プロンプト強化は 501。
+- パススルー `/h3image/*`、成果物 `/h3image/outputs/...`。プロンプト強化は上記 `/api/v1/prompt/enhance` 参照。
 - VRAM: GPU0 常駐 ~19GB・peak ~21GB、TE は 2 枚目 GPU(cuda:1)があればそちらに ~17GB。
 
 実測(統一 API 経由、3 step): ref2i 1024² 4.9s / t2i 2048²(native)4.1s / t2i 1024² 1.2s、
