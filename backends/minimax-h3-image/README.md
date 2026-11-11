@@ -13,7 +13,9 @@
 | text_encoder | H3 動画の量子化済みキャッシュ(nf4・51層、`backends/minimax-h3/models/prequant/te_bnb-4bit_prune1`)を流用 | ~17GB(GPU が 2 枚なら cuda:1) |
 | VAE | bf16 | 2.3GB |
 
-量子化キャッシュ(各 19GiB)は `cache/int8wo_adaln_table{,_pdmd2,_pdmd3}` に置く。無ければ bf16 シャード
+量子化キャッシュ(各 19GiB)は `cache/int8wo_adaln_table{,_pdmd2,_pdmd3}` に置く
+(この機では実体は `~/models/minimax-h3-image/` にあり、`cache/`・`models/lora/`・動画 H3 の
+`models/prequant/te_bnb-4bit_prune1` は symlink。単独リポジトリ `~/minimax-h3-image-server` と共有、2026-11-11)。無ければ bf16 シャード
 (HF キャッシュの `transformer_diffusers`、66GB)から約 40 秒で構築して保存する(bf16 を CPU/GPU に全展開しない)。
 
 ## 実測(RTX PRO 6000 96GB + RTX PRO 5000 48GB、seed 固定)
