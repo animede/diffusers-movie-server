@@ -12,6 +12,7 @@
   <nav class="tabs" id="tabs">
     <button class="tab-btn active" data-tab="h3">MiniMax-H3</button>
     <button class="tab-btn" data-tab="ltx25">LTX-2.5</button>
+    <button class="tab-btn" data-tab="h3image">MiniMax-H3-Image</button>
     <button class="tab-btn" data-tab="admin">バックエンド管理</button>
     <button class="tab-btn" data-tab="gallery">ギャラリー</button>
   </nav>
@@ -27,6 +28,10 @@
   <section class="tab-panel" id="panel-ltx25" data-backend="ltx25">
     <div class="backend-overlay" id="overlay-ltx25"></div>
     <iframe class="backend-frame" id="frame-ltx25" title="LTX-2.5 UI" hidden></iframe>
+  </section>
+  <section class="tab-panel" id="panel-h3image" data-backend="h3image">
+    <div class="backend-overlay" id="overlay-h3image"></div>
+    <iframe class="backend-frame" id="frame-h3image" title="MiniMax-H3-Image UI" hidden></iframe>
   </section>
 
   <!-- 管理タブ -->
@@ -107,6 +112,7 @@
             <option value="">すべて</option>
             <option value="h3">MiniMax-H3</option>
             <option value="ltx25">LTX-2.5</option>
+            <option value="h3image">MiniMax-H3-Image</option>
           </select>
         </label>
         <label>種類

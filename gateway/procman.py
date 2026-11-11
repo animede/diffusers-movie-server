@@ -309,11 +309,11 @@ class ProcessManager:
                     resp = client.get(base + "/api/status")
                     resp.raise_for_status()
                     return bool(resp.json().get("busy"))
-                if proc.backend.name == "ltx25":
-                    resp = client.get(base + "/api/jobs", params={"limit": 10})
-                    resp.raise_for_status()
-                    return any(job.get("status") in ("queued", "running")
-                               for job in resp.json())
+                # ジョブ型バックエンド(ltx25 / h3image): 履歴の先頭に queued/running があれば busy
+                resp = client.get(base + "/api/jobs", params={"limit": 10})
+                resp.raise_for_status()
+                return any(job.get("status") in ("queued", "running")
+                           for job in resp.json())
         except httpx.HTTPError as exc:
             logger.warning("busy 判定に失敗(%s): %s — busy=不明のため安全側(True)扱い",
                            proc.backend.name, exc)
@@ -400,10 +400,11 @@ class ProcessManager:
                     own = _pid_vram_mb(existing.pid)
                     if own:
                         free += own
-                if free is not None and free < CORESIDENT_MIN_FREE_MB:
+                need = backend.coresident_min_free_mb or CORESIDENT_MIN_FREE_MB
+                if free is not None and free < need:
                     raise BusyError(
                         f"同居で {backend_name} を載せるには空き VRAM が足りません"
-                        f"(空き {free}MiB < 必要目安 {CORESIDENT_MIN_FREE_MB}MiB)。"
+                        f"(空き {free}MiB < 必要目安 {need}MiB)。"
                         "相手の生成完了を待つか、不要なバックエンドを unload してください")
             else:
                 for other in [p for name, p in self._procs.items()

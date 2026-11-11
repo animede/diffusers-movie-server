@@ -419,3 +419,13 @@ curl -X POST http://127.0.0.1:8630/api/v1/prompt/enhance \
 
 > [!IMPORTANT]
 > Apache License 2.0 は MiniMax-H3 / LTX-2.5 / Gemma 等のモデル重み、派生 LoRA・チェックポイント、その他の第三者製コンポーネントには適用されません。各モデルのライセンスを個別に確認してください。
+
+
+## MiniMax-H3-Image バックエンド `h3image`(2026-11-11 追加、内部 port 8633)
+
+本家 MiniMax-H3-Image(静止画生成 + 最大 16 枚参照の編集)を第 3 のバックエンドとして統合。
+動画 H3 の text_encoder キャッシュ(nf4)を流用し、transformer は AdaLN 事前計算テーブル + int8wo
+(pDMD 3 step 既定)。GPU0 常駐 ~19GB / peak ~21GB、TE は 2 枚目 GPU があればそちらに ~17GB。
+1024² 1.2〜1.8s、2048² 4.1s、参照編集 1024² 4.9s。動画バックエンドと同居させる場合は
+`strategy: "coresident"` で起動する。詳細: `backends/minimax-h3-image/README.md`、
+調査記録: `probes/h3-image/RESULTS.md`、統一 API: `docs/API_SPEC.md` の h3image 節。

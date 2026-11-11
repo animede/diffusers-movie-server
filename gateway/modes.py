@@ -62,7 +62,13 @@ LTX25_MODE_TABLE = {
     "refine_image": "refine_image",
 }
 
-UNIFIED_MODES = sorted(set(H3_MODE_TABLE) | set(LTX25_MODE_TABLE))
+# 統一mode → h3image(MiniMax-H3-Image、静止画のみ)の GenerateRequest.mode
+H3IMAGE_MODE_TABLE = {
+    "t2i": "t2i",
+    "ref2i": "edit",   # 参照画像 1〜16 枚の編集(プロンプト中で <Picture 1> … と参照)
+}
+
+UNIFIED_MODES = sorted(set(H3_MODE_TABLE) | set(LTX25_MODE_TABLE) | set(H3IMAGE_MODE_TABLE))
 
 # extra ホワイトリスト(バックエンド固有パラメータの素通し)
 H3_EXTRA_KEYS = {
@@ -91,6 +97,12 @@ LTX25_EXTRA_KEYS = {
     "conditions",  # ConditionInput の index/strength 上書き(asset_ids と同順の dict 配列)
 }
 
+H3IMAGE_EXTRA_KEYS = {
+    # "native" = 最低 4MP で生成して縮小(モデル推奨)、"requested" = 要求サイズで生成(高速)
+    "generation_area",
+}
+H3IMAGE_STEPS = (2, 3, 6)
+
 H3_FPS = 24.0  # minimax-h3 は 24fps 固定(core/runner.py の FPS)
 
 
@@ -115,7 +127,8 @@ def _check_params(params: dict[str, Any]) -> None:
 
 
 def _check_extra(backend: str, extra: dict[str, Any]) -> None:
-    allowed = H3_EXTRA_KEYS if backend == "h3" else LTX25_EXTRA_KEYS
+    allowed = {"h3": H3_EXTRA_KEYS, "ltx25": LTX25_EXTRA_KEYS,
+               "h3image": H3IMAGE_EXTRA_KEYS}[backend]
     unknown = set(extra) - allowed
     if unknown:
         raise ModeError(
@@ -382,3 +395,63 @@ def build_ltx25_request(mode: str, params: dict[str, Any], extra: dict[str, Any]
     if conditions:
         body["conditions"] = conditions
     return body, notes
+
+
+# ---------------------------------------------------------------------------
+# h3image 変換(MiniMax-H3-Image、静止画のみ)
+# ---------------------------------------------------------------------------
+
+def build_h3image_request(mode: str, params: dict[str, Any], extra: dict[str, Any],
+                          backend_assets: list[dict]) -> tuple[dict, list[str]]:
+    """h3image の POST /api/jobs 向け JSON を組み立てる。
+
+    共通パラメータのうち prompt / width / height / seed / steps を使う。steps は 2 / 3 / 6
+    (2・3 = pDMD 蒸留、6 = チェックポイント既定)。negative_prompt / guidance_scale /
+    seconds / num_frames / fps は静止画・CFG なしモデルのため無視する(notes に記録)。
+    """
+    if mode not in H3IMAGE_MODE_TABLE:
+        raise ModeError(
+            f"mode {mode!r} は h3image では使えません(有効: {sorted(H3IMAGE_MODE_TABLE)})")
+    _check_params(params)
+    _check_extra("h3image", extra)
+    notes: list[str] = []
+    prompt = params.get("prompt")
+    if not prompt or not str(prompt).strip():
+        raise ModeError("params.prompt は必須です")
+    body: dict[str, Any] = {"mode": H3IMAGE_MODE_TABLE[mode], "prompt": str(prompt)}
+    for key in ("width", "height", "seed"):
+        if params.get(key) is not None:
+            body[key] = int(params[key])
+    if params.get("steps") is not None:
+        steps = int(params["steps"])
+        if steps not in H3IMAGE_STEPS:
+            raise ModeError(f"h3image の steps は {list(H3IMAGE_STEPS)} のいずれかです: {steps}")
+        body["steps"] = steps
+    for key in ("negative_prompt", "guidance_scale", "seconds", "num_frames", "fps"):
+        if params.get(key) is not None:
+            notes.append(f"params.{key} は h3image では無視されます")
+    if extra.get("generation_area") is not None:
+        body["generation_area"] = extra["generation_area"]
+    images = [a for a in backend_assets if a["kind"] == "image"]
+    if len(images) != len(backend_assets):
+        raise ModeError("h3image は画像アセットのみ受け付けます")
+    if mode == "t2i":
+        if images:
+            raise ModeError("t2i(h3image)はアセットを受け付けません(参照編集は ref2i)")
+    else:
+        if not images:
+            raise ModeError("ref2i(h3image)は画像アセットが 1 件以上必要です(最大 16)")
+        if len(images) > 16:
+            raise ModeError("ref2i(h3image)の参照画像は最大 16 件です")
+        body["conditions"] = [{"asset_id": a["id"]} for a in images]
+    return body, notes
+
+
+def build_jobs_request(backend: str, mode: str, params: dict[str, Any], extra: dict[str, Any],
+                       backend_assets: list[dict]) -> tuple[dict, list[str]]:
+    """ジョブ型バックエンド(ltx25 / h3image)のリクエスト組み立てを振り分ける。"""
+    if backend == "ltx25":
+        return build_ltx25_request(mode, params, extra, backend_assets)
+    if backend == "h3image":
+        return build_h3image_request(mode, params, extra, backend_assets)
+    raise ModeError(f"ジョブ型バックエンドではありません: {backend!r}")

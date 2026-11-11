@@ -39,6 +39,9 @@ from procman import BusyError, manager
 logger = logging.getLogger("gateway.jobs")
 
 TERMINAL = {"completed", "failed", "interrupted"}
+# 非同期ジョブ API(POST /api/jobs、/api/assets、/api/admin/unload)を持つバックエンド。
+# h3(同期 API)以外はこの経路で扱う。
+JOBS_BACKENDS = {"ltx25", "h3image"}
 
 DB_PATH = Path(__file__).resolve().parent / "data" / "jobs.sqlite3"
 RESTORE_LIMIT = 1000  # 復元する履歴の上限(新しい順)
@@ -194,7 +197,7 @@ class JobRegistry:
                 created_at=row["created_at"], finished_at=row["finished_at"],
                 backend_job_id=row["backend_job_id"])
             if job.status not in TERMINAL:
-                if job.backend == "ltx25" and job.backend_job_id:
+                if job.backend in JOBS_BACKENDS and job.backend_job_id:
                     self._pending_resync.append(job.id)
                 else:
                     job.status = "interrupted"
@@ -222,14 +225,14 @@ class JobRegistry:
             job = self._jobs.get(job_id)
             if job is None or job.status in TERMINAL:
                 continue
-            base = BACKENDS["ltx25"].base_url()
+            base = BACKENDS[job.backend].base_url()
             try:
                 with httpx.Client(timeout=5.0) as client:
                     resp = client.get(base + f"/api/jobs/{job.backend_job_id}")
                     resp.raise_for_status()
             except httpx.HTTPError as exc:
                 job.status = "interrupted"
-                job.error = ("gateway 再起動後、バックエンド ltx25 のジョブ状態を"
+                job.error = (f"gateway 再起動後、バックエンド {job.backend} のジョブ状態を"
                              f"確認できませんでした: {exc}")
                 job.finished_at = time.time()
                 self._persist(job)
@@ -257,10 +260,10 @@ class JobRegistry:
             path, data, files, notes = modes.build_h3_request(
                 mode, params or {}, extra or {}, asset_metas)
         else:
-            # ltx25 は変換だけ先に検査(backend asset id はまだ無いのでダミーで検査し、
+            # ジョブ型は変換だけ先に検査(backend asset id はまだ無いのでダミーで検査し、
             # 起動確認後に本組み立てする)
             dummy = [{"id": "0" * 32, "kind": m["kind"]} for m in asset_metas]
-            modes.build_ltx25_request(mode, params or {}, extra or {}, dummy)
+            modes.build_jobs_request(backend, mode, params or {}, extra or {}, dummy)
 
         # upscale ガード(Phase 7): LTX の2段アップスケールはデコード段で
         # **GPU を丸ごと使い切る**。480×640×97f・steps4 という小さな構成でも
@@ -325,8 +328,8 @@ class JobRegistry:
             self._jobs[job.id] = job
 
         try:
-            if backend == "ltx25":
-                self._submit_ltx25(job, mode, params or {}, extra or {}, asset_metas)
+            if backend in JOBS_BACKENDS:
+                self._submit_jobs_backend(job, backend, mode, params or {}, extra or {}, asset_metas)
             else:
                 job.notes.extend(notes)
                 self._submit_h3(job, path, data, files)
@@ -339,9 +342,9 @@ class JobRegistry:
 
     # -- ltx25 -------------------------------------------------------------
 
-    def _submit_ltx25(self, job: UnifiedJob, mode: str, params: dict,
-                      extra: dict, asset_metas: list[dict]) -> None:
-        base = BACKENDS["ltx25"].base_url()
+    def _submit_jobs_backend(self, job: UnifiedJob, backend: str, mode: str, params: dict,
+                             extra: dict, asset_metas: list[dict]) -> None:
+        base = BACKENDS[backend].base_url()
         backend_assets = []
         with httpx.Client(timeout=httpx.Timeout(connect=10.0, read=120.0,
                                                 write=None, pool=None)) as client:
@@ -354,19 +357,19 @@ class JobRegistry:
                                         modes._suffix_content_type(meta["suffix"]))})
                 if resp.status_code not in (200, 201):
                     raise modes.ModeError(
-                        f"ltx25 へのアセット転送に失敗しました({meta['id']}): "
+                        f"{backend} へのアセット転送に失敗しました({meta['id']}): "
                         f"{resp.status_code} {resp.text[:300]}")
                 backend_assets.append(
                     {"id": resp.json()["id"], "kind": meta["kind"]})
 
-            body, notes = modes.build_ltx25_request(mode, params, extra, backend_assets)
+            body, notes = modes.build_jobs_request(backend, mode, params, extra, backend_assets)
             job.notes.extend(notes)
             resp = client.post(base + "/api/jobs", json=body)
             if resp.status_code == 429:
-                raise BusyError("ltx25 の生成キューが一杯です(429)")
+                raise BusyError(f"{backend} の生成キューが一杯です(429)")
             if resp.status_code not in (200, 202):
                 raise modes.ModeError(
-                    f"ltx25 がジョブを受理しませんでした: {resp.status_code} "
+                    f"{backend} がジョブを受理しませんでした: {resp.status_code} "
                     f"{resp.text[:500]}")
             job.backend_job_id = resp.json()["id"]
             job.status = "running"
@@ -382,11 +385,13 @@ class JobRegistry:
             job.progress = 1.0
             job.finished_at = time.time()
             job.result = {
-                "video_url": _rewrite_url("ltx25", data.get("video_url")),
-                "image_url": _rewrite_url("ltx25", data.get("image_url")),
+                "video_url": _rewrite_url(job.backend, data.get("video_url")),
+                "image_url": _rewrite_url(job.backend, data.get("image_url")),
                 "generation_seconds": data.get("generation_seconds"),
                 "peak_vram_gb": data.get("peak_vram_gb"),
             }
+            if data.get("steps_used") is not None:
+                job.result["steps_used"] = data.get("steps_used")
         elif status == "interrupted":
             # ユーザーが `POST /ltx25/api/interrupt` で止めた場合。失敗ではないので
             # 「ジョブが失敗しました」と言わない(統一ステータスに interrupted がある)。
@@ -395,25 +400,25 @@ class JobRegistry:
             job.finished_at = time.time()
         else:  # failed 系
             job.status = "failed"
-            job.error = data.get("error") or f"ltx25 ジョブが失敗しました(status={status})"
+            job.error = data.get("error") or f"{job.backend} ジョブが失敗しました(status={status})"
             job.finished_at = time.time()
 
     def _refresh_ltx25(self, job: UnifiedJob) -> None:
         if job.status in TERMINAL:
             return
-        if not manager.is_loaded("ltx25"):
+        if not manager.is_loaded(job.backend):
             job.status = "failed"
-            job.error = "バックエンド ltx25 がジョブ完了前に停止しました(切替/unload)"
+            job.error = f"バックエンド {job.backend} がジョブ完了前に停止しました(切替/unload)"
             job.finished_at = time.time()
             self._persist(job)
             return
-        base = BACKENDS["ltx25"].base_url()
+        base = BACKENDS[job.backend].base_url()
         try:
             with httpx.Client(timeout=5.0) as client:
                 resp = client.get(base + f"/api/jobs/{job.backend_job_id}")
                 resp.raise_for_status()
         except httpx.HTTPError as exc:
-            logger.warning("ltx25 ジョブ照会に失敗(%s): %s", job.backend_job_id, exc)
+            logger.warning("%s ジョブ照会に失敗(%s): %s", job.backend, job.backend_job_id, exc)
             return  # 一時的な失敗は前回状態のまま
         self._apply_ltx25_state(job, resp.json())
         if job.status in TERMINAL:
@@ -495,7 +500,7 @@ class JobRegistry:
             job = self._jobs.get(job_id)
         if job is None:
             return None
-        if job.backend == "ltx25":
+        if job.backend in JOBS_BACKENDS:
             self._refresh_ltx25(job)
         else:
             self._refresh_h3(job)
@@ -507,7 +512,7 @@ class JobRegistry:
                           reverse=True)[:max(1, min(limit, 200))]
         out = []
         for job in jobs:
-            if job.backend == "ltx25":
+            if job.backend in JOBS_BACKENDS:
                 self._refresh_ltx25(job)
             else:
                 self._refresh_h3(job)

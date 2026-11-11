@@ -190,3 +190,23 @@ env セットの一部なので resident 切替時に gpus が変わるとプロ
 `/api/v1/status` の `process.gpus` / `backends.<name>.gpus` で確認できる。
 h3 に 2GPU分担プリセット `48gb-dual`(GPU0=transformer、GPU1=text_encoder)を追加
 (詳細: docs/phase6-gpu-assignment.md)。
+
+
+## バックエンド h3image(MiniMax-H3-Image、2026-11-11 追加)
+
+静止画生成・最大 16 枚参照の編集。詳細は `backends/minimax-h3-image/README.md`。
+
+- `POST /api/v1/backend/load {"backend":"h3image","preset":"3step"|"6step"|"2step","strategy":"coresident"}`
+  既定 `3step`(pDMD 蒸留、6 step 比 1.7×・品質ほぼ同等)。動画バックエンドと同居させるときは
+  `strategy: "coresident"` を明示すること(既定の process 戦略は他バックエンドを停止する。
+  `generate` の auto_load も process 戦略なので、同居運用では先に明示ロードする)。
+  coresident の空き VRAM 判定は h3image だけ 24GB(`BackendDef.coresident_min_free_mb`)。
+- 統一 mode: `t2i`、`ref2i`(画像アセット 1〜16 件、プロンプトで `<Picture 1>` … と参照)。
+  `params`: prompt / width / height / seed / steps(2|3|6)。negative_prompt / guidance_scale /
+  seconds / num_frames / fps は無視(notes に記録)。`extra`: `generation_area`("native" = 最低 4MP
+  キャンバス、"requested" = 要求サイズ・既定)。
+- パススルー `/h3image/*`、成果物 `/h3image/outputs/...`。プロンプト強化は 501。
+- VRAM: GPU0 常駐 ~19GB・peak ~21GB、TE は 2 枚目 GPU(cuda:1)があればそちらに ~17GB。
+
+実測(統一 API 経由、3 step): ref2i 1024² 4.9s / t2i 2048²(native)4.1s / t2i 1024² 1.2s、
+遅延ロード ~20s、resident unload → reactivate 0.03s(重みは次の生成で再ロード)。

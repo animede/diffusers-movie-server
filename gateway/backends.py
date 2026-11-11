@@ -40,6 +40,9 @@ class BackendDef:
     default_preset: str
     description: str = ""
     toggles: dict[str, dict[str, str]] = field(default_factory=dict)  # 例: turbo
+    # coresident 起動時に要求する「可視 GPU の空き VRAM の最小値」(MiB)。None なら
+    # procman.CORESIDENT_MIN_FREE_MB(動画バックエンド向けの 40GB)。
+    coresident_min_free_mb: int | None = None
 
     def base_url(self) -> str:
         return f"http://127.0.0.1:{self.port}"
@@ -629,7 +632,47 @@ LTX25 = BackendDef(
     description="LTX-2.5 動画+音声生成(非同期ジョブ API、POST /api/jobs)",
 )
 
-BACKENDS: dict[str, BackendDef] = {"h3": H3, "ltx25": LTX25}
+# ---------------------------------------------------------------------------
+# minimax-h3-image (port 8633)  — 静止画生成・参照編集(Phase 8、2026-11-11)
+# ---------------------------------------------------------------------------
+
+H3IMAGE_PRESETS = {
+    "3step": Preset(
+        name="3step",
+        env={"H3IMG_STEPS": "3"},
+        description="既定。pDMD 2-step LoRA マージ済みを 3 step で使う(6 step 比 1.7×、品質ほぼ同等)。"
+                    "AdaLN 事前計算テーブル + int8wo、TE は H3 動画の nf4 キャッシュを流用(cuda:1 があればそちら)。",
+        vram_hint="GPU0 常駐 ~19GB / peak ~21GB(2048²)+ TE 16〜18GB(別GPU可)",
+    ),
+    "6step": Preset(
+        name="6step",
+        env={"H3IMG_STEPS": "6"},
+        description="チェックポイント既定の 6 step(LoRA なし)。最高品質、1024² 2.4s / 2048² 7.0s。",
+        vram_hint="同上",
+    ),
+    "2step": Preset(
+        name="2step",
+        env={"H3IMG_STEPS": "2"},
+        description="pDMD 2 step(プレビュー向け)。1024² ~1s だが織り目状の微細パターンが出る。",
+        vram_hint="同上",
+    ),
+}
+
+H3IMAGE = BackendDef(
+    name="h3image",
+    dir=REPO_ROOT / "backends" / "minimax-h3-image",
+    run_script="run.sh",
+    port=8633,
+    health_path="/api/health",
+    health_timeout_s=120.0,  # 遅延ロード(初回生成時に ~30s)
+    presets=H3IMAGE_PRESETS,
+    default_preset="3step",
+    description="MiniMax-H3-Image 静止画生成・最大16枚参照の編集(非同期ジョブ API、POST /api/jobs)",
+    # 実測: transformer+VAE 常駐 ~19GB・peak ~21GB(GPU0)、TE nf4 ~17GB(cuda:1 があればそちら)。
+    coresident_min_free_mb=24576,
+)
+
+BACKENDS: dict[str, BackendDef] = {"h3": H3, "ltx25": LTX25, "h3image": H3IMAGE}
 
 
 # ---------------------------------------------------------------------------
@@ -645,6 +688,8 @@ def override_allowed(backend: str, key: str) -> bool:
         return key.startswith("H3_")
     if backend == "ltx25":
         return key.startswith("LTX25_") or key in LTX25_ALLOWED_KEYS
+    if backend == "h3image":
+        return key.startswith("H3IMG_")
     return False
 
 
@@ -825,9 +870,10 @@ def catalog() -> list[dict]:
                 for p in backend.presets.values()
             ],
             "toggles": {k: v for k, v in backend.toggles.items()},
-            "overrides_policy": (
-                "H3_ プレフィックスのみ" if backend.name == "h3"
-                else "LTX25_* / OFFLOAD_MODE / OUTPUT_DIR 等 config.py 由来キーのみ"
-            ),
+            "overrides_policy": {
+                "h3": "H3_ プレフィックスのみ",
+                "ltx25": "LTX25_* / OFFLOAD_MODE / OUTPUT_DIR 等 config.py 由来キーのみ",
+                "h3image": "H3IMG_ プレフィックスのみ",
+            }.get(backend.name, "overrides 非対応"),
         })
     return items

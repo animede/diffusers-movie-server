@@ -12,8 +12,8 @@
  */
 "use strict";
 
-const BACKEND_TABS = ["h3", "ltx25"];
-const LABELS = { h3: "MiniMax-H3", ltx25: "LTX-2.5" };
+const BACKEND_TABS = ["h3", "ltx25", "h3image"];
+const LABELS = { h3: "MiniMax-H3", ltx25: "LTX-2.5", h3image: "MiniMax-H3-Image" };
 const STATUS_INTERVAL_MS = 3000;
 const JOBS_INTERVAL_MS = 5000;
 
@@ -85,7 +85,7 @@ function initTabs() {
 function backendOrigin(backend) {
   // LAN クライアント対応のためホスト名は動的に組み立てる。ポートはカタログ由来。
   const entry = state.catalog[backend];
-  const port = entry ? entry.port : (backend === "h3" ? 8631 : 8632);
+  const port = entry ? entry.port : ({ h3: 8631, ltx25: 8632, h3image: 8633 }[backend] || 8630);
   return "http://" + window.location.hostname + ":" + port + "/";
 }
 

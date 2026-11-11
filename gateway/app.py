@@ -3,7 +3,7 @@
 - 統一管理 API: /api/v1/backends, /api/v1/status, /api/v1/backend/load, /backend/unload
 - 統一生成 API(Phase 2): /api/v1/generate, /api/v1/jobs, /api/v1/assets,
   /api/v1/outputs, /api/v1/prompt/enhance
-- パススルー: /h3/{path} → 127.0.0.1:8631、/ltx25/{path} → 127.0.0.1:8632
+- パススルー: /h3/{path} → 127.0.0.1:8631、/ltx25/{path} → 127.0.0.1:8632、/h3image/{path} → 127.0.0.1:8633
   (method/ヘッダ/ボディ/クエリを素通し、レスポンスはストリーミング転送)
 - 出力静的配信: /h3/outputs /ltx25/outputs は gateway が直接配信する
   (StaticFiles マウントをパススルーの catch-all より先に登録するため優先される。
@@ -318,6 +318,9 @@ class PromptEnhanceRequest(BaseModel):
 def api_prompt_enhance(req: PromptEnhanceRequest):
     if req.backend not in BACKENDS:
         raise HTTPException(400, f"未知のバックエンドです: {req.backend!r}")
+    if req.backend == "h3image":
+        raise HTTPException(501, "h3image はプロンプト強化に対応していません"
+                                 "(MiniMax-H3-Image-PE は未統合)")
     if not manager.is_loaded(req.backend):
         raise HTTPException(
             502,
@@ -431,3 +434,8 @@ async def passthrough_h3(path: str, request: Request):
 @app.api_route("/ltx25/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"])
 async def passthrough_ltx25(path: str, request: Request):
     return await _passthrough("ltx25", path, request)
+
+
+@app.api_route("/h3image/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"])
+async def passthrough_h3image(path: str, request: Request):
+    return await _passthrough("h3image", path, request)
