@@ -16,6 +16,11 @@ class GenerateRequest(BaseModel):
     prompt: str = Field(..., min_length=1, max_length=8000)
     width: int = Field(2048, ge=256, le=8192)
     height: int = Field(2048, ge=256, le=8192)
+
+    @field_validator("width", "height", mode="before")
+    @classmethod
+    def _none_to_default(cls, v):
+        return 2048 if v is None else v
     seed: int | None = None
     # 2 / 3 = pDMD LoRA 蒸留(高速)、6 = チェックポイント既定。None = サーバ既定(H3IMG_STEPS)
     steps: Literal[2, 3, 6] | None = None

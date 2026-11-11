@@ -105,16 +105,29 @@ function renderRefs() {
     d.append(img, tag, rm); box.appendChild(d);
   });
 }
+function intField(id, label, def) {
+  // 空欄は既定値へ戻す。数値でない/範囲外はここで止める(NaN を送ると JSON の null になり 422 になる)
+  const el = $(id);
+  if (el.value.trim() === "") el.value = String(def);
+  const v = parseInt(el.value, 10);
+  if (!Number.isFinite(v) || v < 256 || v > 8192) throw new Error(label + " は 256〜8192 の整数で指定してください(32 の倍数に丸められます)");
+  return v;
+}
 $("go").addEventListener("click", async () => {
   $("err").textContent = "";
+  let width, height;
+  try { width = intField("width", "幅", 2048); height = intField("height", "高さ", 2048); }
+  catch (e) { $("err").textContent = e.message; return; }
+  if (!$("prompt").value.trim()) { $("err").textContent = "プロンプトを入力してください"; return; }
+  if ($("mode").value === "edit" && refs.length === 0) { $("err").textContent = "編集には参照画像が 1 枚以上必要です"; return; }
   const body = {
     mode: $("mode").value, prompt: $("prompt").value,
-    width: parseInt($("width").value, 10), height: parseInt($("height").value, 10),
+    width, height,
     conditions: $("mode").value === "edit" ? refs.map((r) => ({ asset_id: r.id })) : [],
   };
   if ($("steps").value) body.steps = parseInt($("steps").value, 10);
   if ($("area").value) body.generation_area = $("area").value;
-  if ($("seed").value !== "") body.seed = parseInt($("seed").value, 10);
+  if ($("seed").value.trim() !== "" && Number.isFinite(parseInt($("seed").value, 10))) body.seed = parseInt($("seed").value, 10);
   const r = await fetch("/api/jobs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   if (!r.ok) { $("err").textContent = "受理されませんでした: " + (await r.text()); return; }
   currentJob = (await r.json()).id; $("go").disabled = true; poll();
