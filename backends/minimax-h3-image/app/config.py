@@ -60,6 +60,11 @@ class Settings:
     # 生成中に CUDA OOM が起きたら一段下の構成へ自動で下げて 1 回だけやり直す(H3IMG_VRAM_FALLBACK=0 で無効)。
     vram_gb: str = _env("H3IMG_VRAM_GB", "auto")
     vram_fallback: bool = _env("H3IMG_VRAM_FALLBACK", "1") == "1"
+    # 予算から差し引いて必ず空けておく VRAM(GB)。画面表示や他のアプリの分。予算 = min(要求, 空き - これ)
+    vram_reserve_gb: float = float(_env("H3IMG_VRAM_RESERVE_GB", "1.0"))
+    # text_encoder をストリーミングするときの原本の置き場所: pinned / mmap(ページキャッシュ、RAM の少ない PC 向け)/
+    # auto(既定。ホスト RAM 48GB 以上なら pinned、未満なら mmap)
+    te_host: str = _env("H3IMG_TE_HOST", "auto")
     # 以下 3 つは auto(既定)なら VRAM 予算から決まる。明示すると予算より優先する。
     transformer_quant: str = _env("H3IMG_TRANSFORMER_QUANT", "auto")
     te_stream: str = _env("H3IMG_TE_STREAM", "auto")
@@ -92,6 +97,8 @@ class Settings:
     def __post_init__(self) -> None:
         if self.default_steps not in STEP_PRESETS:
             raise ValueError(f"H3IMG_STEPS は {sorted(STEP_PRESETS)} のいずれかです: {self.default_steps}")
+        if self.te_host not in ("auto", "pinned", "mmap"):
+            raise ValueError("H3IMG_TE_HOST は auto / pinned / mmap のいずれかです")
         if self.te_stream not in ("auto", "0", "1"):
             raise ValueError("H3IMG_TE_STREAM は auto / 0 / 1 のいずれかです")
         if self.transformer_stream not in ("auto", "0", "1"):
