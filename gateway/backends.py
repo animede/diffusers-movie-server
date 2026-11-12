@@ -637,22 +637,31 @@ LTX25 = BackendDef(
 # ---------------------------------------------------------------------------
 
 H3IMAGE_PRESETS = {
+    "auto": Preset(
+        name="auto",
+        env={"H3IMG_STEPS": "3"},
+        description="VRAM 予算から構成を自動選択(H3IMG_VRAM_GB、既定は GPU 総容量と実際の空きの小さい方)。"
+                    "48gb(int8wo)/ 32gb(W4A8)/ 16gb(+TE ストリーミング)/ 8gb(+ブロックストリーミング)。"
+                    "生成中の OOM は一段下へ自動で下げて再試行。overrides で H3IMG_VRAM_GB=16 等を指定可。",
+        vram_hint="空き VRAM に応じて 4〜38GB",
+    ),
     "3step": Preset(
         name="3step",
-        env={"H3IMG_STEPS": "3"},
+        env={"H3IMG_STEPS": "3", "H3IMG_TRANSFORMER_QUANT": "int8wo", "H3IMG_TE_STREAM": "0",
+             "H3IMG_TRANSFORMER_STREAM": "0"},
         description="既定。pDMD 2-step LoRA マージ済みを 3 step で使う(6 step 比 1.7×、品質ほぼ同等)。"
                     "AdaLN 事前計算テーブル + int8wo、TE は H3 動画の nf4 キャッシュを流用(cuda:1 があればそちら)。",
         vram_hint="GPU0 常駐 ~19GB / peak ~21GB(2048²)+ TE 16〜18GB(別GPU可)",
     ),
     "6step": Preset(
         name="6step",
-        env={"H3IMG_STEPS": "6"},
+        env={"H3IMG_STEPS": "6", "H3IMG_TRANSFORMER_QUANT": "int8wo", "H3IMG_TE_STREAM": "0", "H3IMG_TRANSFORMER_STREAM": "0"},
         description="チェックポイント既定の 6 step(LoRA なし)。最高品質、1024² 2.4s / 2048² 7.0s。",
         vram_hint="同上",
     ),
     "2step": Preset(
         name="2step",
-        env={"H3IMG_STEPS": "2"},
+        env={"H3IMG_STEPS": "2", "H3IMG_TRANSFORMER_QUANT": "int8wo", "H3IMG_TE_STREAM": "0", "H3IMG_TRANSFORMER_STREAM": "0"},
         description="pDMD 2 step(プレビュー向け)。1024² ~1s だが織り目状の微細パターンが出る。",
         vram_hint="同上",
     ),
@@ -690,7 +699,7 @@ H3IMAGE = BackendDef(
     health_path="/api/health",
     health_timeout_s=120.0,  # 遅延ロード(初回生成時に ~30s)
     presets=H3IMAGE_PRESETS,
-    default_preset="3step",
+    default_preset="auto",
     description="MiniMax-H3-Image 静止画生成・最大16枚参照の編集(非同期ジョブ API、POST /api/jobs)",
     # 実測: transformer+VAE 常駐 ~19GB・peak ~21GB(GPU0)、TE nf4 ~17GB(cuda:1 があればそちら)。
     coresident_min_free_mb=24576,

@@ -196,8 +196,9 @@ h3 に 2GPU分担プリセット `48gb-dual`(GPU0=transformer、GPU1=text_encode
 
 静止画生成・最大 16 枚参照の編集。詳細は `backends/minimax-h3-image/README.md`。
 
-- `POST /api/v1/backend/load {"backend":"h3image","preset":"3step"|"6step"|"2step"|"3step-32gb"|"3step-24gb"|"3step-8gb","strategy":"coresident"}`
-  既定 `3step`(pDMD 蒸留、6 step 比 1.7×・品質ほぼ同等)。動画バックエンドと同居させるときは
+- `POST /api/v1/backend/load {"backend":"h3image","preset":"auto"|"3step"|"6step"|"2step"|"3step-32gb"|"3step-24gb"|"3step-8gb","strategy":"coresident"}`
+  既定 `auto`(3 step、VRAM 予算から 48gb/32gb/16gb/8gb 構成を自動選択。overrides に `H3IMG_VRAM_GB` で予算指定可)。
+  `3step` 以下は従来の固定構成(pDMD 蒸留、6 step 比 1.7×・品質ほぼ同等)。動画バックエンドと同居させるときは
   `strategy: "coresident"` を明示すること(既定の process 戦略は他バックエンドを停止する。
   `generate` の auto_load も process 戦略なので、同居運用では先に明示ロードする)。
   coresident の空き VRAM 判定は h3image だけ 24GB(`BackendDef.coresident_min_free_mb`)。
