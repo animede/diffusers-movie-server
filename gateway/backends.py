@@ -678,7 +678,7 @@ H3IMAGE_PRESETS = {
              "H3IMG_TE_DEVICE": "cuda:0"},
         description="W4A8 + TE 層ストリーミング(decoder 51 層を pinned ホストから 1 層ずつ、lm_head 削除・"
                     "埋め込み CPU 化・VAE スワップ、出力 bit 一致)。1 枚 16〜24GB 級向け。"
-                    "1024² 2.6s / 2048² 4.1s / 編集 7.3s。ホスト RAM +20GB。",
+                    "1024² 1.2s / 2048² 3.4s / 編集 6.0s。ホスト RAM 約 19GB。",
         vram_hint="GPU0 peak 12.5〜13.1GB(2026-11-12 実測、空き 15.5GB に制限して検証。16GB 級でも可)",
     ),
     "3step-8gb": Preset(
