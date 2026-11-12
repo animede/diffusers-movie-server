@@ -667,9 +667,10 @@ H3IMAGE_PRESETS = {
         name="3step-24gb",
         env={"H3IMG_STEPS": "3", "H3IMG_TRANSFORMER_QUANT": "ck-w4a8", "H3IMG_TE_STREAM": "1",
              "H3IMG_TE_DEVICE": "cuda:0"},
-        description="W4A8 + TE 層ストリーミング(decoder 51 層を pinned ホストから 1 層ずつ、出力 bit 一致)。"
-                    "1 枚 24GB 級向け。2048² 3.9s / 編集 6.8s。ホスト RAM +17GB。",
-        vram_hint="GPU0 peak ~16〜17.5GB(2026-11-12 実測、空き 23.5GB に制限して検証)",
+        description="W4A8 + TE 層ストリーミング(decoder 51 層を pinned ホストから 1 層ずつ、lm_head 削除・"
+                    "埋め込み CPU 化・VAE スワップ、出力 bit 一致)。1 枚 16〜24GB 級向け。"
+                    "1024² 2.6s / 2048² 4.1s / 編集 7.3s。ホスト RAM +20GB。",
+        vram_hint="GPU0 peak 12.5〜13.1GB(2026-11-12 実測、空き 15.5GB に制限して検証。16GB 級でも可)",
     ),
 }
 
