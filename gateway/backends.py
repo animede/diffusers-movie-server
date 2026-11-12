@@ -686,7 +686,7 @@ H3IMAGE_PRESETS = {
         env={"H3IMG_STEPS": "3", "H3IMG_TRANSFORMER_QUANT": "ck-w4a8", "H3IMG_TE_STREAM": "1",
              "H3IMG_TRANSFORMER_STREAM": "1", "H3IMG_TE_DEVICE": "cuda:0"},
         description="3step-24gb に加えて transformer 50 ブロックも pinned ホストから先読みしながら流す"
-                    "(出力ピクセル一致、速度同等)。1 枚 8〜12GB 級向け。ホスト RAM +31GB。",
+                    "(出力ピクセル一致、速度同等)。1 枚 8〜12GB 級向け。ホスト RAM 約 29GB。",
         vram_hint="GPU0 torch peak 2.4〜2.9GB / プロセス実使用 max 4.2GB(2026-11-12 実測、空き 7.3GB に制限して検証)",
     ),
 }
