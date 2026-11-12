@@ -21,3 +21,6 @@ docs/*
 !docs/lowvram-techniques.md
 backends/minimax-h3/docs/h3-single-frame-vae-eval-20260827.md
 backends/minimax-h3/docs/h3-transformer-prequant-20260827.md
+
+# 探索スクリプト・調査記録はローカル保持のみ(2026-11-12)
+probes/
