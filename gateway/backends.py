@@ -656,6 +656,21 @@ H3IMAGE_PRESETS = {
         description="pDMD 2 step(プレビュー向け)。1024² ~1s だが織り目状の微細パターンが出る。",
         vram_hint="同上",
     ),
+    "3step-32gb": Preset(
+        name="3step-32gb",
+        env={"H3IMG_STEPS": "3", "H3IMG_TRANSFORMER_QUANT": "ck-w4a8", "H3IMG_TE_STREAM": "0"},
+        description="W4A8(comfy-kitchen)の 3 step。transformer ~11GB、GEMM は int8wo より速い(2048² 2.8s)。"
+                    "TE は常駐(2 枚あれば cuda:1)。1 枚なら 32GB 級向け。",
+        vram_hint="GPU0 peak ~13〜14GB + TE 16GB(同居なら peak ~29〜30GB)",
+    ),
+    "3step-24gb": Preset(
+        name="3step-24gb",
+        env={"H3IMG_STEPS": "3", "H3IMG_TRANSFORMER_QUANT": "ck-w4a8", "H3IMG_TE_STREAM": "1",
+             "H3IMG_TE_DEVICE": "cuda:0"},
+        description="W4A8 + TE 層ストリーミング(decoder 51 層を pinned ホストから 1 層ずつ、出力 bit 一致)。"
+                    "1 枚 24GB 級向け。2048² 3.9s / 編集 6.8s。ホスト RAM +17GB。",
+        vram_hint="GPU0 peak ~16〜17.5GB(2026-11-12 実測、空き 23.5GB に制限して検証)",
+    ),
 }
 
 H3IMAGE = BackendDef(

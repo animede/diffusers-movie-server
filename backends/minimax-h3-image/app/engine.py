@@ -1,6 +1,6 @@
 """MiniMax-H3-Image 生成エンジン。
 
-構成(probes/h3-image の実測に基づく、RESULTS.md 参照):
+構成(README「低 VRAM 化・高速化の方法」「調査・実測の記録」参照):
 - transformer: AdaLN 事前計算テーブル + torchao int8wo(app/pruned_image.py)。steps 2/3 は pDMD
   LoRA をマージ済みの別キャッシュ。常駐 ~19GB、1024² 1.8s / 2048² 4.1s(3-step)。
 - text_encoder: H3 動画用 prequant(nf4・51層、17GB)を流用。GPU が 2 枚あれば cuda:1 へ置き、
@@ -55,9 +55,11 @@ class Engine:
         return {
             "loaded": self.loaded,
             "steps": self.loaded_steps,
+            "transformer_quant": self.s.transformer_quant,
             "device": str(self.device),
             "te_device": str(self.te_device),
             "te_loaded": self.te is not None,
+            "te_streamed": self.te_streamed,
             "vram_alloc_gb": round(torch.cuda.memory_allocated(self.device) / 2**30, 2),
         }
 
@@ -80,7 +82,7 @@ class Engine:
                 self._repo = str(snap)
                 return self._repo
         raise RuntimeError(
-            f"{self.s.model_id} のスナップショットが見つかりません。probes/h3-image/download.py 相当で "
+            f"{self.s.model_id} のスナップショットが見つかりません。scripts/prepare_models.py を実行して "
             "transformer_diffusers / vae_diffusers / scheduler / tokenizer / processor / *.json を取得してください")
 
     def _build_pipeline(self):
@@ -105,9 +107,49 @@ class Engine:
                                                          device_map=str(self.te_device))
         if self.te_device != self.device:
             self._route_text_encoder(te)
-        logger.info("text_encoder loaded (%d layers) on %s in %.1fs",
-                    te.config.text_config.num_hidden_layers, self.te_device, time.time() - t0)
+        elif self._te_stream_enabled():
+            self._stream_text_encoder(te)
+        logger.info("text_encoder loaded (%d layers) on %s in %.1fs (stream=%s)",
+                    te.config.text_config.num_hidden_layers, self.te_device, time.time() - t0, self.te_streamed)
         return te
+
+    te_streamed: bool = False
+
+    def _te_stream_enabled(self) -> bool:
+        if self.s.te_stream == "1":
+            return True
+        if self.s.te_stream == "0":
+            return False
+        total_gb = torch.cuda.get_device_properties(self.device).total_memory / 2**30
+        return total_gb < self.s.te_stream_auto_below_gb
+
+    def _stream_text_encoder(self, te) -> None:
+        """decoder 51 層を pinned CPU に退避し、forward hook で 1 層ずつ GPU へ往復させる。
+
+        bnb nf4 の Params4bit は `.to()` の往復で量子化状態を保つ(hidden_states[50] が全 GPU 常駐時と
+        bit 一致することを実測済み)。embed / vision tower / norm は GPU に残す(~3GB)。
+        """
+        dev = self.device
+        layers = te.model.language_model.layers
+        t0 = time.time()
+        for layer in layers:
+            layer.to("cpu")
+            for p in layer.parameters():
+                p.data = p.data.pin_memory()
+
+        def pre(mod, args, kwargs):
+            mod.to(dev, non_blocking=True)
+
+        def post(mod, args, out):
+            mod.to("cpu", non_blocking=True)
+
+        for layer in layers:
+            layer.register_forward_pre_hook(pre, with_kwargs=True)
+            layer.register_forward_hook(post)
+        torch.cuda.empty_cache()
+        self.te_streamed = True
+        logger.info("text_encoder decoder layers streamed from pinned host (%d layers, %.1fs, resident=%.2fGB)",
+                    len(layers), time.time() - t0, torch.cuda.memory_allocated(dev) / 2**30)
 
     def _route_text_encoder(self, te) -> None:
         """te.model.forward を包み、入力を TE 側 GPU へ、hidden_states[50] だけをホスト経由で返す。"""
@@ -149,9 +191,10 @@ class Engine:
                 raise RuntimeError(f"steps={steps} には pDMD LoRA が必要です: {self.s.lora_path}(H3IMG_LORA_PATH)")
             lora = str(self.s.lora_path)
         t0 = time.time()
+        quant = self.s.transformer_quant
+        cache_name = {"int8wo": "int8wo_adaln_table", "ck-w4a8": "ckw4a8_adaln_table"}[quant] + tag
         tr = pruned_image.load_transformer(self._resolve_repo(), self.pipe, self.device,
-                                           self.s.cache_dir / ("int8wo_adaln_table" + tag),
-                                           quant="int8wo", lora_path=lora)
+                                           self.s.cache_dir / cache_name, quant=quant, lora_path=lora)
         self._install_progress_hook(tr, steps)
         logger.info("transformer (steps=%d) ready in %.1fs, alloc=%.2fGB", steps, time.time() - t0,
                     torch.cuda.memory_allocated(self.device) / 2**30)
