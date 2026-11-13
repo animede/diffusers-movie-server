@@ -103,10 +103,10 @@ class Settings:
     def __post_init__(self) -> None:
         if self.default_steps not in STEP_PRESETS:
             raise ValueError(f"H3IMG_STEPS は {sorted(STEP_PRESETS)} のいずれかです: {self.default_steps}")
-        if self.te_host not in ("auto", "pinned", "mmap"):
-            raise ValueError("H3IMG_TE_HOST は auto / pinned / mmap のいずれかです")
-        if self.transformer_host not in ("auto", "pinned", "mmap"):
-            raise ValueError("H3IMG_TRANSFORMER_HOST は auto / pinned / mmap のいずれかです")
+        if self.te_host not in ("auto", "pinned", "mmap", "file"):
+            raise ValueError("H3IMG_TE_HOST は auto / pinned / mmap / file のいずれかです")
+        if self.transformer_host not in ("auto", "pinned", "mmap", "file"):
+            raise ValueError("H3IMG_TRANSFORMER_HOST は auto / pinned / mmap / file のいずれかです")
         if self.te_stream not in ("auto", "0", "1"):
             raise ValueError("H3IMG_TE_STREAM は auto / 0 / 1 のいずれかです")
         if self.transformer_stream not in ("auto", "0", "1"):
