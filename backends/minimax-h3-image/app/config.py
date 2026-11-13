@@ -65,6 +65,9 @@ class Settings:
     # text_encoder をストリーミングするときの原本の置き場所: pinned / mmap(ページキャッシュ、RAM の少ない PC 向け)/
     # auto(既定。ホスト RAM 48GB 以上なら pinned、未満なら mmap)
     te_host: str = _env("H3IMG_TE_HOST", "auto")
+    # transformer ブロックをストリーミングするときの原本の置き場所: pinned / mmap(量子化キャッシュのページキャッシュから
+    # 直接流す。必須 RAM が約 10GB 減るが、毎生成でディスクから読み直す)/ auto(既定 = te_host と同じ規則)
+    transformer_host: str = _env("H3IMG_TRANSFORMER_HOST", "auto")
     # 以下 3 つは auto(既定)なら VRAM 予算から決まる。明示すると予算より優先する。
     transformer_quant: str = _env("H3IMG_TRANSFORMER_QUANT", "auto")
     te_stream: str = _env("H3IMG_TE_STREAM", "auto")
@@ -99,6 +102,8 @@ class Settings:
             raise ValueError(f"H3IMG_STEPS は {sorted(STEP_PRESETS)} のいずれかです: {self.default_steps}")
         if self.te_host not in ("auto", "pinned", "mmap"):
             raise ValueError("H3IMG_TE_HOST は auto / pinned / mmap のいずれかです")
+        if self.transformer_host not in ("auto", "pinned", "mmap"):
+            raise ValueError("H3IMG_TRANSFORMER_HOST は auto / pinned / mmap のいずれかです")
         if self.te_stream not in ("auto", "0", "1"):
             raise ValueError("H3IMG_TE_STREAM は auto / 0 / 1 のいずれかです")
         if self.transformer_stream not in ("auto", "0", "1"):
