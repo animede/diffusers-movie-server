@@ -9,6 +9,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+TEXT_ENCODER_LAYER = 50   # MiniMax-H3 は Qwen3-VL の hidden_states[50] を読む
 BASE_DIR = Path(__file__).resolve().parent.parent          # backends/minimax-h3-image
 REPO_ROOT = BASE_DIR.parent.parent                          # diffusers-movie-server
 
