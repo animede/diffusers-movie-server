@@ -53,6 +53,8 @@ class Settings:
     model_dir: str = _env("H3IMG_MODEL_DIR", "")
     # キャッシュ構築時に 1 つずつダウンロードした bf16 シャードを消さずに残す(元からあるファイルはどちらでも消さない)
     keep_source: bool = _env("H3IMG_KEEP_SOURCE", "0") == "1"
+    # 編集の参照画像 1 枚あたりの画素数の上限(MP)。auto = 8gb / 16gb 構成で 1.05、それ以外は上限なし
+    reference_max_megapixels: str = _env("H3IMG_REFERENCE_MAX_MEGAPIXELS", "auto")
     te_dir: Path = Path(_env("H3IMG_TE_DIR", str(DEFAULT_TE_DIR)))
     # 使う GPU: H3IMG_GPU=1 のように番号で指定(H3IMG_DEVICE=cuda:1 と同じ)。TE は H3IMG_TE_GPU / H3IMG_TE_DEVICE。
     # 既定: transformer は cuda:0、TE は GPU が 2 枚以上あれば cuda:1(engine 側で解決)
