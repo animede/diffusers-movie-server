@@ -57,6 +57,8 @@ class Settings:
     reference_max_megapixels: str = _env("H3IMG_REFERENCE_MAX_MEGAPIXELS", "auto")
     # 1 で text_encoder のビジョン塔を参照画像 1 枚ずつ通す(結果は一括と数値的に同一ではない)
     vision_per_image: bool = _env("H3IMG_VISION_PER_IMAGE", "0") == "1"
+    # text_encoder の attention をクエリ何行ずつに分けるか(0 = 分けない)。auto = Windows で 512、他は 0
+    te_attn_chunk: str = _env("H3IMG_TE_ATTN_CHUNK", "auto")
     te_dir: Path = Path(_env("H3IMG_TE_DIR", str(DEFAULT_TE_DIR)))
     # 使う GPU: H3IMG_GPU=1 のように番号で指定(H3IMG_DEVICE=cuda:1 と同じ)。TE は H3IMG_TE_GPU / H3IMG_TE_DEVICE。
     # 既定: transformer は cuda:0、TE は GPU が 2 枚以上あれば cuda:1(engine 側で解決)
