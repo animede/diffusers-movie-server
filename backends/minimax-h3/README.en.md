@@ -30,7 +30,7 @@ steps. All speeds are on this box's **PCIe Gen3 x4 slot + sm_89 (4060 Ti) + SDPA
 
 | Config | t2i 768² | t2va 5s 768² | ref2i | i2va (image ref) | audio ref | 768×1344 5s |
 |---|---|---|---|---|---|---|
-| **Real RTX 4060 Ti 16GB, single** | ○ 498s / peak 7.4GB | ○ 25 min / 11.4GB | ○ | ○ 39 min / 9.41GB | ○ 54 min / 11.96GB | ○ 66 min / 13.37GB (15.2GB real = ceiling) |
+| **Real RTX 4060 Ti 16GB, single** | ○ 498s / peak 7.4GB | ○ 25 min / 11.4GB (2026-11-15: 4.62GB with `H3_TE_STREAM=1 H3_TE_DIET=1`, 6.41GB at 1024²; 4.79GB with head-grouped attention, 3.03GB with `H3_CACHE=none`) | ○ | ○ 39 min / 9.41GB | ○ 54 min / 11.96GB | ○ 66 min / 13.37GB (15.2GB real = ceiling) |
 | **8GiB × 2** (compute + TE, ballast-simulated) | ○ 512s / 6.4GB | ○ 25.6 min / 7.23GB | ○ 17.7 min / 6.69GB | × OOM | × OOM | × OOM |
 | **12GB, single** | △ estimate | △ | △ | △ | close to × (14.7GB real) | × |
 | **48GB + 20GB** (two cards, turbo LoRA) | ○ 9.7s | ○ 44.2s | ○ | ○ | ○ | ○ |
@@ -57,6 +57,14 @@ H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1 \
   H3_ATTN_BACKEND=default \
   venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8611
 # Note: anything other than sm_120 requires H3_ATTN_BACKEND=default (the default sage is an sm_120-only build)
+
+# 6GB single (768² x 5 s 4.6GB; 1024² x 5 s 4.8GB with head-grouped attention chosen from the free VRAM) / 8GB single
+# (1024² 6.4GB, no grouping): the 2026-11-15 streaming and lean forward (see "Where low VRAM stands"). Just add
+# H3_TE_STREAM=1 H3_TE_DIET=1 to the 16GB line (the rest is on by default; H3_CACHE=none takes 1024² to 3.0GB).
+# Host RAM: 48GB+ pins the weights (fast); 32GB / 16GB PCs stream them from the quantized cache automatically (H3_GROUP_STREAM_HOST)
+H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1 H3_TE_STREAM=1 H3_TE_DIET=1 \
+  H3_ATTN_BACKEND=default \
+  venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8611
 
 # 8GB × 2 (put the TE on the second GPU)
 H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1 \
@@ -246,7 +254,7 @@ minimax-h3/
 | | Requirement |
 |---|---|
 | GPU | Minimum: a **single 16GB card** (all features, measured, slow) or **8GB×2** (up to t2i/t2va/ref2i). **48GB tier** recommended for comfortable use. Per-config measurements: "[VRAM × feature matrix](#vram--feature-matrix-measured-2026-08-11)" at the top |
-| Host RAM | 64GB or more recommended (`H3_LOWVRAM=group` keeps ~34GB of int8 weights resident in RAM, so 48GB+ free is needed) |
+| Host RAM | 64GB or more recommended for pinned weights (`H3_LOWVRAM=group` keeps ~34GB of int8 weights resident in RAM, so 48GB+ free is needed); below 48GB the weights are streamed from the quantized cache instead (`H3_GROUP_STREAM_HOST=file`, 1K at the same speed on 32GB, slower at 512²) |
 | Disk | About 145GB (T2VA/FL2VA only) / about 207GB (if Ref2VA is also used) |
 | CUDA | 12.8 series (to match torch 2.9.0+cu128). If building SageAttention, `nvcc` must also be the same series |
 | Python | 3.12 |
@@ -342,7 +350,7 @@ at the top and the dated 2026-08-11 sections for details).
 | 96GB | (none = default) | peak 92GB / about 160s |
 | 80GB tier | `H3_TRANSFORMER_QUANT=int8` | peak 59.7GB / about 160s |
 | 48GB tier | `H3_LOWVRAM=1` | peak 38.9GB / about 215s |
-| 32GB tier | `H3_LOWVRAM=group` | peak 28.7GB / about 280s |
+| 32GB tier | `H3_LOWVRAM=group` | peak 28.7GB / about 280s (denoise about 1.7x faster since the 2026-11-15 streamer, see `H3_GROUP_STREAM` below) |
 | 18GB tier | `H3_LOWVRAM=group H3_TE_PRUNE=1` | peak 17.7GB / about 280-320s |
 | **Single 16GB** (real 4060 Ti) | `H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1` | peak 11.4GB / about 25min* |
 | **Single 12GB** (projected, unmeasured) | same as single 16GB | the measured 11.4GB peak should fit in 12GiB; reference modes and 768×1344 will not |
@@ -812,6 +820,224 @@ bf16-ification).
 - With default OFF, this MD5-matches the existing baseline (zero regression)
 
 ## 24-32GB-tier VRAM support (`H3_LOWVRAM=group`, added 2026-08-05)
+
+### 2026-11-15: block transfer replaced by an in-house windowed prefetch streamer (`H3_GROUP_STREAM`, default `own`)
+
+The block transfer of `H3_LOWVRAM=group` moved from diffusers' `enable_group_offload(block_level, use_stream=True)`
+to the streamer in `core/blockstream.py` (`H3_GROUP_STREAM=diffusers` restores the old path). It follows the
+design of the text encoder's `H3_TE_STREAM` (`core/testream.py`): the 50 int8 blocks (30.1 GiB) live in
+page-locked host RAM and a copy stream sends `window` blocks ahead of the computation (`H3_GROUP_OFFLOAD_BLOCKS`+1,
+default 2). Everything that is not a block (embedders, token_refiner, output layers, 1.6 GiB in bf16) stays on the
+GPU. torchao `Int8Tensor`s are moved through their inner `qdata` / `scale` / `zero_point` tensors rather than the
+outer wrapper (the same approach as diffusers' `_restore_torchao_tensor`). This is the design proven in
+flux3-klein-studio's 6 GB work, ported here.
+
+Measured (GPU0 of an RTX PRO 5000 Blackwell 48 GB, `H3_LOWVRAM=group H3_TE_PRUNE=1`, t2va 512² x 5 s = 124 frames,
+30 steps, seed 1, two runs each):
+
+| | diffusers (`H3_GROUP_STREAM=diffusers`) | in-house (`own`, default) |
+|---|---:|---:|
+| Denoise, `H3_CACHE=none` | 164.9-165.0 s (5.68 s/step) | **96.4-96.5 s (3.32 s/step)** |
+| Denoise, `H3_CACHE=fbc` (default) | 165.5-167.6 s (FBC never skips a step) | **85.6-86.1 s (FBC skips 6 of 30 steps)** |
+| Peak VRAM | 17.7-18.3 GB | 19.5-20.0 GB (+1.6 GiB of resident non-block modules) |
+| Output (MD5) | **identical** to the in-house streamer with `H3_CACHE=none` | same |
+| Load (pinning) | 20 s (34 GB into a pinned dict) | 15 s (one buffer per block) |
+
+- The speed difference is the transfer scheme itself (1.71x with FBC off on both sides): the stock hooks pay a
+  fixed cost per group and let the CPU run ahead of the GPU, which delays the frees (section 4.2 of
+  `docs/lowvram-techniques.md`).
+- **FirstBlockCache now works in group mode.** Under the diffusers path FBC never skipped a step (the
+  `cache_skipped_steps: 0` noted under "An honest note on speed"); the in-house streamer skips 6 of 30 at the
+  default threshold 0.05, so the output differs from FBC-off by exactly FBC's intended approximation. Use
+  `H3_CACHE=none` when the exact result matters.
+- The group-mode transformer now loads from the prequantized cache (`models/prequant/transformer_int8`) onto the CPU
+  when present (the bf16 shards no longer need to be in the HF cache; same fail-open as the other modes). Int8Tensors
+  read from the cache are pinned to `requires_grad=False` (diffusers' `swap_tensors` otherwise walks autograd and
+  fails with `aten.view unimplemented`). On a box whose bf16 shards were deleted, the `source_snapshot` check of
+  `meta.json` is skipped.
+- Release goes through `BlockStreamer.release()` (`cudaHostUnregister`) instead of relying on `_host_emptyCache`.
+- Host RAM: 30.1 GiB pinned (about the same as the diffusers path's 34 GB pinned dict). The RAM guard
+  (`H3_GROUP_OFFLOAD_MIN_RAM_GB`) is unchanged.
+
+### 2026-11-15: where low VRAM stands — from the 16GB configuration to 8GB / 6GB (three streaming stages)
+
+The same design was applied to the three things that still stayed on the GPU in group mode. All are placement
+changes only, and **the outputs match by MD5**.
+
+1. **The projection TE's LM layers** (`H3_TE_STREAM=1` now also applies to `H3_TE_PROJ`): the 4B model's 36 layers
+   (1.9 GiB) live in pinned host memory and stream only during encoding. Group mode keeps the TE resident through
+   denoise, so this lowers the denoise peak.
+2. **The token_refiner's two blocks** (`H3_GROUP_STREAM_REFINER`, default 1): excluded from int8, 1.5 GiB of bf16 stayed resident.
+3. **The video VAE decoder's 36 blocks** (`H3_GROUP_STREAM_VAE`, default `auto` = stream when less than 8 GB of VRAM is
+   free at the first decode): 4.8 GiB of the VAE's 5.2 GiB (fp16) is the decoder, and after 1 and 2 this was the peak.
+   Blocks are re-sent per tile, so decoding gets slower.
+
+Measured (GPU0 of an RTX PRO 5000 48 GB, `H3_LOWVRAM=group H3_TE_PROJ=… H3_VIDEO_VAE_FP16=1 H3_TE_STREAM=1`,
+t2va 5 s, 30 steps, seed 1):
+
+| | baseline (in-house streamer only) | +1 projection TE | +2 token_refiner | +3 VAE decoder |
+|---|---:|---:|---:|---:|
+| 512² x 5 s peak | 8.59 GB | 8.33 GB | 6.79 GB | **4.67 GB** |
+| 768² x 5 s peak | 10.78 GB | 9.54 GB | 7.99 GB | **7.45 GB** |
+| 512² denoise / decode | 90 / 6 s | 86 / 6 s | 90 / 6 s | 89 / 17 s |
+| 768² denoise / decode | 200 / 11 s | 193 / 11 s | 195 / 11 s | 195 / 30 s |
+
+Resident VRAM right after startup is 0.18 GB. What remains at the peak is the denoise activations, which depend on
+resolution and length.
+
+4. **Token-chunked feed-forward** (`H3_FF_CHUNK`, default `auto` = 8192 tokens in group mode, `0` disables). The largest
+   transient in a block is the SwiGLU projection (2 × ffn_dim 14336 bf16 = 57 KB per token); running the feed-forward
+   8192 tokens at a time bounds that transient. It is a per-token operation, so the result is the same (MD5 match).
+
+| Activation peak incl. 1K (denoise phase, same configuration) | unchunked | `H3_FF_CHUNK=8192` |
+|---|---:|---:|
+| 768² × 5 s | 7.45 GB | **6.26 GB** |
+| 1024² × 5 s (38k tokens, 13.9 s/step) | 10.73 GB | **9.34 GB** |
+
+What remains is the attention's K and V (0.55 GB each at 1024²) plus the output and the residual stream, close to the
+floor for an exact result.
+
+5. **Query-chunked attention** (`H3_ATTN_Q_CHUNK`, default 0 = off, `core/attnchunk.py`). K and V are built in full; the
+   Q projection, QK norm, RoPE, the kernel and the output projection run 8192 tokens at a time (MD5 match). It only
+   helps at 1K and above: the 1024² × 5 s denoise peak goes 9.34 → **8.53 GB**, 768² is unchanged (6.26 → 6.38). It is
+   2-4% slower (13.9 → 14.4 s/step at 1024²), so it is off by default; add `H3_ATTN_Q_CHUNK=8192` for 1K on a small card.
+
+That left 1024² × 5 s at 8.5 GB. Three more changes closed the gap (all MD5-identical):
+
+6. **A memory-lean block forward** (`H3_LEAN_BLOCK`, default `auto` = 8192 tokens in group mode, `core/leanblock.py`).
+   The original forward materializes the norm1 output, the attention output, the norm2 output and the FF output for
+   all tokens (0.41 GB each at 1024²) before adding them. The lean version runs normalization → modulation →
+   projections/attention/FF → gate → residual add in chunks, so the only full-length tensors are the input, the
+   output, K and V. It subsumes 4 (FF chunking) and 5 (query chunking); recomputing the norm per chunk costs about 7%
+   at 1024².
+7. **Streaming in thirds of a block** (`H3_GROUP_STREAM_UNITS=half`, default): adaln_proj → attn → ff as 150 units, so
+   the prefetched residency drops from two blocks (1.3 GiB) to two small units.
+8. **`H3_TE_DIET=1` for the projection TE** (opt-in): releasing lm_head and bridging the embedding table
+   (151936 × 2560) to the CPU frees 1.45 GiB.
+
+| Peak VRAM (same configuration + `H3_TE_DIET=1`, overall, VAE streamed as on a small card) | at first (in-house streamer only) | 1-3 (three streaming stages) | everything (4-8) |
+|---|---:|---:|---:|
+| 512² × 5 s | 8.59 GB | 4.67 GB | **3.27 GB** |
+| 768² × 5 s | 10.78 GB | 7.45 GB | **4.85 GB** |
+| 1024² × 5 s | 10.73 GB (denoise) | — | **6.82 GB** |
+
+That was the morning. In the afternoon the 1024² × 5 s breakdown was re-measured (`H3_LEAN_DEBUG=1` logs allocated / peak
+around blocks 0-2): 38,321 tokens (31,744 video + audio + text), one residual-stream buffer 0.41 GB, K and V 0.55 GB each,
+and the largest transient inside a block is the attention phase (K + V 1.1 GB + the int8 copies sage makes inside its
+kernel + the chunk). Four more changes:
+
+9. **Rounding the fp32 patch embeddings** (`shrink_prologue` in `core/leanblock.py`, installed together with
+   `H3_LEAN_BLOCK`). The transformer forward computes the `proj_in` output (a layer kept in fp32) for all tokens and
+   rounds it to bf16 when packing, but the fp32 version survives as a local variable for the whole block loop (0.68 GB at
+   1024²). Rounding at the projection's exit gives the same values with half the residency. 1024² 6.82 → **6.41 GB**,
+   768² 4.85 → **4.62 GB** (MD5 match).
+10. **In-place residual update** (same module). From block 2 on, each block writes into its input buffer (every chunk
+    finishes reading its own rows before writing them, so the result is the same; MD5 match). FBC references the input
+    and output of block 0, so blocks 0 and 1 write new buffers; together with the three residual tensors FBC keeps
+    (head_block_output / head_block_residual / tail_block_residuals, 1.2 GB in total at 1024²) the peak stays at block 1,
+    so the overall figure does not move with FBC on. With `H3_CACHE=none` every block is in place and one buffer is saved.
+11. **Head-grouped attention** (`H3_ATTN_HEAD_GROUPS`, default `auto`). K, V and Q are built for the 56 heads in G groups
+    (row slices of the to_q/to_k/to_v weights; the streamer keeps only the inner tensors of torchao's Int8Tensor on the
+    GPU, so the slice is rebuilt from them). Each group's attention output goes into one full-width buffer (attn_out) and
+    the output projection runs from it for all heads at once. The resident set goes from two buffers (K, V) to
+    attn_out + K/G + V/G, and the K/V copies sage makes inside its kernel shrink by G as well. Recomputing the norm and
+    modulation G times costs time (G=4 +13%, G=8 +15-35%, G=28 +70%). **Same math, but not bit-identical**: changing the
+    GEMM width (7168/G) and the head count seen by the attention kernel changes kernel selection and summation order,
+    so the last bf16 bit can move (sage's K-mean centering matches or not depending on the head count and token count).
+    Thirty steps amplify that into a different sample of the same video (PSNR against the baseline 34.4 dB at 1024²,
+    38.7 dB at 768²; FBC on vs off differs by 34.2 dB, so this is the same order as the FBC approximation that is on by
+    default, not a quality loss). Therefore **auto always picks G=1 when G=1 fits** and otherwise the smallest of
+    4 → 7 → 8 → 14 → 28 that fits the free VRAM (a `H3_VRAM_LIMIT_GB` cap is honored; decided at the first forward of a
+    generation and kept for that generation, after reserving FBC's three residuals and 1 GiB of slack). Fixed G=4: 1024² 5.09 GB (16.7 s/step, +8%).
+    Fixed G=8: 1024² **4.79 GB** (17.9 s/step), 768² **3.95 GB** (8.8 s/step). Under a 5.8 GB cap, auto chose G=4 → 28 and
+    peaked at 4.79 GB (26 s/step). Even a combination that matched bit-for-bit in a single-block check (G=4 at 1024²) gave a
+    different MD5 after 30 real steps, so treat any G>1 as a different sample.
+12. **Turning FBC off** (`H3_CACHE=none`) drops the three FBC residuals and makes every block in place. With G=8 the
+    1024² × 5 s denoise peaks at **3.03 GB** (all 30 steps are computed, 23 s/step; FBC itself is an approximation, so the
+    output changes).
+
+| Peak VRAM (same configuration, overall) | up to 8 (morning) | 9-10 (MD5 match, default) | + head groups G=8 (different sample) | + `H3_CACHE=none` |
+|---|---:|---:|---:|---:|
+| 512² × 5 s | 3.27 GB | **2.90 GB** | — | — |
+| 768² × 5 s | 4.85 GB | **4.62 GB** | 3.95 GB | — |
+| 1024² × 5 s | 6.82 GB | **6.41 GB** | 4.79 GB | 3.03 GB |
+
+Exact (MD5-identical) results bottom out at **512² 2.90 GB / 768² 4.62 GB / 1024² 6.41 GB**; what remains is K and V, the residual stream
+and the three FBC residuals. Allowing head groups puts **1024² × 5 s on a 6 GB card** (auto uses them only when needed).
+`/api/status` reports `group_stream_refiner`, `group_stream_vae`, `group_stream_units`, `ff_chunk`, `attn_q_chunk`,
+`lean_block`, `attn_head_groups` and `lean_block_last` (token count, G and the first in-place block of the latest forward;
+the generation result JSON carries `lean_block_last` too).
+
+### PCs with 32 GB / 16 GB of host RAM: streaming the weights straight from the files (`H3_GROUP_STREAM_HOST=file`, 2026-11-15)
+
+Everything above keeps the whole int8 transformer (30 GiB) in pinned host RAM, which assumes a 48 GB-class machine.
+`H3_GROUP_STREAM_HOST=file` (`core/filestream.py`, the same scheme as minimax-h3-image-server's `app/filestream.py`) reads
+each unit (a third of a block) from the prequantized cache (safetensors; `from_pretrained` maps the files, so nothing is
+expanded into RAM) with 8 threads in 32 MB chunks into a small pinned staging ring (3 × 0.24 GiB, two units of read-ahead)
+and copies from there to the GPU. The only mandatory host RAM is that ring plus the token_refiner's (2 × 0.36 GiB); whatever
+else fits in the OS page cache makes it faster. The tail units that do not fit the cache are dropped with
+`posix_fadvise(DONTNEED)` after every read so the cyclic access does not flush everything through LRU (the number is `auto`:
+weights + the TE / VAE pinning that comes later − usable RAM, honoring a cgroup limit). In file mode the VAE decoder's
+streaming source is not pinned either (the fp16 copy is used as is). The int8 weights are the same, so the output is the same.
+
+- `H3_GROUP_STREAM_HOST`: `auto` (default: file when the installed RAM is below `H3_GROUP_STREAM_FILE_BELOW_GB` = 48 GB),
+  `pinned`, `file`. Falls back to pinned when the weights were quantized from bf16 at load (no cache file to read).
+  `H3_GROUP_STREAM_DROP_UNITS` (auto / a number), `H3_GROUP_STREAM_RING` (staging buffers, default 3). `/api/status` reports
+  `group_stream_host` / `group_stream_file`.
+- Windows has no `fadvise`, so the drop control does not apply (reading itself works, opened with
+  `FILE_FLAG_SEQUENTIAL_SCAN`; the same scheme was verified on the image server's RTX 3050 / 16 GB RAM machine).
+
+Measured on GPU0 of the 48 GB machine with the RAM limit emulated by a cgroup and the cache's page cache dropped before
+each run (this machine's NVMe reads 3.3 GB/s directly; every output is MD5-identical to pinned):
+
+| Where the weights live | Mandatory host RAM | 512² × 5 s | 1024² × 5 s | Notes |
+|---|---:|---:|---:|---|
+| pinned (reference) | about 38 GiB (transformer 30 + refiner 1.4 + TE 1.9 + VAE 4.5) | 2.98 s/step | 15.1 s/step | VRAM 2.90 / 6.41 GB |
+| file, no RAM limit (warm cache) | about 8 GiB | 3.11 s/step | — | VRAM 2.49 GB (one less unit prefetched on the GPU) |
+| file, 28 GB RAM cap (a 32 GB PC) | same | 6.1 s/step | **14.7 s/step** | 94 of 150 units read from disk; at 1K the reads hide behind compute |
+| file, 16 GB RAM cap | same | 8.0 s/step | — | all 150 units read from disk (30 GiB/step), MD5 match |
+| file, 12 GB RAM cap (a 16 GB PC), VAE and TE from files too (below) | about 2 GiB | 8.0 s/step | **15.4 s/step** | MD5 match; the VAE is pinned only during the decode when RAM allows |
+
+At 1K the reads (worst case 30 GiB/step ÷ 3.3 GB/s ≈ 9 s) hide behind 15 s of compute, so it is as fast as pinned; 512² is
+read-bound and takes about twice as long. **A 32 GB PC runs 1024² × 5 s at the pinned speed, and a 16 GB PC runs 1K too** (speed depends on the disk's sequential
+read speed). In the first 12 GB-cap test the process's anonymous memory reached about 12 GB right before the decode (`proc_anon_gb`:
+the fp16 copy of the VAE 4.8, staging 1.6, the TE's pinned layers 1.9-2.4, baseline 0.6, plus the decode's frame buffers).
+The two remaining pieces were moved to the same scheme, and 1K now runs with 16 GB of RAM:
+
+- **An fp16 cache of the VAE decoder** (`core/vaecache.py`, `models/prequant/vae_decoder_fp16/`, 4.5 GiB, written once in
+  2 s). In file mode the decoder blocks are not cast to fp16 at startup (that copy was 4.8 GiB of anonymous memory); they
+  become 0-element placeholders. At decode time the free RAM decides: **with 4.5 GiB + 2 GiB available the cache is read
+  into pinned memory in 1.4 s and kept only for that decode** (same speed as pinned); otherwise it is streamed from the
+  file per tile (1K decode 48 → 95 s). The pinned copy is released afterwards. The values are the same rounding as
+  `vae.to(float16)`, so the output is unchanged.
+- **A quantized cache of the projection TE** (`H3_TE_PROJ_PREQUANT=1`, default, `models/prequant/te_proj_<model>_bnb-4bit/`).
+  The bnb-4bit TE is saved once (2 s) and loaded from there afterwards (on this machine the load takes the same 9-10 s as
+  quantizing from bf16, but it reads 2.2 GB of nf4 instead of 8 GB of bf16, which matters on a slow disk). In file mode its 36 LM layers (1.9 GiB) are streamed straight from that file instead of being
+  pinned (staging 2 × 0.06 GiB).
+
+With that, **1024² × 5 s completes under the 12 GB cap** (a 16 GB PC): 15.4 s/step, decode 97 s streamed from the file,
+MD5 match; 768² runs at 8.3 s/step (the VAE is pinned for the decode, 30 s; MD5 match). The mandatory host RAM is the staging ring plus the TE's
+(about 1 GiB) and the process itself, about 2 GiB in total.
+
+#### VRAM class × host RAM class at a glance (t2va 5 s, 30 steps, the default low-VRAM configuration)
+
+Speeds are seconds per step on this machine (RTX PRO 5000); an RTX 3050 takes several times longer. ○ = fits with
+MD5-identical output, △ = fits with head groups (a different sample) or `H3_CACHE=none`, ✗ = does not fit.
+
+| VRAM \ host RAM | 16 GB (file, every unit from disk) | 32 GB (file, part from disk) | 48 GB+ (pinned) |
+|---|---|---|---|
+| **6 GB** | 512² ○ 8.0 / 768² ○ 8.3. 1K △ about 17 (head groups; decode streamed from the file, 97 s) | 512² ○ 6.1 / 768² ○ 7.1. 1K △ 16.8 (auto picks G=4, 4.4 GB) | 512² ○ 3.0 / 768² ○ 7.1. 1K △ (head groups 4.8 GB, `H3_CACHE=none` 3.0 GB) |
+| **8 GB** | same; 1K ○ 15.4 (5.8 GB, decode 97 s) | same; 1K ○ 14.7 (5.8 GB) | same; 1K ○ 15.1 (6.4 GB) |
+| **12-16 GB** | same | same; with 8 GB+ of free VRAM the VAE is not streamed and the decode is faster (768²: 31 → about 11 s) | same |
+| **24 GB+** | same | the earlier tables (`H3_LOWVRAM=1` family) also apply | same |
+
+- VRAM decides what fits: 512² (2.9 GB) and 768² (4.6 GB) fit 6 GB; 1K stays MD5-identical on 8 GB (pinned 6.4 GB /
+  file 5.8 GB) and needs head groups (auto uses them only when required) or `H3_CACHE=none` on 6 GB.
+- Host RAM decides the speed: 48 GB+ pins the weights and is fastest, 32 GB runs 768² and 1K at the same speed and 512²
+  at 2×, 16 GB runs 512² at 2.7× and 768² at 1.1×, and 1K runs as well (the VAE and the TE are streamed from files too).
+- File mode prefetches one unit less on the GPU, so the VRAM peak drops too (512² 2.49 / 768² 3.71 / 1K 5.76 GB).
+  Whether the streamed VAE decoder is pinned in file mode is `H3_GROUP_STREAM_VAE_PIN` (auto = RAM 24 GB+; without it
+  the 768² decode goes 31 → 53 s).
 
 `H3_LOWVRAM=1` (48GB tier) loads the full transformer (34GB) onto the GPU every request,
 so it doesn't even fit alone on a 24-32GB-tier card. `H3_LOWVRAM=group` ports the

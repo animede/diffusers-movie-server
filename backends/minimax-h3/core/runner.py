@@ -732,6 +732,9 @@ H3_TE_PROJ_MODEL = os.environ.get("H3_TE_PROJ_MODEL", "Qwen/Qwen3-VL-4B-Instruct
 # 37.1 + 6.6 = 43.7GB で余裕 6.1GB。上記の実測(劣化ほぼ無し)から、H3_TE_PROJ 利用時は
 # 既定で量子化する方が安全側に倒れていると判断した。
 H3_TE_PROJ_QUANT = os.environ.get("H3_TE_PROJ_QUANT", "bnb-4bit").strip()
+# 投影 TE(bnb-4bit)を量子化済みのまま保存して次回から読む(2026-11-15)。毎回 bf16 からの量子化(17〜30 秒)が
+# 3〜5 秒になり、H3_GROUP_STREAM_HOST=file では LM 層をこのファイルから直接流す(ピン留め 1.9GiB が不要になる)。
+H3_TE_PROJ_PREQUANT = os.environ.get("H3_TE_PROJ_PREQUANT", "1").strip() == "1"
 if H3_TE_PROJ_QUANT not in ("none", "bnb-4bit", "bnb-8bit"):
     raise RuntimeError(
         f"H3_TE_PROJ_QUANT must be one of none/bnb-4bit/bnb-8bit, got {H3_TE_PROJ_QUANT!r}"
@@ -1353,7 +1356,8 @@ H3_TE_DIET = os.environ.get("H3_TE_DIET", "0").strip() == "1"
 # denoise / decode の間は LM 層は使われない -> その間の GPU 常駐を ~13GiB 減らす。
 # 層単位の移動 (モジュール丸ごとのスワップではない)・値は不変なので出力はビット一致。
 # 適用は `_apply_te_diet` の直後 (同じ2箇所)。TE が計算用 GPU に載る bnb-4bit 構成専用
-# (H3_TE_DEVICE 外部常駐・H3_TE_QUANT=none・H3_TE_PROJ では無視)。ホスト RAM は pinned
+# (H3_TE_DEVICE 外部常駐・H3_TE_QUANT=none では無視)。2026-11-15 から H3_TE_PROJ(投影 4B TE、
+# bnb-4bit)にも適用する(`_load_text_encoder_proj`、LM 層 ~2.7GiB を流す)。ホスト RAM は pinned
 # 確保分 (~14GiB) + 余裕を MemAvailable で確認し、足りなければ RuntimeError。
 # `H3_TE_STREAM_WINDOW` (既定 2 = LTX-2.5 と同じ): 先読みする層数。既定 (0) は挙動不変。
 H3_TE_STREAM = os.environ.get("H3_TE_STREAM", "0").strip() == "1"
@@ -1564,6 +1568,84 @@ H3_GROUP_OFFLOAD_USE_STREAM = os.environ.get("H3_GROUP_OFFLOAD_USE_STREAM", "1")
 # since `low_cpu_mem_usage=True` + `use_stream=True` together are exactly the broken
 # combination) or the pin_memory() crash returns.
 H3_GROUP_OFFLOAD_LOW_CPU_MEM = os.environ.get("H3_GROUP_OFFLOAD_LOW_CPU_MEM", "0").strip() == "1"
+
+# "group" モードのブロック転送の実装 (2026-11-15)。
+#   own       (既定) core/blockstream.py の窓付き先読み。TE の `core/testream.py` と同じ設計で、
+#             ブロック以外(埋め込み・token_refiner・出力層、bf16 で約 1.7GB)は GPU 常駐、
+#             50 ブロックはピン留めしたホスト RAM から window 個先読みで流す。diffusers 版より
+#             フック固定費が小さく、CPU の先回りで GPU 側の解放が遅れることもない
+#             (flux3-klein-studio の flux3_stream.py で実証した設計)。
+#   diffusers 従来の `enable_group_offload(block_level, use_stream)`(上の knob がそのまま効く)。
+H3_GROUP_STREAM = os.environ.get("H3_GROUP_STREAM", "own").strip().lower()
+if H3_GROUP_STREAM not in ("own", "diffusers"):
+    raise ValueError(f"H3_GROUP_STREAM must be 'own' or 'diffusers', got {H3_GROUP_STREAM!r}")
+# own のとき token_refiner の 2 ブロック(bf16 1.5GiB)も流す(既定 1)。0 で GPU 常駐(従来)。
+H3_GROUP_STREAM_REFINER = os.environ.get("H3_GROUP_STREAM_REFINER", "1").strip() == "1"
+# own のとき video VAE デコーダの 36 ブロック(fp16 で 4.8GiB、VAE 5.2GiB の大半)もデコード中に流す。
+# 低 VRAM 構成ではデコードがピーク(512² で 8.3GB、768² で 9.5GB、うち VAE の重み 5.2GB)だったため。
+#   auto (既定) 最初のデコードで空き VRAM が H3_GROUP_STREAM_VAE_FREE_GB 未満なら流す(以後固定)
+#   1 / 0      常に流す / 流さない(従来どおり VAE 全体を GPU へ)
+# 流すとデコードはタイルごとに 36 ブロックを送り直すため遅くなる(512² 6 → 17 秒、768² 11 → 30 秒)。
+# H3_VAE_PINNED=1(VAE 全体のピン留め往復)とは併用せず、そちらが優先。
+H3_GROUP_STREAM_VAE = os.environ.get("H3_GROUP_STREAM_VAE", "auto").strip().lower()
+if H3_GROUP_STREAM_VAE not in ("auto", "1", "0"):
+    raise ValueError(f"H3_GROUP_STREAM_VAE must be 'auto', '1' or '0', got {H3_GROUP_STREAM_VAE!r}")
+H3_GROUP_STREAM_VAE_FREE_GB = float(os.environ.get("H3_GROUP_STREAM_VAE_FREE_GB", "8").strip() or "8")
+# own のとき、ブロックの原本をどこに置くか (2026-11-15、core/filestream.py)。
+#   pinned  ピン留めしたホスト RAM に全部置く(int8 transformer で 30GiB。RAM 48GB 級向け、速い)
+#   file    量子化済みキャッシュ(safetensors)から単位ごとに直接読み、ピン留めした受け皿 2 単位分(約 0.5GiB)経由で
+#           GPU へ流す。必須 RAM はその受け皿だけで、残りは OS のページキャッシュに乗る分だけ速くなる(RAM 32GB /
+#           16GB の PC 向け、ディスクの連続読み出し速度に依存)。キャッシュに収まらない末尾の単位は読むたびに捨てて
+#           巡回アクセスで全部が押し出されるのを防ぐ。bf16 原本から量子化した(キャッシュが無い)ときは pinned に落ちる。
+#   auto    搭載 RAM が H3_GROUP_STREAM_FILE_BELOW_GB(既定 48)GB 未満なら file、以上なら pinned
+H3_GROUP_STREAM_HOST = os.environ.get("H3_GROUP_STREAM_HOST", "auto").strip().lower()
+if H3_GROUP_STREAM_HOST not in ("auto", "pinned", "file"):
+    raise ValueError(f"H3_GROUP_STREAM_HOST must be 'auto', 'pinned' or 'file', got {H3_GROUP_STREAM_HOST!r}")
+H3_GROUP_STREAM_FILE_BELOW_GB = float(os.environ.get("H3_GROUP_STREAM_FILE_BELOW_GB", "48").strip() or "48")
+# file のとき、読むたびにページキャッシュから捨てる末尾の単位数。auto = 使える RAM からはみ出す分(core/filestream.py)
+H3_GROUP_STREAM_DROP_UNITS = os.environ.get("H3_GROUP_STREAM_DROP_UNITS", "auto").strip().lower()
+# file のとき、ピン留めした受け皿の本数(= 読みの先行数 + 1)。2 だと 512² で読みと H2D が計算に隠れきらない
+# (3.0 → 4.7 秒/step、実測)。3 で 2 単位先まで読む。1 本は最大の単位(0.24GiB)分。
+H3_GROUP_STREAM_RING = int(os.environ.get("H3_GROUP_STREAM_RING", "3").strip() or "3")
+# file のとき、流す VAE デコーダの原本(fp16 の写し 4.5GiB)をピン留めするか。ピン留めすると写しが二重になる代わりに
+# H2D が非同期で速い(768² のデコード 31 秒、しないと 53 秒)。auto = 搭載 RAM 24GB 以上ならピン留め、未満ならしない。
+H3_GROUP_STREAM_VAE_PIN = os.environ.get("H3_GROUP_STREAM_VAE_PIN", "auto").strip().lower()
+if H3_GROUP_STREAM_VAE_PIN not in ("auto", "0", "1"):
+    raise ValueError(f"H3_GROUP_STREAM_VAE_PIN must be 'auto', '0' or '1', got {H3_GROUP_STREAM_VAE_PIN!r}")
+
+# feed-forward のトークン分割 (2026-11-15)。H3 のブロックで一番大きい一時メモリは SwiGLU の射影
+# (トークンごとに 2 x ffn_dim 14336 の bf16 = 57KB、768²x5 秒の 7.1 万トークンで 4.1GB、さらに積 2GB)。
+# トークンを `H3_FF_CHUNK` 個ずつに分けて feed-forward を通すと一時メモリがチャンク分になる。
+# トークンごとの演算なので結果は同じ(bf16 の丸めも同じ)。auto = group モードで 8192、他は 0(無効)。
+_H3_FF_CHUNK_RAW = os.environ.get("H3_FF_CHUNK", "auto").strip().lower()
+H3_FF_CHUNK = (8192 if H3_LOWVRAM_GROUP else 0) if _H3_FF_CHUNK_RAW == "auto" else int(_H3_FF_CHUNK_RAW)
+# attention のクエリ分割 (2026-11-15、core/attnchunk.py)。K・V は丸ごと、Q と出力をトークン `H3_ATTN_Q_CHUNK` 個ずつ。
+# 結果は同じ(MD5 一致)。効くのは 1K 以上だけ(1024²×5 秒でデノイズのピーク 9.34 → 8.53GB、768² では差なし)で
+# 2〜4% 遅くなるので既定は 0(無効)。1K を小さいカードで回すときに 8192 を指定する。128 の倍数(sage のブロック境界)。
+_H3_ATTN_Q_CHUNK_RAW = os.environ.get("H3_ATTN_Q_CHUNK", "0").strip().lower()
+H3_ATTN_Q_CHUNK = 0 if _H3_ATTN_Q_CHUNK_RAW in ("", "0", "auto") else int(_H3_ATTN_Q_CHUNK_RAW)
+if H3_ATTN_Q_CHUNK % 128:
+    raise ValueError(f"H3_ATTN_Q_CHUNK must be a multiple of 128, got {H3_ATTN_Q_CHUNK}")
+# メモリ節約版のブロック forward (2026-11-15、core/leanblock.py)。norm/変調/attention/FF/ゲート/残差加算を
+# トークン `H3_LEAN_BLOCK` 個ずつ通し、全トークン分の中間(1024² で各 1.35GB × 4 本)を作らない。結果は同じ。
+# H3_FF_CHUNK / H3_ATTN_Q_CHUNK を包含する(有効なら両方は不要)。auto = group モードで 8192、他は 0。128 の倍数。
+_H3_LEAN_BLOCK_RAW = os.environ.get("H3_LEAN_BLOCK", "auto").strip().lower()
+H3_LEAN_BLOCK = (8192 if H3_LOWVRAM_GROUP else 0) if _H3_LEAN_BLOCK_RAW == "auto" else int(_H3_LEAN_BLOCK_RAW)
+if H3_LEAN_BLOCK % 128:
+    raise ValueError(f"H3_LEAN_BLOCK must be a multiple of 128, got {H3_LEAN_BLOCK}")
+# attention のヘッド分割数 (2026-11-15、core/leanblock.py)。K・V・Q をヘッド G 分割で順に作り、同時に持つ大きな
+# バッファを K・V の 2 本から attn_out + K/G + V/G にする(カーネル内部の K・V の写しも 1/G)。計算は同じだが、
+# カーネル選択が変わるので bf16 の最下位ビットは一致しないことがある(別サンプル相当の動画になる。品質は同等)。
+# 正規化と変調を G 回やり直すぶん遅い(G=4 +13%、G=8 +35%、G=28 +70〜140%)。auto = 空き VRAM に G=1 が
+# 収まらないときだけ、収まる最小の G(4 → 7 → 8 → 14 → 28)をブロック 0 で選ぶ。H3_LEAN_BLOCK が有効なときだけ意味を持つ。
+_H3_ATTN_HEAD_GROUPS_RAW = os.environ.get("H3_ATTN_HEAD_GROUPS", "auto").strip().lower()
+H3_ATTN_HEAD_GROUPS = 0 if _H3_ATTN_HEAD_GROUPS_RAW in ("", "auto") else int(_H3_ATTN_HEAD_GROUPS_RAW)
+if H3_ATTN_HEAD_GROUPS < 0:
+    raise ValueError(f"H3_ATTN_HEAD_GROUPS must be 'auto' or a positive integer, got {H3_ATTN_HEAD_GROUPS}")
+# own ストリーマの単位: block(1 ブロック 0.65GiB、常駐 2 つ)/ half(adaln_proj・attn・ff の 3 単位、常駐は小さい 2 つ)。
+H3_GROUP_STREAM_UNITS = os.environ.get("H3_GROUP_STREAM_UNITS", "half").strip().lower()
+if H3_GROUP_STREAM_UNITS not in ("block", "half"):
+    raise ValueError(f"H3_GROUP_STREAM_UNITS must be 'block' or 'half', got {H3_GROUP_STREAM_UNITS!r}")
 if H3_GROUP_OFFLOAD_LOW_CPU_MEM and "H3_GROUP_OFFLOAD_USE_STREAM" not in os.environ:
     H3_GROUP_OFFLOAD_USE_STREAM = False
 
@@ -4054,6 +4136,23 @@ def ram_gb() -> dict:
     }
 
 
+
+_ram_gb_base = ram_gb
+
+
+def ram_gb() -> dict:
+    """`ram_gb` にこのプロセスの匿名メモリ(RssAnon、ページキャッシュを含まない)を足す。RAM の少ない PC を
+    cgroup で模擬したときに、どの段階で何 GB 使っているかを切り分けるため(2026-11-15)。"""
+    d = _ram_gb_base()
+    try:
+        for line in open("/proc/self/status"):
+            if line.startswith("RssAnon:"):
+                d["proc_anon_gb"] = round(int(line.split()[1]) / 2**20, 2)
+                break
+    except OSError:
+        pass
+    return d
+
 def _adaln_precompute_status(self: "MiniMaxH3Runner") -> dict:
     """`status()` helper: whether each currently-resident transformer instance actually
     has its AdaLN precompute table built yet (see H3_ADALN_PRECOMP's own module comment
@@ -4431,9 +4530,27 @@ class MiniMaxH3Runner:
             # for this VAE (see H3_VIDEO_VAE_FP16's module comment) -- has to be a
             # manual cast after the fp32 load. audio_vae is deliberately excluded.
             t_cast = time.time()
-            self._pipe.vae = self._pipe.vae.to(torch.float16)
-            logger.info("video vae cast to float16 in %.2fs (H3_VIDEO_VAE_FP16=1)",
-                        time.time() - t_cast)
+            if self._vae_file_mode():
+                # file モード: デコーダブロックは fp16 のキャッシュから流すので、写しを RAM に持たない
+                from core import vaecache
+
+                self._vae_cache_file = vaecache.ensure_cache(self._pipe.vae, H3_TRANSFORMER_PREQUANT_DIR / "vae_decoder_fp16")
+                freed = vaecache.detach_blocks(self._pipe.vae)
+                vaecache.cast_except_blocks(self._pipe.vae, torch.float16)
+                logger.info("video vae cast to float16 except the decoder blocks (%.2f GiB fp32 left in the files, "
+                            "streamed from %s) in %.2fs", freed, self._vae_cache_file, time.time() - t_cast)
+                _orig_vae_decode = self._pipe.vae.decode
+
+                def _decode_with_file_streamer(z, *args, _orig=_orig_vae_decode, **kwargs):
+                    # デコードの出力サイズ(潜在の形)が分かるここで、ピン留めかファイル流しかを決める
+                    self._vae_ensure_file_streamer(z)
+                    return _orig(z, *args, **kwargs)
+
+                self._pipe.vae.decode = _decode_with_file_streamer
+            else:
+                self._pipe.vae = self._pipe.vae.to(torch.float16)
+                logger.info("video vae cast to float16 in %.2fs (H3_VIDEO_VAE_FP16=1)",
+                            time.time() - t_cast)
             # デコードは上流ステップ自身が fp16 autocast を張る (decoders.py) が、
             # **エンコード**側 (encoders.py の encode_vae_condition -- ref2va の参照と
             # fl2va のキーフレーム条件付けが使う) は autocast なしで、内部で明示的に
@@ -4623,6 +4740,90 @@ class MiniMaxH3Runner:
         if not to_cpu:
             torch.cuda.synchronize()
 
+    def _vae_file_mode(self) -> bool:
+        """VAE デコーダブロックを fp16 キャッシュのファイルから流す(H3_GROUP_STREAM_HOST=file のとき。常に流す)。"""
+        return bool(H3_LOWVRAM_GROUP and H3_GROUP_STREAM == "own" and not H3_VAE_PINNED and TE_QUANT == "bnb-4bit"
+                    and H3_VIDEO_VAE_FP16 and self._group_stream_host_hint() == "file")
+
+    def _vae_stream_enabled(self) -> bool:
+        if not (H3_LOWVRAM_GROUP and H3_GROUP_STREAM == "own" and not H3_VAE_PINNED and TE_QUANT == "bnb-4bit"):
+            return False
+        if self._vae_file_mode():
+            return True
+        if H3_GROUP_STREAM_VAE != "auto":
+            return H3_GROUP_STREAM_VAE == "1"
+        decided = getattr(self, "_vae_stream_decided", None)
+        if decided is None:
+            free_gb = torch.cuda.mem_get_info(DEVICE)[0] / 1e9
+            decided = free_gb < H3_GROUP_STREAM_VAE_FREE_GB
+            self._vae_stream_decided = decided
+            logger.info("vae decoder streaming: %s (free VRAM %.1fGB %s %.0fGB, H3_GROUP_STREAM_VAE=auto)",
+                        "on" if decided else "off", free_gb, "<" if decided else ">=", H3_GROUP_STREAM_VAE_FREE_GB)
+        return decided
+
+    def _vae_ensure_file_streamer(self, z) -> None:
+        """file モードのデコード入口(vae.decode)で、デコーダブロックの置き場所を決める。空き RAM が
+        「重み 4.5GiB + 余裕 2GiB + 出力フレーム(fp32 と変換用の写しで 2 倍)」以上ならキャッシュからピン留めに読んで
+        デコードの間だけ持つ(pinned と同じ速さ)。足りなければタイルごとにファイルから流す(遅いが RAM を使わない)。"""
+        if getattr(self, "_vae_streamer", None) is not None or not self._vae_file_mode():
+            return
+        from core import blockstream as _bs
+        from core import filestream
+
+        vae = self._pipe.vae
+        try:
+            frames = int(z.shape[-3]) * 4
+            out_gib = frames * int(z.shape[-2]) * 16 * int(z.shape[-1]) * 16 * 3 * 4 / 2**30
+        except Exception:  # noqa: BLE001
+            out_gib = 2.0
+        need = 4.5 + 2.0 + 2 * out_gib
+        budget = filestream.host_cache_budget_gb()
+        if budget >= need:
+            self._vae_streamer = _bs.BlockStreamer(
+                vae.decoder.transformer_blocks, DEVICE, window=2, root=vae.decoder, pin=True,
+                source_files=[self._vae_cache_file], names_root=vae)
+            self._vae_streamer_transient = True
+            logger.info("vae.decoder: pinned from the fp16 cache for this decode (budget %.1f GiB >= %.1f needed, "
+                        "output ~%.1f GiB) %s", budget, need, out_gib, self._vae_streamer.describe())
+        else:
+            self._vae_streamer = filestream.FileBlockStreamer(
+                vae.decoder.transformer_blocks, DEVICE, root=vae.decoder, names_root=vae,
+                files=[self._vae_cache_file], label="vae.decoder", drop_units=H3_GROUP_STREAM_DROP_UNITS,
+                ring=H3_GROUP_STREAM_RING)
+            self._vae_streamer_transient = False
+            logger.info("vae.decoder: file streamer for this decode (budget %.1f GiB < %.1f needed, output ~%.1f GiB) %s",
+                        budget, need, out_gib, self._vae_streamer.describe())
+
+    def _vae_stream_move(self, device) -> None:
+        """video VAE のデコーダブロックは常にホスト(ピン留め)に置き、残り(encoder、デコーダの入出力層、
+        audio_vae)だけを device へ動かす。ストリーマは初回に作ってプロセス中は持ち続ける。"""
+        from core import blockstream
+
+        vae = self._pipe.vae
+        if self._vae_file_mode() and device == CPU and getattr(self, "_vae_streamer_transient", False):
+            # デコードの間だけピン留めしていた分を返す(次のデコードで空き RAM を見て決め直す)
+            logger.info("vae.decoder: transient pinned copy released (%.2f GiB)", self._vae_streamer.release())
+            self._vae_streamer = None
+            self._vae_streamer_transient = False
+        if getattr(self, "_vae_streamer", None) is None and not self._vae_file_mode():
+            # H3_GROUP_STREAM_HOST=file(RAM の少ない PC)では fp16 の写しに加えてピン留めの写しを持たない(pin=False)。
+            # ただし RAM 24GB 以上ならピン留めした方がデコードが速い(H3_GROUP_STREAM_VAE_PIN)
+            if getattr(self, "_group_stream_host_resolved", None) != "file":
+                pin = True
+            elif H3_GROUP_STREAM_VAE_PIN == "auto":
+                pin = ram_gb()["total_gb"] >= 24
+            else:
+                pin = H3_GROUP_STREAM_VAE_PIN == "1"
+            self._vae_streamer = blockstream.BlockStreamer(
+                vae.decoder.transformer_blocks, DEVICE, window=2, root=vae.decoder, pin=pin)
+            logger.info("vae.decoder: own block streamer %s", self._vae_streamer.describe())
+        for name, child in vae.named_children():
+            if name == "decoder":
+                blockstream.move_non_block_children(child, "transformer_blocks", device)
+            else:
+                child.to(device)
+        self._pipe.audio_vae.to(device)
+
     def _vae_to_gpu(self, part: str = "all"):
         """bnb-4bit mode only: move the (small, fp32, ~11GB) VAEs onto GPU for their active
         phase. A single short one-way trip, not a standing swap -- see module docstring.
@@ -4641,7 +4842,11 @@ class MiniMaxH3Runner:
             return
         t0 = time.time()
         moved = False
-        if H3_VAE_PINNED and self._vae_pin_masters() is not None:
+        if self._vae_stream_enabled():
+            self._vae_stream_move(DEVICE)
+            self._vae_gpu_parts = {"encode", "decode"}
+            moved = True
+        if not moved and H3_VAE_PINNED and self._vae_pin_masters() is not None:
             tensors = self._vae_pin_tensor_list(need if split else None)
             if tensors is None and split:
                 tensors = self._vae_pin_tensor_list(None)  # 未知の子モジュール: 全体移動へ退避
@@ -4669,7 +4874,9 @@ class MiniMaxH3Runner:
         if TE_QUANT != "bnb-4bit" or not self._vae_on_gpu:
             return
         t0 = time.time()
-        if H3_VAE_PINNED and self._vae_pin_masters() is not None:
+        if self._vae_stream_enabled():
+            self._vae_stream_move(CPU)
+        elif H3_VAE_PINNED and self._vae_pin_masters() is not None:
             self._vae_pinned_move(self._vae_pin_tensor_list(None), CPU)
         else:
             self._pipe.vae.to(CPU)
@@ -4948,6 +5155,22 @@ class MiniMaxH3Runner:
             time.time() - t0, H3_HYPERFLOW_LORA, gpu_mem_gb(),
         )
 
+    def _group_stream_host_hint(self) -> str:
+        """H3_GROUP_STREAM_HOST の auto を搭載 RAM で解決する(キャッシュの有無は見ない)。"""
+        if H3_GROUP_STREAM_HOST != "auto":
+            return H3_GROUP_STREAM_HOST
+        return "file" if ram_gb()["total_gb"] < H3_GROUP_STREAM_FILE_BELOW_GB else "pinned"
+
+    def _resolve_group_stream_host(self, name: str) -> tuple[str, list]:
+        """ブロックの原本の置き場所と、file のときの読み元(量子化済みキャッシュのシャード)。"""
+        files = (getattr(self, "_prequant_files", None) or {}).get(name) or []
+        host = self._group_stream_host_hint()
+        if host == "file" and not files:
+            logger.warning("%s: H3_GROUP_STREAM_HOST=file needs the prequantized int8 cache (the weights were quantized "
+                           "from bf16 at load, so there is no file to stream from); falling back to pinned host RAM", name)
+            host = "pinned"
+        return host, files
+
     def _check_group_offload_ram_guard(self):
         """Refuse to start a group-offload transformer load if host RAM is already tight.
 
@@ -4968,6 +5191,113 @@ class MiniMaxH3Runner:
                 "up host RAM, or lower H3_GROUP_OFFLOAD_MIN_RAM_GB if you have verified "
                 "this box's actual headroom."
             )
+
+    def _attach_group_offload(self, module, name: str) -> None:
+        """group モードのブロック転送を `module`(CPU 常駐 int8)に取り付ける。`H3_GROUP_STREAM` で
+        core/blockstream.py(own)か diffusers の enable_group_offload かを選ぶ。"""
+        if H3_GROUP_STREAM == "own":
+            from core import blockstream
+
+            streamers = getattr(self, "_block_streamers", None)
+            if streamers is None:
+                self._block_streamers = streamers = {}
+            host, files = self._resolve_group_stream_host(name)
+            skip = {"transformer_blocks"}
+            if H3_GROUP_STREAM_REFINER and hasattr(module, "token_refiner"):
+                skip.add("token_refiner")
+            moved_gib = blockstream.move_non_block_children(module, skip, DEVICE)
+            if H3_GROUP_STREAM_UNITS == "half":
+                # ブロックを adaln_proj → attn → ff の 3 単位に分けて流す(forward の順)。norm1/norm2 は GPU へ
+                units = []
+                for block in module.transformer_blocks:
+                    units += [block.adaln_proj, block.attn, block.ff]
+                    moved_gib += blockstream.move_non_block_children(block, {"adaln_proj", "attn", "ff"}, DEVICE)
+            else:
+                units = list(module.transformer_blocks)
+            if host == "file":
+                from core import filestream
+
+                # この後ホスト RAM に乗る見込みのもの(ページキャッシュの予算から先に引く): TE の層のピン留め、
+                # 流す VAE デコーダのピン留め、token_refiner(file で流すがキャッシュに残したい)、その他
+                reserve = 1.5 + (1.9 if H3_TE_STREAM else 0.0) + (4.5 if H3_GROUP_STREAM_VAE != "0" else 0.0)
+                reserve += 1.5 if "token_refiner" in skip else 0.0
+                streamers[name] = filestream.FileBlockStreamer(
+                    units, DEVICE, root=module, names_root=module, files=files, label=name,
+                    drop_units=H3_GROUP_STREAM_DROP_UNITS, reserve_gb=reserve, ring=H3_GROUP_STREAM_RING)
+            else:
+                streamers[name] = blockstream.BlockStreamer(units, DEVICE, window=H3_GROUP_OFFLOAD_BLOCKS + 1, root=module)
+            if "token_refiner" in skip:
+                # token_refiner の 2 ブロック(bf16 1.5GiB、int8 化対象外)も流す。final_norm だけ GPU に置く。
+                refiner = module.token_refiner
+                blockstream.move_non_block_children(refiner, "refiner_blocks", DEVICE)
+                if host == "file":
+                    # 受け皿を小さくするため attn / ff の 2 単位に分けて流す(norm1 / norm2 は GPU へ)
+                    refiner_units = []
+                    for block in refiner.refiner_blocks:
+                        refiner_units += [block.attn, block.ff]
+                        blockstream.move_non_block_children(block, {"attn", "ff"}, DEVICE)
+                    streamers[name + ":refiner"] = filestream.FileBlockStreamer(
+                        refiner_units, DEVICE, root=refiner, names_root=module, files=files,
+                        label=name + ":refiner", drop_units=0, ring=2)
+                else:
+                    streamers[name + ":refiner"] = blockstream.BlockStreamer(
+                        refiner.refiner_blocks, DEVICE, window=1, root=refiner)
+            self._group_stream_host_resolved = host
+            logger.info("%s: own block streamer (host=%s) %s%s, non-block modules resident on GPU %.2f GiB",
+                        name, host, streamers[name].describe(),
+                        f", token_refiner {streamers[name + ':refiner'].describe()}" if "token_refiner" in skip else "",
+                        moved_gib)
+            return
+        module.enable_group_offload(
+            onload_device=DEVICE,
+            offload_device=CPU,
+            offload_type="block_level",
+            num_blocks_per_group=H3_GROUP_OFFLOAD_BLOCKS,
+            non_blocking=True,
+            use_stream=H3_GROUP_OFFLOAD_USE_STREAM,
+            record_stream=False,
+            low_cpu_mem_usage=H3_GROUP_OFFLOAD_LOW_CPU_MEM,
+        )
+
+    def _lean_last(self):
+        """直近の forward で lean block が選んだ設定(トークン数・ヘッド分割数・in-place 開始ブロック)。"""
+        pipes = ((getattr(self, "_pipe_ref", None), "transformer_ref"), (getattr(self, "_pipe", None), "transformer"))
+        if getattr(self, "_active_variant", None) != "ref2va":
+            pipes = pipes[::-1]
+        for pipe, attr in pipes:
+            state = getattr(getattr(pipe, attr, None), "_h3_lean_state", None)
+            if state is not None and state.last:
+                return dict(state.last)
+        return None
+
+    @staticmethod
+    def _apply_ff_chunk(module, chunk: int) -> int:
+        """各ブロックの feed-forward をトークン `chunk` 個ずつに分けて実行する(結果は同じ)。適用数を返す。"""
+        if chunk <= 0:
+            return 0
+        count = 0
+        for block in list(module.transformer_blocks) + list(getattr(getattr(module, "token_refiner", None), "refiner_blocks", [])):
+            ff = block.ff
+            if getattr(ff, "_h3_ff_chunked", False):
+                continue
+            original = ff.forward
+
+            def chunked(hidden_states, *args, _orig=original, _chunk=chunk, **kwargs):
+                if hidden_states.shape[1] <= _chunk:
+                    return _orig(hidden_states, *args, **kwargs)
+                return torch.cat([_orig(part, *args, **kwargs) for part in hidden_states.split(_chunk, dim=1)], dim=1)
+
+            ff.forward = chunked
+            ff._h3_ff_chunked = True
+            count += 1
+        return count
+
+    def _release_block_streamer(self, name: str) -> None:
+        streamers = getattr(self, "_block_streamers", None) or {}
+        for key in (name, name + ":refiner"):
+            streamer = streamers.pop(key, None)
+            if streamer is not None:
+                logger.info("%s: block streamer released (%.1f GiB unpinned)", key, streamer.release())
 
     def _ensure_transformer_group(self, progress: ProgressState | None = None):
         """`H3_LOWVRAM_GROUP` ("group" mode) transformer loading: CPU-resident int8 +
@@ -5038,7 +5368,11 @@ class MiniMaxH3Runner:
         if self._transformer_loaded:
             self._active_variant = "t2va"
             return
-        self._check_group_offload_ram_guard()
+        # 量子化済みキャッシュは mmap で読む(RAM に展開しない)ので、file で流すなら大きな RAM は要らない。
+        # ピン留めする(pinned)か、キャッシュが無くて bf16 から量子化するときだけ従来のガードを通す。
+        prequant_ready = H3_TRANSFORMER_PREQUANT and (self._transformer_prequant_dir(is_ref=False) / "config.json").exists()
+        if not (prequant_ready and self._group_stream_host_hint() == "file"):
+            self._check_group_offload_ram_guard()
         if progress:
             progress.update(phase="loading_transformer", message="transformer (group offload) をロード中...")
         t0 = time.time()
@@ -5049,13 +5383,18 @@ class MiniMaxH3Runner:
             Int8WeightOnlyConfig(version=2, set_inductor_config=False),
             modules_to_not_convert=H3_INT8_MODULES_TO_NOT_CONVERT,
         )
-        self._pipe.load_components(
-            names=["transformer"],
-            dtype=torch.bfloat16,
-            quantization_config={"transformer": quant_config},
-            device_map={"transformer": "cpu"},
-            **_TRANSFORMER_HUB_KWARGS,
-        )
+        # 2026-11-15: 量子化済みキャッシュ (models/prequant/transformer_int8) があればそれを CPU に読む
+        # (bf16 原本が HF キャッシュに無くても動く。他モードと同じ fail-open)。無ければ従来の
+        # bf16 ロード + その場量子化。
+        if not (H3_TRANSFORMER_PREQUANT and self._load_transformer_from_prequant(
+                self._transformer_prequant_dir(is_ref=False), is_ref=False, progress=progress, device=CPU)):
+            self._pipe.load_components(
+                names=["transformer"],
+                dtype=torch.bfloat16,
+                quantization_config={"transformer": quant_config},
+                device_map={"transformer": "cpu"},
+                **_TRANSFORMER_HUB_KWARGS,
+            )
         if getattr(self._pipe, "transformer", None) is None:
             raise RuntimeError(
                 "transformer load failed (see the diffusers 'Failed to create component "
@@ -5067,16 +5406,23 @@ class MiniMaxH3Runner:
             "transformer loaded to CPU (int8, group-offload target) in %.1fs. ram=%s",
             t1 - t0, ram_gb(),
         )
-        self._pipe.transformer.enable_group_offload(
-            onload_device=DEVICE,
-            offload_device=CPU,
-            offload_type="block_level",
-            num_blocks_per_group=H3_GROUP_OFFLOAD_BLOCKS,
-            non_blocking=True,
-            use_stream=H3_GROUP_OFFLOAD_USE_STREAM,
-            record_stream=False,
-            low_cpu_mem_usage=H3_GROUP_OFFLOAD_LOW_CPU_MEM,
-        )
+        self._attach_group_offload(self._pipe.transformer, "transformer")
+        if H3_FF_CHUNK:
+            logger.info("transformer: feed-forward chunked by %d tokens on %d blocks (H3_FF_CHUNK)",
+                        H3_FF_CHUNK, self._apply_ff_chunk(self._pipe.transformer, H3_FF_CHUNK))
+        if H3_ATTN_Q_CHUNK:
+            from core import attnchunk
+
+            logger.info("transformer: attention query-chunked by %d tokens on %d blocks (H3_ATTN_Q_CHUNK)",
+                        H3_ATTN_Q_CHUNK, attnchunk.enable(self._pipe.transformer, H3_ATTN_Q_CHUNK))
+        if H3_LEAN_BLOCK:
+            from core import leanblock
+
+            logger.info("transformer: lean block forward, %d tokens per chunk, head groups %s, on %d blocks "
+                        "(H3_LEAN_BLOCK, H3_ATTN_HEAD_GROUPS)", H3_LEAN_BLOCK, _H3_ATTN_HEAD_GROUPS_RAW,
+                        leanblock.enable(self._pipe.transformer, H3_LEAN_BLOCK, H3_ATTN_HEAD_GROUPS))
+            logger.info("transformer: patch embeddings rounded to %s at %s (no fp32 copies held during the blocks)",
+                        self._pipe.transformer.context_embedder.weight.dtype, leanblock.shrink_prologue(self._pipe.transformer))
         self._transformer_loaded = True
         self._active_variant = "t2va"
         if H3_ATTN_BACKEND:
@@ -5204,6 +5550,7 @@ class MiniMaxH3Runner:
         # mode's transformer/transformer_ref pair, group mode never keeps both resident
         # at once (not verified to fit two ~34GB CPU-resident copies alongside TE-nf4
         # reload headroom within this mode's RAM guard -- see H3_GROUP_OFFLOAD_MIN_RAM_GB).
+        self._release_block_streamer("transformer")
         del self._pipe.transformer
         self._pipe.transformer = None
         self._transformer_loaded = False
@@ -5449,13 +5796,15 @@ class MiniMaxH3Runner:
             Int8WeightOnlyConfig(version=2, set_inductor_config=False),
             modules_to_not_convert=H3_INT8_MODULES_TO_NOT_CONVERT,
         )
-        self._pipe_ref.load_components(
-            names=["transformer_ref"],
-            dtype=torch.bfloat16,
-            quantization_config={"transformer_ref": quant_config},
-            device_map={"transformer_ref": "cpu"},
-            **_TRANSFORMER_HUB_KWARGS,
-        )
+        if not (H3_TRANSFORMER_PREQUANT and self._load_transformer_from_prequant(
+                self._transformer_prequant_dir(is_ref=True), is_ref=True, progress=progress, device=CPU)):
+            self._pipe_ref.load_components(
+                names=["transformer_ref"],
+                dtype=torch.bfloat16,
+                quantization_config={"transformer_ref": quant_config},
+                device_map={"transformer_ref": "cpu"},
+                **_TRANSFORMER_HUB_KWARGS,
+            )
         if getattr(self._pipe_ref, "transformer_ref", None) is None:
             raise RuntimeError(
                 "transformer_ref load failed (see the diffusers 'Failed to create "
@@ -5467,16 +5816,23 @@ class MiniMaxH3Runner:
             "transformer_ref loaded to CPU (int8, group-offload target) in %.1fs. ram=%s",
             t1 - t0, ram_gb(),
         )
-        self._pipe_ref.transformer_ref.enable_group_offload(
-            onload_device=DEVICE,
-            offload_device=CPU,
-            offload_type="block_level",
-            num_blocks_per_group=H3_GROUP_OFFLOAD_BLOCKS,
-            non_blocking=True,
-            use_stream=H3_GROUP_OFFLOAD_USE_STREAM,
-            record_stream=False,
-            low_cpu_mem_usage=H3_GROUP_OFFLOAD_LOW_CPU_MEM,
-        )
+        self._attach_group_offload(self._pipe_ref.transformer_ref, "transformer_ref")
+        if H3_FF_CHUNK:
+            logger.info("transformer_ref: feed-forward chunked by %d tokens on %d blocks (H3_FF_CHUNK)",
+                        H3_FF_CHUNK, self._apply_ff_chunk(self._pipe_ref.transformer_ref, H3_FF_CHUNK))
+        if H3_ATTN_Q_CHUNK:
+            from core import attnchunk
+
+            logger.info("transformer_ref: attention query-chunked by %d tokens on %d blocks (H3_ATTN_Q_CHUNK)",
+                        H3_ATTN_Q_CHUNK, attnchunk.enable(self._pipe_ref.transformer_ref, H3_ATTN_Q_CHUNK))
+        if H3_LEAN_BLOCK:
+            from core import leanblock
+
+            logger.info("transformer_ref: lean block forward, %d tokens per chunk, head groups %s, on %d blocks "
+                        "(H3_LEAN_BLOCK, H3_ATTN_HEAD_GROUPS)", H3_LEAN_BLOCK, _H3_ATTN_HEAD_GROUPS_RAW,
+                        leanblock.enable(self._pipe_ref.transformer_ref, H3_LEAN_BLOCK, H3_ATTN_HEAD_GROUPS))
+            logger.info("transformer_ref: patch embeddings rounded to %s at %s (no fp32 copies held during the blocks)",
+                        self._pipe_ref.transformer_ref.context_embedder.weight.dtype, leanblock.shrink_prologue(self._pipe_ref.transformer_ref))
         self._transformer_ref_loaded = True
         self._active_variant = "ref2va"
         if H3_ATTN_BACKEND:
@@ -5510,6 +5866,7 @@ class MiniMaxH3Runner:
         # _free_text_encoder (CLAUDE.md #33: no whole-module CPU-staging trips for
         # 60GB+ modules on this box). In H3_LOWVRAM_GROUP mode this reclaims host RAM
         # (see _free_transformer's matching comment), not VRAM.
+        self._release_block_streamer("transformer_ref")
         del self._pipe_ref.transformer_ref
         self._pipe_ref.transformer_ref = None
         self._transformer_ref_loaded = False
@@ -6079,6 +6436,16 @@ class MiniMaxH3Runner:
             pipe.vae = saved_vae
             pipe.audio_vae = saved_audio_vae
 
+    def _te_proj_prequant_dir(self) -> Path:
+        """投影 TE(H3_TE_PROJ_MODEL、bnb-4bit)の量子化済みキャッシュ先。モデル名と方式をディレクトリ名に入れる。"""
+        slug = H3_TE_PROJ_MODEL.replace("/", "--")
+        return H3_TE_PREQUANT_DIR / f"te_proj_{slug}_{H3_TE_PROJ_QUANT}"
+
+    def _te_proj_prequant_meta(self) -> dict:
+        import transformers
+
+        return {"model": H3_TE_PROJ_MODEL, "quant": H3_TE_PROJ_QUANT, "transformers": transformers.__version__}
+
     def _te_prequant_dir(self) -> Path:
         """量子化済み TE のキャッシュ先。**設定ごとに別ディレクトリ**にする
         (TE_QUANT / TE_PRUNE を変えると重みの中身が別物になるため、同じ場所を使い回すと
@@ -6263,7 +6630,7 @@ class MiniMaxH3Runner:
         return meta
 
     def _load_transformer_from_prequant(
-        self, cache_dir: Path, is_ref: bool, progress: ProgressState | None = None
+        self, cache_dir: Path, is_ref: bool, progress: ProgressState | None = None, device=None
     ) -> bool:
         """量子化済みキャッシュから transformer(_ref) を読む。成功したら True。
 
@@ -6283,12 +6650,21 @@ class MiniMaxH3Runner:
             return False
         current_meta = self._transformer_prequant_metadata(pruned=False)
         if saved_meta != current_meta:
-            logger.info(
-                "transformer 量子化済みキャッシュのメタデータが現在の設定と不一致のため無効"
-                "扱いにします (通常経路で作り直します): %s\n保存済み=%s\n現在=%s",
-                cache_dir, saved_meta, current_meta,
-            )
-            return False
+            # 2026-11-15: bf16 の原本を HF キャッシュから消した箱では source_snapshot だけが None になる。
+            # 原本が無いのだから更新の検知もできず、作り直しもできない(ロードが失敗するだけ)ので、
+            # それ以外が一致していればキャッシュを有効とみなす。
+            if (current_meta.get("source_snapshot") is None
+                    and {k: v for k, v in saved_meta.items() if k != "source_snapshot"}
+                    == {k: v for k, v in current_meta.items() if k != "source_snapshot"}):
+                logger.info("transformer 量子化済みキャッシュ: bf16 原本が無いので source_snapshot の照合を省略して使います: %s",
+                            cache_dir)
+            else:
+                logger.info(
+                    "transformer 量子化済みキャッシュのメタデータが現在の設定と不一致のため無効"
+                    "扱いにします (通常経路で作り直します): %s\n保存済み=%s\n現在=%s",
+                    cache_dir, saved_meta, current_meta,
+                )
+                return False
         label = "transformer_ref" if is_ref else "transformer"
         if progress:
             progress.update(
@@ -6300,7 +6676,16 @@ class MiniMaxH3Runner:
             from diffusers import MiniMaxH3Transformer3DModel
 
             tr = MiniMaxH3Transformer3DModel.from_pretrained(str(cache_dir), torch_dtype=torch.bfloat16)
-            tr = tr.to(DEVICE)
+            # 推論専用。キャッシュから読んだ torchao Int8Tensor は requires_grad=True のままで、diffusers の
+            # group offload が使う torch.utils.swap_tensors が autograd の辺を辿ろうとして
+            # 「Int8Tensor dispatch: aten.view unimplemented」で落ちる(2026-11-15、group モードで実測)。
+            for param in tr.parameters():
+                try:
+                    param.requires_grad_(False)
+                except Exception:  # noqa: BLE001
+                    pass
+            # group モード (device=CPU) はホスト常駐のまま使う(from_pretrained は CPU に読む)
+            tr = tr.to(DEVICE if device is None else device)
         except Exception:
             logger.exception(
                 "%s 量子化済みキャッシュの読み込みに失敗、通常経路へフォールバック: %s",
@@ -6311,6 +6696,10 @@ class MiniMaxH3Runner:
             self._pipe_ref.transformer_ref = tr
         else:
             self._pipe.transformer = tr
+        files = getattr(self, "_prequant_files", None)
+        if files is None:
+            self._prequant_files = files = {}
+        files[label] = sorted(Path(cache_dir).glob("*.safetensors"))   # H3_GROUP_STREAM_HOST=file の読み元
         logger.info(
             "%s loaded from prequantized cache in %.1fs (%s). gpu=%s",
             label, time.time() - t0, cache_dir, gpu_mem_gb(),
@@ -6526,7 +6915,35 @@ class MiniMaxH3Runner:
             else:  # "bnb-8bit"
                 load_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
 
-        te = AutoModelForImageTextToText.from_pretrained(H3_TE_PROJ_MODEL, **load_kwargs)
+        te = None
+        cache_dir = self._te_proj_prequant_dir() if (H3_TE_PROJ_PREQUANT and H3_TE_PROJ_QUANT == "bnb-4bit") else None
+        self._te_proj_cache_files = []
+        if cache_dir is not None and (cache_dir / "config.json").exists() and (cache_dir / "meta.json").exists():
+            try:
+                if json.loads((cache_dir / "meta.json").read_text()) == self._te_proj_prequant_meta():
+                    kwargs = {k: v for k, v in load_kwargs.items() if k != "quantization_config"}
+                    te = AutoModelForImageTextToText.from_pretrained(str(cache_dir), **kwargs)
+                    self._te_proj_cache_files = sorted(cache_dir.glob("*.safetensors"))
+                    logger.info("text_encoder (H3_TE_PROJ) loaded from the quantized cache %s", cache_dir)
+                else:
+                    logger.info("text_encoder (H3_TE_PROJ) quantized cache does not match the current settings, rebuilding: %s",
+                                cache_dir)
+            except Exception:  # noqa: BLE001 - キャッシュは高速化であって機能ではない: 読めなければ通常経路
+                logger.exception("text_encoder (H3_TE_PROJ) quantized cache unreadable, loading from the source: %s", cache_dir)
+                te = None
+        if te is None:
+            te = AutoModelForImageTextToText.from_pretrained(H3_TE_PROJ_MODEL, **load_kwargs)
+            if cache_dir is not None:
+                try:
+                    t_save = time.time()
+                    cache_dir.mkdir(parents=True, exist_ok=True)
+                    te.save_pretrained(str(cache_dir), safe_serialization=True)
+                    (cache_dir / "meta.json").write_text(json.dumps(self._te_proj_prequant_meta(), indent=1))
+                    self._te_proj_cache_files = sorted(cache_dir.glob("*.safetensors"))
+                    logger.info("text_encoder (H3_TE_PROJ) quantized cache written to %s in %.1fs", cache_dir, time.time() - t_save)
+                except Exception:  # noqa: BLE001
+                    logger.exception("text_encoder (H3_TE_PROJ) quantized cache could not be written: %s", cache_dir)
+                    self._te_proj_cache_files = []
         # tokenizer/processor は H3 のもの (通常ロード経路と同一) -- text_encoder だけ
         # 4B に差し替える。
         self._pipe.load_components(names=["tokenizer", "processor"])
@@ -6539,6 +6956,37 @@ class MiniMaxH3Runner:
         )
         _install_patch_embed_linear(self._pipe.text_encoder)  # no-op unless H3_PATCH_EMBED_LINEAR=0
         _install_qwen3vl_submodule_timing(self._pipe.text_encoder)  # no-op unless H3_PHASE_TIMING=1
+        if H3_TE_DIET and not self._te_external:
+            # 2026-11-15: 投影 TE にも TE_DIET(lm_head 解放 + 埋め込み表を CPU ブリッジ、4B は埋め込み表 0.78GB)
+            _apply_te_diet(self._pipe.text_encoder)
+            logger.info("text_encoder (H3_TE_PROJ) after H3_TE_DIET. gpu=%s", gpu_mem_gb())
+        if H3_TE_STREAM and not self._te_external:
+            # 2026-11-15: 投影 TE(Qwen3-VL-4B)にも TE_STREAM を適用する。構造は 32B と同じ
+            # (`model.language_model.layers`、bnb Params4bit)で、LM 層 ~2.7GiB をピン留めホストに置き
+            # エンコード中だけ流す。group モードでは TE をデノイズ中も常駐させる段取りなので、
+            # これがデノイズ時のピークを ~2.7GB 下げる(16GB 級の構成で 768² 10.8 → 8GB 台)。
+            t_stream = time.time()
+            if self._group_stream_host_hint() == "file" and self._te_proj_cache_files:
+                # file モード: LM 層を量子化済みキャッシュのファイルから直接流す(ピン留めしない)
+                from core import filestream
+
+                te = self._pipe.text_encoder
+                lm = te.model.language_model
+                fs = filestream.FileBlockStreamer(
+                    lm.layers, DEVICE, root=lm, names_root=te, files=self._te_proj_cache_files,
+                    label="text_encoder", drop_units=H3_GROUP_STREAM_DROP_UNITS, ring=2)
+                te._te_stream_applied = True
+                te._te_file_streamer = fs
+                gc.collect()
+                torch.cuda.empty_cache()
+                logger.info("text_encoder (H3_TE_PROJ) after H3_TE_STREAM (file %s, %.1fs). gpu=%s ram=%s",
+                            fs.describe(), time.time() - t_stream, gpu_mem_gb(), ram_gb())
+            else:
+                pinned = _apply_te_stream(self._pipe.text_encoder)
+                logger.info(
+                    "text_encoder (H3_TE_PROJ) after H3_TE_STREAM (window=%d, pinned %.2fGiB, %.1fs). gpu=%s ram=%s",
+                    H3_TE_STREAM_WINDOW, pinned, time.time() - t_stream, gpu_mem_gb(), ram_gb(),
+                )
         self._detach_te_if_external()
 
         # 投影行列は一度だけロードしてキャッシュする (`self._pipe._te_projection`,
@@ -6733,6 +7181,10 @@ class MiniMaxH3Runner:
         # H3_TE_STREAM: LM 層の pinned host 実体 (~14GiB) は PyTorch の host キャッシュに残って
         # しまう (del + gc + empty_cache では OS へ返らない) ので、TE を落とすときに明示的に返す。
         _te_was_streamed = bool(getattr(self._pipe.text_encoder, "_te_stream_applied", False))
+        _fs = getattr(self._pipe.text_encoder, "_te_file_streamer", None)
+        if _fs is not None:
+            _fs.release()          # file モードの受け皿(ピン留め)とフックを外す
+            self._pipe.text_encoder._te_file_streamer = None
         del self._pipe.text_encoder
         self._pipe.text_encoder = None
         if self._pipe_ref is not None and getattr(self._pipe_ref, "text_encoder", None) is not None:
@@ -7189,9 +7641,24 @@ class MiniMaxH3Runner:
             # 上限が効いているかは status 経由で確認できるようにしておく (None = 無制限)。
             "vram_limit_gb": float(H3_VRAM_LIMIT_GB) if H3_VRAM_LIMIT_GB else None,
             "group_offload_blocks": H3_GROUP_OFFLOAD_BLOCKS if H3_LOWVRAM_GROUP else None,
+            "group_stream": H3_GROUP_STREAM if H3_LOWVRAM_GROUP else None,
+            "group_stream_refiner": H3_GROUP_STREAM_REFINER if H3_LOWVRAM_GROUP else None,
+            "ff_chunk": H3_FF_CHUNK,
+            "attn_q_chunk": H3_ATTN_Q_CHUNK,
+            "lean_block": H3_LEAN_BLOCK,
+            "attn_head_groups": _H3_ATTN_HEAD_GROUPS_RAW if H3_LEAN_BLOCK else None,
+            "group_stream_units": H3_GROUP_STREAM_UNITS if H3_LOWVRAM_GROUP else None,
+            "group_stream_host": (getattr(self, "_group_stream_host_resolved", None) or self._group_stream_host_hint())
+                                 if H3_LOWVRAM_GROUP and H3_GROUP_STREAM == "own" else None,
+            "group_stream_file": (self._block_streamers["transformer"].describe()
+                                  if getattr(self, "_group_stream_host_resolved", None) == "file"
+                                  and "transformer" in (getattr(self, "_block_streamers", None) or {}) else None),
+            "group_stream_vae": (H3_GROUP_STREAM_VAE if getattr(self, "_vae_stream_decided", None) is None
+                                 else ("on" if self._vae_stream_decided else "off")) if H3_LOWVRAM_GROUP else None,
             "group_offload_use_stream": H3_GROUP_OFFLOAD_USE_STREAM if H3_LOWVRAM_GROUP else None,
             "group_offload_low_cpu_mem": H3_GROUP_OFFLOAD_LOW_CPU_MEM if H3_LOWVRAM_GROUP else None,
             "attn_backend": H3_ATTN_BACKEND or "default",
+            "lean_block_last": self._lean_last() if H3_LEAN_BLOCK else None,
             "cache_mode": H3_CACHE if not H3_TURBO_LORA else "none (force-disabled by H3_TURBO_LORA)",
             "cache_threshold": H3_CACHE_THRESHOLD if (H3_CACHE == "fbc" and not H3_TURBO_LORA) else None,
             "turbo_lora": H3_TURBO_LORA,
@@ -8617,6 +9084,7 @@ class MiniMaxH3Runner:
             # "cache"/"turbo"/"attn_backend" below are the new, directly-machine-
             # readable equivalents.
             "attn_backend": instant["attn"],
+            "lean_block_last": self._lean_last(),
             "cache_mode": instant["cache"] if not instant["turbo"] else "none (force-disabled by turbo=1)",
             "cache": instant["effective_cache"],
             "cache_threshold": instant["cache_threshold"] if instant["effective_cache"] == "fbc" else None,
@@ -8981,6 +9449,7 @@ class MiniMaxH3Runner:
             "transformer_quant": H3_TRANSFORMER_QUANT,
             "lowvram": H3_LOWVRAM_RAW,
             "attn_backend": instant["attn"],
+            "lean_block_last": self._lean_last(),
             "cache": instant["effective_cache"],
             "cache_threshold": instant["cache_threshold"] if instant["effective_cache"] == "fbc" else None,
             "turbo": instant["turbo"],
@@ -9923,6 +10392,7 @@ class MiniMaxH3Runner:
             "transformer_quant": H3_TRANSFORMER_QUANT,
             "lowvram": H3_LOWVRAM_RAW,
             "attn_backend": instant["attn"],
+            "lean_block_last": self._lean_last(),
             "cache_mode": instant["cache"] if not instant["turbo"] else "none (force-disabled by turbo=1)",
             "cache": instant["effective_cache"],
             "cache_threshold": instant["cache_threshold"] if instant["effective_cache"] == "fbc" else None,
@@ -10376,6 +10846,7 @@ class MiniMaxH3Runner:
             "transformer_quant": H3_TRANSFORMER_QUANT,
             "lowvram": H3_LOWVRAM_RAW,
             "attn_backend": instant["attn"],
+            "lean_block_last": self._lean_last(),
             "cache": instant["effective_cache"],
             "cache_threshold": instant["cache_threshold"] if instant["effective_cache"] == "fbc" else None,
             "turbo": instant["turbo"],

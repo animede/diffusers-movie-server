@@ -54,6 +54,14 @@ H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1 \
   venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8611
 # ※ sm_120 以外は H3_ATTN_BACKEND=default が必須(既定の sage は sm_120 専用ビルド)
 
+# 6GB 単体(768²×5 秒 4.6GB、1024²×5 秒は空きに応じて attention をヘッド分割して 4.8GB)/ 8GB 単体(1024² 6.4GB、分割なし)。
+# 2026-11-15 のストリーミングとメモリ節約版 forward(下の「低 VRAM の到達点」)。上の 16GB の行に
+# H3_TE_STREAM=1 H3_TE_DIET=1 を足すだけ(残りは既定で有効。さらに下げるなら H3_CACHE=none で 1024² 3.0GB)。
+# ホスト RAM は 48GB 以上でピン留め(速い)、32GB / 16GB の PC では自動で量子化キャッシュから直接流す(H3_GROUP_STREAM_HOST)
+H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1 H3_TE_STREAM=1 H3_TE_DIET=1 \
+  H3_ATTN_BACKEND=default \
+  venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8611
+
 # 8GB×2(TE を2枚目GPUへ)
 H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1 \
   H3_ATTN_BACKEND=default H3_TE_DEVICE=cuda:1 \
@@ -319,9 +327,10 @@ venv/bin/python scripts/download_t2va.py
 | 96GB | (指定なし=既定) | peak 92GB / 約160秒 |
 | 80GB級 | `H3_TRANSFORMER_QUANT=int8` | peak 59.7GB / 約160秒 |
 | 48GB級 | `H3_LOWVRAM=1` | peak 38.9GB / 約215秒 |
-| 32GB級 | `H3_LOWVRAM=group` | peak 28.7GB / 約280秒 |
+| 32GB級 | `H3_LOWVRAM=group` | peak 28.7GB / 約280秒(2026-11-15 の自作ストリーマで denoise は約 1.7 倍速、下の `H3_GROUP_STREAM`) |
 | 18GB級 | `H3_LOWVRAM=group H3_TE_PRUNE=1` | peak 17.7GB / 約280〜320秒 |
 | **16GB 単体**(実 4060 Ti) | `H3_LOWVRAM=group H3_TE_PROJ=NicoLab28/ClipProj-MiniMax-H3 H3_VIDEO_VAE_FP16=1` | peak 11.4GB / 約25分※ |
+| **6GB 単体 / 8GB 単体**(2026-11-15) | 上の行 + `H3_TE_STREAM=1 H3_TE_DIET=1` | 768²: 4.62GB / 1024²: 6.41GB(MD5 一致の既定。48GB 機で 272 / 552 秒)。空きが足りないときは attention をヘッド分割して 1024² 4.79GB(別サンプル相当、+15%)、`H3_CACHE=none` なら 3.03GB。ホスト RAM 32GB / 16GB は量子化キャッシュから直接流す(1K は同速、512² は約 2 倍)。Gen3 x4 の箱では上の※と同じ転送律速 |
 | **12GB 単体**(見込み・未実測) | 16GB 単体と同じ | 実ピーク11.4GBが12GiBに入る計算。参照系・768×1344は不可 |
 | **8GB×2**(バラスト実測) | 16GB 単体の指定 + `H3_TE_DEVICE=cuda:1` | peak 7.23GB / 約25.6分※ |
 
@@ -737,6 +746,199 @@ to_q/k/vを削除せず+12.8GBリークする**(明示deleteで対処)。AdaLN�
 - 既定OFFでは既存基準とMD5一致(回帰ゼロ)
 
 ## 24〜32GB級VRAM対応 (`H3_LOWVRAM=group`、2026-08-05追加)
+
+### 2026-11-15: ブロック転送を自作の窓付き先読みに置き換え(`H3_GROUP_STREAM`、既定 `own`)
+
+`H3_LOWVRAM=group` のブロック転送は、diffusers の `enable_group_offload(block_level, use_stream=True)` から
+`core/blockstream.py` の自作ストリーマに置き換えた(`H3_GROUP_STREAM=diffusers` で従来に戻せる)。
+TE の `H3_TE_STREAM`(`core/testream.py`)と同じ設計で、50 ブロック(int8、計 30.1GiB)をピン留めした
+ホスト RAM に置き、コピー専用 stream で window 個(`H3_GROUP_OFFLOAD_BLOCKS`+1、既定 2)先のブロックを
+送りながら計算する。ブロック以外(埋め込み・token_refiner・出力層、bf16 で 1.6GiB)は GPU に常駐。
+torchao `Int8Tensor` は外側の wrapper ではなく内側の `qdata` / `scale` / `zero_point` を差し替える
+(diffusers の `_restore_torchao_tensor` と同じ方式)。flux3-klein-studio の 6GB 対応で実証した設計の移植。
+
+実測(RTX PRO 5000 Blackwell 48GB の GPU0、`H3_LOWVRAM=group H3_TE_PRUNE=1`、t2va 512²×5 秒 124f、30 step、seed 1、2 回ずつ):
+
+| | diffusers 版(`H3_GROUP_STREAM=diffusers`) | 自作版(`own`、既定) |
+|---|---:|---:|
+| デノイズ、`H3_CACHE=none` | 164.9〜165.0 秒(5.68 秒/step) | **96.4〜96.5 秒(3.32 秒/step)** |
+| デノイズ、`H3_CACHE=fbc`(既定) | 165.5〜167.6 秒(FBC が 1 step も飛ばない) | **85.6〜86.1 秒(FBC が 6/30 step を飛ばす)** |
+| ピーク VRAM | 17.7〜18.3GB | 19.5〜20.0GB(ブロック以外の常駐 +1.6GiB) |
+| 出力(MD5) | `H3_CACHE=none` で自作版と**完全一致** | 同左 |
+| ロード(ピン留め) | 20 秒(34GB を pinned 辞書へ) | 15 秒(ブロックごとに 1 本のバッファへ) |
+
+- 速さの差は転送方式そのもの(FBC オフ同士で 1.71 倍)。既製品はグループごとのフック固定費と、CPU が計算に先回りして
+  GPU 側の解放が遅れる構造のため(`docs/lowvram-techniques.md` の 4.2 節と同じ)。
+- **FirstBlockCache が group モードでも効くようになった**。diffusers 版では FBC が 1 step も飛ばしておらず
+  (「速度の正直な注記」の `cache_skipped_steps: 0` はこれ)、自作版では閾値 0.05 で 30 step 中 6 step を飛ばす。
+  その分だけ出力は FBC オフと変わる(FBC 本来の挙動)。完全一致が要るときは `H3_CACHE=none`。
+- group モードの transformer は、量子化済みキャッシュ(`models/prequant/transformer_int8`)があればそれを CPU に読む
+  ようにした(bf16 原本が HF キャッシュに無くても起動できる。他モードと同じ fail-open)。キャッシュから読んだ
+  Int8Tensor は `requires_grad=False` に固定する(diffusers 版の `swap_tensors` が autograd を辿って
+  `aten.view unimplemented` で落ちるため)。bf16 原本を消した箱では `meta.json` の `source_snapshot` の照合を省略する。
+- 解放は `BlockStreamer.release()`(`cudaHostUnregister`)で行い、`_host_emptyCache` に頼らない。
+- ホスト RAM: ピン留め 30.1GiB(diffusers 版の pinned 辞書 34GB と同程度)。RAM ガード(`H3_GROUP_OFFLOAD_MIN_RAM_GB`)はそのまま。
+
+### 2026-11-15: 低 VRAM の到達点 — 16GB 構成を 8GB / 6GB へ(3 段のストリーミング)
+
+同じ設計を、group モードで GPU に残っていた残り 3 つにも当てた。いずれも配置換えだけで**出力は MD5 一致**。
+
+1. **投影 TE の LM 層**(`H3_TE_STREAM=1` が `H3_TE_PROJ` にも効くようにした)。4B の 36 層 1.9GiB をピン留めホストに置き、
+   エンコード中だけ流す。group モードは TE をデノイズ中も常駐させる段取りなので、デノイズのピークが下がる。
+2. **token_refiner の 2 ブロック**(`H3_GROUP_STREAM_REFINER`、既定 1)。int8 化の対象外で bf16 1.5GiB が常駐していた。
+3. **video VAE デコーダの 36 ブロック**(`H3_GROUP_STREAM_VAE`、既定 `auto` = 最初のデコードで空き VRAM が 8GB 未満なら流す)。
+   VAE 5.2GiB(fp16)の 4.8GiB がデコーダで、1・2 のあとはここがピークだった。タイルごとに送り直すのでデコードは遅くなる。
+
+実測(RTX PRO 5000 48GB の GPU0、`H3_LOWVRAM=group H3_TE_PROJ=… H3_VIDEO_VAE_FP16=1 H3_TE_STREAM=1`、t2va 5 秒 30 step、seed 1):
+
+| | 基準(自作ストリーマのみ) | +1 投影 TE | +2 token_refiner | +3 VAE デコーダ |
+|---|---:|---:|---:|---:|
+| 512²×5 秒 ピーク | 8.59GB | 8.33GB | 6.79GB | **4.67GB** |
+| 768²×5 秒 ピーク | 10.78GB | 9.54GB | 7.99GB | **7.45GB** |
+| 512² デノイズ / デコード | 90 / 6 秒 | 86 / 6 秒 | 90 / 6 秒 | 89 / 17 秒 |
+| 768² デノイズ / デコード | 200 / 11 秒 | 193 / 11 秒 | 195 / 11 秒 | 195 / 30 秒 |
+
+起動直後の GPU 常駐は 0.18GB。残るピークはデノイズの活性で、これは解像度と長さで決まる。
+
+4. **feed-forward のトークン分割**(`H3_FF_CHUNK`、既定 `auto` = group モードで 8192 トークン、`0` で無効)。ブロックで最大の
+   一時メモリは SwiGLU の射影(トークンごとに 2 × ffn_dim 14336 の bf16 = 57KB)で、トークンを 8192 個ずつ通すと
+   一時メモリがその分だけになる。トークンごとの演算なので結果は同じ(MD5 一致)。
+
+| 1K を含む活性のピーク(デノイズ段階、同構成) | 分割なし | `H3_FF_CHUNK=8192` |
+|---|---:|---:|
+| 768²×5 秒 | 7.45GB | **6.26GB** |
+| 1024²×5 秒(3.8 万トークン、13.9 秒/step) | 10.73GB | **9.34GB** |
+
+残るのは attention の K・V(1024² で各 0.55GB)と出力・残差ストリームで、正確なままでは削れない下限に近い。
+
+5. **attention のクエリ分割**(`H3_ATTN_Q_CHUNK`、既定 0 = 無効、`core/attnchunk.py`)。K・V は丸ごと作り、Q の射影・
+   QK ノルム・RoPE・カーネル・出力射影を 8192 トークンずつ回す(結果は MD5 一致)。効くのは 1K 以上で、
+   1024²×5 秒のデノイズのピークが 9.34 → **8.53GB**、768² では差なし(6.26 → 6.38)。2〜4% 遅くなる(1024² で
+   13.9 → 14.4 秒/step)ので既定では切ってあり、1K を小さいカードで回すときに `H3_ATTN_Q_CHUNK=8192` を足す。
+
+ここまでで 1024²×5 秒は 8.5GB。さらに 3 つで「後ちょっと」を詰めた(いずれも MD5 一致)。
+
+6. **メモリ節約版のブロック forward**(`H3_LEAN_BLOCK`、既定 `auto` = group モードで 8192 トークン、`core/leanblock.py`)。
+   元の forward は norm1 の出力・attention の出力・norm2 の出力・FF の出力を全トークン分(1024² で各 0.41GB)作ってから
+   足す。正規化 → 変調 → 射影/attention/FF → ゲート → 残差加算をチャンクで通し、全トークン分の中間は入力・出力・
+   K・V の 4 本だけにする。4(FF 分割)と 5(クエリ分割)を包含する。norm をチャンクごとに 2 回計算する分、1024² で約 7% 遅い。
+7. **流す単位をブロックの 1/3 に**(`H3_GROUP_STREAM_UNITS=half`、既定)。adaln_proj → attn → ff の順に 150 単位で流し、
+   常駐する先読み分が 2 ブロック(1.3GiB)から小さい 2 単位になる。
+8. **投影 TE にも `H3_TE_DIET=1`**(opt-in)。lm_head の解放と埋め込み表(151936 × 2560)の CPU ブリッジ化で 1.45GiB。
+
+| ピーク VRAM(同構成 + `H3_TE_DIET=1`、VAE を流した小カード相当の総合値) | 最初(自作ストリーマのみ) | 1〜3(ストリーミング 3 段) | 全部(4〜8) |
+|---|---:|---:|---:|
+| 512²×5 秒 | 8.59GB | 4.67GB | **3.27GB** |
+| 768²×5 秒 | 10.78GB | 7.45GB | **4.85GB** |
+| 1024²×5 秒 | 10.73GB(デノイズ) | — | **6.82GB** |
+
+ここまでが午前。午後に 1024²×5 秒の内訳を測り直す(`H3_LEAN_DEBUG=1` がブロック 0〜2 の allocated / peak を出す)と、
+トークンは 38,321(動画 31,744 + 音声 + テキスト)で、残差ストリーム 1 本が 0.41GB、K・V が各 0.55GB、ブロック内の一時
+メモリは attention 段が最大(K・V 1.1GB + sage がカーネル内で作る int8 の写し + チャンク分)だった。さらに 4 つ。
+
+9. **fp32 パッチ埋め込みの丸め**(`core/leanblock.py` の `shrink_prologue`、`H3_LEAN_BLOCK` と一緒に入る)。transformer の
+   forward は `proj_in`(fp32 のまま残す層)の出力を全トークン分作って bf16 に丸めて詰めるが、丸める前の fp32 の方が
+   ローカル変数としてブロックのループ中ずっと残る(1024² で 0.68GB)。射影の出口で同じ丸めをしてから返すので値は
+   同じまま、残るのが半分になる。1024² 6.82 → **6.41GB**、768² 4.85 → **4.62GB**(MD5 一致)。
+10. **残差の in-place 更新**(同)。ブロック 2 以降は入力バッファに直接書く(各チャンクは自分の行を読み終えてから書く
+    ので結果は同じ。MD5 一致)。FBC はブロック 0 の入力と出力を参照するのでブロック 0・1 は新しいバッファに書き、
+    FBC が持つ残差 3 本(head_block_output / head_block_residual / tail_block_residuals、1024² で計 1.2GB)と合わせると
+    ピークはブロック 1 のまま → FBC 有効時の総合値は変わらない。`H3_CACHE=none` なら全ブロック in-place で 1 本下がる。
+11. **ヘッド分割の attention**(`H3_ATTN_HEAD_GROUPS`、既定 `auto`)。K・V・Q を 56 ヘッドの G 分割で順に作る(to_q/to_k/to_v
+    の重みの行スライス。torchao の Int8Tensor はストリーマが中身だけ GPU に置くので、中身をスライスして組み直す)。
+    各グループの attention 出力は全ヘッド分の 1 本(attn_out)に書き、出力射影はそこから全ヘッドまとめて行う。同時に
+    持つのが K・V の 2 本から attn_out + K/G + V/G になり、sage がカーネル内で作る K・V の写しも 1/G になる。
+    正規化と変調を G 回やり直すので遅い(G=4 +13%、G=8 +15〜35%、G=28 +70%)。**計算は同じだがビット一致はしない**:
+    GEMM の行数(7168/G)と attention カーネルのヘッド数が変わるとカーネル選択と加算順序が変わり、bf16 の最下位
+    ビットが動くことがある(sage は K の平均を引く前処理がヘッド数とトークン数の組み合わせで揃ったり揃わなかったり
+    する)。30 ステップで増幅されて別のサンプル相当の動画になる(基準との PSNR は 1024² 34.4dB / 768² 38.7dB。FBC の
+    有無の差が 34.2dB なので、既定で使っている FBC の近似と同程度の差で、品質低下ではない)。そのため **auto は G=1 で
+    収まるときは必ず G=1** を選び、収まらないときだけ 4 → 7 → 8 → 14 → 28 の順に空き VRAM(`H3_VRAM_LIMIT_GB` の上限も
+    見る)に入る最小の G を使う(生成の最初の forward で決めて、その生成の間は固定。FBC の残差 3 本と 1GiB の余裕を先に引く)。G=4 固定で 1024² 5.09GB(16.7 秒/step、+8%)、G=8 固定で 1024² **4.79GB**(17.9 秒/step)、768² **3.95GB**
+    (8.8 秒/step)。5.8GB 上限で auto に任せると G=4 → 28 を選んで 4.79GB(26 秒/step)。ブロック単位の診断で一致した
+    組み合わせ(1024² の G=4)でも 30 ステップの実機出力は MD5 が変わったので、G>1 は常に「別サンプル」と考える。
+12. **FBC を切る**(`H3_CACHE=none`)。FBC の残差 3 本が消え、全ブロック in-place になる。G=8 と合わせて 1024²×5 秒の
+    デノイズが **3.03GB**(30 ステップ全部計算するので 23 秒/step。FBC 自体が別サンプル相当の近似なので出力は変わる)。
+
+| ピーク VRAM(同構成、総合値) | 〜8(午前) | 9〜10(MD5 一致、既定) | + ヘッド分割 G=8(別サンプル) | + `H3_CACHE=none` |
+|---|---:|---:|---:|---:|
+| 512²×5 秒 | 3.27GB | **2.90GB** | — | — |
+| 768²×5 秒 | 4.85GB | **4.62GB** | 3.95GB | — |
+| 1024²×5 秒 | 6.82GB | **6.41GB** | 4.79GB | 3.03GB |
+
+正確なまま(MD5 一致)では **512² 2.90GB / 768² 4.62GB / 1024² 6.41GB** が下限で、残りは K・V と残差ストリームと FBC の残差 3 本。
+ヘッド分割を許せば **1024²×5 秒が 6GB カード**に入る(auto が必要なときだけ使う)。`/api/status` の
+`group_stream_refiner` / `group_stream_vae` / `group_stream_units` / `ff_chunk` / `attn_q_chunk` / `lean_block` /
+`attn_head_groups` と、直近の forward が選んだ `lean_block_last`(トークン数・G・in-place の開始ブロック)で状態を
+確認できる(生成結果の JSON にも `lean_block_last` が入る)。
+
+### ホスト RAM 32GB / 16GB の PC: 重みをファイルから直接流す(`H3_GROUP_STREAM_HOST=file`、2026-11-15)
+
+ここまでの low VRAM 構成は int8 transformer 全体(30GiB)をピン留めしたホスト RAM に置くので、RAM 48GB 級が前提だった。
+`H3_GROUP_STREAM_HOST=file`(`core/filestream.py`。minimax-h3-image-server の `app/filestream.py` と同じ方式)は、
+量子化済みキャッシュ(safetensors、`from_pretrained` が mmap で読むので RAM に展開されない)から単位(ブロックの 1/3)ごとに
+8 スレッドで 32MB ずつ並列に読み、ピン留めした受け皿(3 本 × 0.24GiB、2 単位先読み)経由で GPU へ流す。必須のホスト RAM は
+その受け皿と token_refiner の受け皿(2 × 0.36GiB)だけで、残りは OS のページキャッシュに乗る分だけ速くなる。
+キャッシュに収まらない末尾の単位は読むたびに `posix_fadvise(DONTNEED)` で捨て、巡回アクセスで全部が LRU に押し出される
+のを防ぐ(捨てる数は auto: 「原本 + この後ピン留めする TE / VAE の分 − 使える RAM(cgroup の上限も見る)」)。
+file のときは VAE デコーダの流し元もピン留めしない(fp16 の写しをそのまま使う)。重みは同じ int8 なので出力は同じ。
+
+- `H3_GROUP_STREAM_HOST`: `auto`(既定。搭載 RAM が `H3_GROUP_STREAM_FILE_BELOW_GB` = 48GB 未満なら file)/ `pinned` / `file`。
+  bf16 原本から量子化した(キャッシュが無い)ときは pinned に落ちる。`H3_GROUP_STREAM_DROP_UNITS`(auto / 数)、
+  `H3_GROUP_STREAM_RING`(受け皿の本数、既定 3)。`/api/status` の `group_stream_host` / `group_stream_file`。
+- Windows は `fadvise` が無いので捨てる制御は効かない(読み自体は `FILE_FLAG_SEQUENTIAL_SCAN` で動く。画像サーバの
+  RTX 3050 / RAM 16GB 機で実証した方式)。
+
+実測(48GB 機の GPU0、RAM の上限を cgroup で模擬し、量子化キャッシュのページキャッシュを捨ててから開始。この機の
+NVMe は直読み 3.3GB/s。出力はすべて pinned と MD5 一致):
+
+| 原本の置き場所 | 必須ホスト RAM | 512²×5 秒 | 1024²×5 秒 | 備考 |
+|---|---:|---:|---:|---|
+| pinned(参考) | 約 38GiB(transformer 30 + refiner 1.4 + TE 1.9 + VAE 4.5) | 2.98 秒/step | 15.1 秒/step | VRAM 2.90 / 6.41GB |
+| file、RAM 制限なし(キャッシュ温) | 約 8GiB | 3.11 秒/step | — | VRAM 2.49GB(GPU の先読みが 1 単位少ない) |
+| file、RAM 28GB 上限(32GB 機相当) | 同上 | 6.1 秒/step | **14.7 秒/step** | 150 単位中 94 をディスク直読み。1K は読みが計算に隠れる |
+| file、RAM 16GB 上限 | 同上 | 8.0 秒/step | — | 全 150 単位をディスク直読み(30GiB/step)、MD5 一致 |
+| file、RAM 12GB 上限(16GB 機相当)、VAE・TE もファイルから(下記) | 約 2GiB | 8.0 秒/step | **15.4 秒/step** | MD5 一致。VAE は空き RAM があればデコードの間だけピン留め |
+
+1K では読み(最悪 30GiB/step ÷ 3.3GB/s ≈ 9 秒)が 15 秒の計算に隠れて pinned と同じ速さ、512² は読み律速で約 2 倍かかる。
+**RAM 32GB の PC で 1024²×5 秒が pinned と同速、RAM 16GB でも 1K まで通る**(速度はディスクの連続読み出し速度に依存)。
+最初の 12GB 上限の試験では、デコードの直前にプロセスの匿名メモリが約 12GB に達して落ちた(`proc_anon_gb` の内訳:
+VAE の fp16 の写し 4.8、受け皿 1.6、TE の層のピン留め 1.9〜2.4、基本 0.6、デコードのフレームバッファ)。残っていた 2 つも
+同じ方式に乗せて、RAM 16GB 相当で 1K を通した:
+
+- **VAE デコーダの fp16 キャッシュ**(`core/vaecache.py`、`models/prequant/vae_decoder_fp16/`、4.5GiB、初回に 2 秒で作る)。
+  file モードでは起動時にデコーダブロックを fp16 に写さず(写しが 4.8GiB の匿名メモリだった)、ブロックを 0 要素の
+  プレースホルダにしておく。デコードのときは空き RAM を見て、**4.5GiB + 2GiB あればキャッシュからピン留めに 1.4 秒で
+  読み込み、デコードの間だけ持つ**(pinned と同じ速さ)。無ければタイルごとにファイルから流す(1K のデコード 48 → 95 秒)。
+  終わったらピン留めを返す。値は `vae.to(float16)` と同じ丸めなので出力は同じ。
+- **投影 TE の量子化済みキャッシュ**(`H3_TE_PROJ_PREQUANT=1`、既定。`models/prequant/te_proj_<model>_bnb-4bit/`)。
+  bnb-4bit の TE を一度だけ保存し(2 秒)、次回から読む(ロードはこの機では bf16 からの量子化と同じ 9〜10 秒だが、読む量が
+  bf16 8GB から nf4 2.2GB になるのでディスクの遅い PC で効く)。
+  file モードでは LM 層 36 本(1.9GiB)をこのファイルから直接流し、ピン留めしない(受け皿 2 × 0.06GiB)。
+
+これで 12GB 上限(16GB 機相当)でも **1024²×5 秒が完走**(15.4 秒/step、デコードはファイル流しで 97 秒、MD5 一致)、
+768² も 8.3 秒/step(VAE をデコードの間だけピン留めしてデコード 30 秒、MD5 一致)。必須のホスト RAM は受け皿 3 本 + TE の受け皿 2 本の約 1GiB と
+プロセス本体で、約 2GiB。
+
+#### VRAM 級 × ホスト RAM 級の早見表(t2va 5 秒・30 ステップ、既定の低 VRAM 構成)
+
+速度はこの機(RTX PRO 5000)の秒/step。RTX 3050 などではその数倍かかる。○ = MD5 一致のまま入る、△ = ヘッド分割
+(別サンプル相当)か `H3_CACHE=none` で入る、✗ = 入らない。
+
+| VRAM \ ホスト RAM | 16GB(file、全単位をディスクから) | 32GB(file、一部をディスクから) | 48GB 以上(pinned) |
+|---|---|---|---|
+| **6GB** | 512² ○ 8.0 / 768² ○ 8.3。1K △ 約 17(ヘッド分割、デコードはファイル流しで 97 秒) | 512² ○ 6.1 / 768² ○ 7.1。1K △ 16.8(auto が G=4 を選び 4.4GB) | 512² ○ 3.0 / 768² ○ 7.1。1K △(ヘッド分割で 4.8GB、`H3_CACHE=none` で 3.0GB) |
+| **8GB** | 同上。1K ○ 15.4(5.8GB、デコード 97 秒) | 同上。1K ○ 14.7(5.8GB) | 同上。1K ○ 15.1(6.4GB) |
+| **12〜16GB** | 同上 | 同上。空き VRAM が 8GB 以上なら VAE を流さずデコードが速い(768² 31 → 11 秒級) | 同上 |
+| **24GB 以上** | 同上 | 従来の表(`H3_LOWVRAM=1` 系)も選べる | 同左 |
+
+- VRAM が決めるのは「何が入るか」: 512²(2.9GB)と 768²(4.6GB)は 6GB で入り、1K は 8GB なら MD5 一致のまま
+  (pinned 6.4GB / file 5.8GB)、6GB ではヘッド分割(auto が必要なときだけ使う)か `H3_CACHE=none`。
+- ホスト RAM が決めるのは「速さ」: 48GB 以上はピン留めで最速、32GB は 768² と 1K が同速で 512² が 2 倍、16GB は
+  512² が 2.7 倍・768² が 1.1 倍で、1K も通る(VAE と TE もファイルから流す)。
+- file モードは GPU の先読みが 1 単位少ないぶん VRAM ピークも下がる(512² 2.49 / 768² 3.71 / 1K 5.76GB)。
+  file で VAE デコーダをピン留めするかは `H3_GROUP_STREAM_VAE_PIN`(auto = RAM 24GB 以上。しないと 768² のデコードが
+  31 → 53 秒)。
 
 `H3_LOWVRAM=1`(48GB級)は transformer(34GB)を毎リクエスト GPU に丸ごとロードするため、
 24〜32GB級カードでは transformer 単体でも収まらない。`H3_LOWVRAM=group` は
