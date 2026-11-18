@@ -185,6 +185,12 @@ MODEL_ID = "MiniMaxAI/MiniMax-H3"
 DEVICE = torch.device("cuda:0")
 CPU = torch.device("cpu")
 
+# H3_PROFILE: 主プロファイル(H3_LOWVRAM / H3_TE_PROJ / ... の一式)を総 VRAM から自動で選ぶ。明示指定が
+# ひとつでもあれば何もしない。この下の `os.environ.get("H3_...")` より**前**に走らせる(core/profile.py)。
+import core.profile as _h3_profile  # noqa: E402
+
+_H3_PROFILE_INFO = _h3_profile.apply()
+
 # ---------------------------------------------------------------------------
 # H3_VRAM_LIMIT_GB: このプロセスが計算用GPU上で確保できる VRAM の上限 (GB, 10進)。
 # 既定は空 = 無制限 (カード全部を使ってよい)。
@@ -1799,7 +1805,11 @@ H3_TURBO_LORA_SCALE_RAW = os.environ.get("H3_TURBO_LORA_SCALE", "").strip()
 # バッファを追加すると offload/onload サイクルで辞書に無いバッファを引いて壊れる
 # (KeyError または GPU 残留) 可能性が高い -- 未実測のまま解禁しない (レビュー指摘。
 # hooks/group_offloading.py の `_init_cpu_param_dict()` が構築時1回きりであることを確認)。
-if H3_TURBO_LORA and H3_LOWVRAM_GROUP:
+# 2026-11-17: 自作ストリーマ(H3_GROUP_STREAM=own)は転送対象をブロックの named_parameters /
+# named_buffers から自分で集めるので、ストリーマ構築より前に LoRA で巻いておけば lora_a / lora_b
+# (非永続バッファ)も同じ窓で GPU へ流れる(A4000 16GB で t2va 5 秒 768² が 4 ステップ 151 秒、
+# ピーク 7.0GB を実測)。拒否は diffusers の enable_group_offload 経路に限定する。
+if H3_TURBO_LORA and H3_LOWVRAM_GROUP and H3_GROUP_STREAM != "own":
     raise RuntimeError(
         "H3_TURBO_LORA=1 と H3_LOWVRAM=group は併用できません (enable_group_offload の "
         "cpu_param_dict は有効化時点で固定されるため、後から追加される LoRA バッファが "
@@ -4119,15 +4129,24 @@ def gpu_mem_gb() -> dict:
 
 
 def ram_gb() -> dict:
-    meminfo = {}
-    with open("/proc/meminfo") as f:
-        for line in f:
-            parts = line.split()
-            meminfo[parts[0].rstrip(":")] = int(parts[1])
-    total = meminfo["MemTotal"] / 1e6
-    avail = meminfo["MemAvailable"] / 1e6
-    swap_total = meminfo.get("SwapTotal", 0) / 1e6
-    swap_free = meminfo.get("SwapFree", 0) / 1e6
+    # 2026-11-17: Windows には /proc が無いので、その場合だけ psutil(requirements.txt に入っている)で代替する。
+    # Linux は従来どおり /proc/meminfo(kB を 1e6 で割る従来の値のまま。RAM 閾値の判定を変えないため)。
+    if not os.path.exists("/proc/meminfo"):
+        import psutil
+
+        vm, sm = psutil.virtual_memory(), psutil.swap_memory()
+        total, avail = vm.total / 1e9, vm.available / 1e9
+        swap_total, swap_free = sm.total / 1e9, sm.free / 1e9
+    else:
+        meminfo = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                parts = line.split()
+                meminfo[parts[0].rstrip(":")] = int(parts[1])
+        total = meminfo["MemTotal"] / 1e6
+        avail = meminfo["MemAvailable"] / 1e6
+        swap_total = meminfo.get("SwapTotal", 0) / 1e6
+        swap_free = meminfo.get("SwapFree", 0) / 1e6
     return {
         "avail_gb": round(avail, 1),
         "total_gb": round(total, 1),
@@ -5406,6 +5425,14 @@ class MiniMaxH3Runner:
             "transformer loaded to CPU (int8, group-offload target) in %.1fs. ram=%s",
             t1 - t0, ram_gb(),
         )
+        if H3_TURBO_LORA:
+            # ストリーマ構築より前に巻く(lora_a / lora_b をストリーマの転送対象に入れるため)。pinned ではブロックと
+            # 一緒に流れ、file(原本をファイルから読む)では「ファイルに無いテンソル」として GPU に常駐する
+            # (約 1.2GB。2026-11-18 に 8GB 上限の模擬で確認)。
+            n = self._apply_turbo_lora_checkpoint(self._pipe.transformer, is_ref=False)
+            self._turbo_lora_wrapped = True
+            logger.info("H3_TURBO_LORA=1 (group): applied turbo LoRA on CPU before the block streamer "
+                        "(%d layers wrapped), FBC force-disabled", n)
         self._attach_group_offload(self._pipe.transformer, "transformer")
         if H3_FF_CHUNK:
             logger.info("transformer: feed-forward chunked by %d tokens on %d blocks (H3_FF_CHUNK)",
@@ -5428,7 +5455,7 @@ class MiniMaxH3Runner:
         if H3_ATTN_BACKEND:
             self._pipe.transformer.set_attention_backend(H3_ATTN_BACKEND)
             logger.info("transformer attention backend set to %r", H3_ATTN_BACKEND)
-        if H3_CACHE == "fbc":
+        if H3_CACHE == "fbc" and not H3_TURBO_LORA:
             self._enable_fbc()
         logger.info(
             "transformer group offload enabled in %.1fs (total load %.1fs). gpu=%s ram=%s",
@@ -5785,7 +5812,20 @@ class MiniMaxH3Runner:
         if self._transformer_ref_loaded:
             self._active_variant = "ref2va"
             return
-        self._check_group_offload_ram_guard()
+        # base 側(_ensure_transformer_group)と同じ: 量子化済みキャッシュを file で流すなら RAM ガードは不要。
+        # file 構成でキャッシュが無いときは、bf16(66GB)の取得 + RAM 上での量子化に落ちて確実に失敗するので、
+        # 作り方を示して先に止める(低 RAM の PC で Ref2VA / Ref2I を使うには prepare_lowvram.py --ref が要る)。
+        prequant_ready = H3_TRANSFORMER_PREQUANT and (self._transformer_prequant_dir(is_ref=True) / "config.json").exists()
+        if self._group_stream_host_hint() == "file" and not prequant_ready:
+            raise RuntimeError(
+                "Ref2VA / Ref2I needs the int8 cache of transformer_ref "
+                f"({self._transformer_prequant_dir(is_ref=True)}), which is missing. On this host (file streaming, "
+                "RAM below the pinned threshold) it cannot be quantized from bf16 at load time. Build it once with "
+                "`scripts/prepare_lowvram.py --ref` (downloads transformer_ref 66GB shard by shard, writes ~32GB), "
+                "then retry."
+            )
+        if not (prequant_ready and self._group_stream_host_hint() == "file"):
+            self._check_group_offload_ram_guard()
         if progress:
             progress.update(phase="loading_transformer", message="transformer_ref (group offload) をロード中...")
         t0 = time.time()
@@ -5816,6 +5856,12 @@ class MiniMaxH3Runner:
             "transformer_ref loaded to CPU (int8, group-offload target) in %.1fs. ram=%s",
             t1 - t0, ram_gb(),
         )
+        if H3_TURBO_LORA:
+            # base 側と同じ: ストリーマ構築より前に巻く(file では LoRA は GPU 常駐、約 1.2GB)
+            n = self._apply_turbo_lora_checkpoint(self._pipe_ref.transformer_ref, is_ref=True)
+            self._turbo_lora_wrapped_ref = True
+            logger.info("H3_TURBO_LORA=1 (group): applied turbo LoRA on CPU before the block streamer "
+                        "(transformer_ref, %d layers wrapped), FBC force-disabled", n)
         self._attach_group_offload(self._pipe_ref.transformer_ref, "transformer_ref")
         if H3_FF_CHUNK:
             logger.info("transformer_ref: feed-forward chunked by %d tokens on %d blocks (H3_FF_CHUNK)",
@@ -5838,7 +5884,7 @@ class MiniMaxH3Runner:
         if H3_ATTN_BACKEND:
             self._pipe_ref.transformer_ref.set_attention_backend(H3_ATTN_BACKEND)
             logger.info("transformer_ref attention backend set to %r", H3_ATTN_BACKEND)
-        if H3_CACHE == "fbc":
+        if H3_CACHE == "fbc" and not H3_TURBO_LORA:
             self._enable_fbc_ref()
         logger.info(
             "transformer_ref group offload enabled in %.1fs (total load %.1fs). gpu=%s ram=%s",
@@ -6041,6 +6087,10 @@ class MiniMaxH3Runner:
         wrapped_attr = "_turbo_lora_wrapped_ref" if is_ref else "_turbo_lora_wrapped"
         label = "transformer_ref" if is_ref else "transformer"
         if turbo and not getattr(self, wrapped_attr):
+            if H3_LOWVRAM_GROUP:
+                raise ValueError(
+                    "group モードではロード後に turbo LoRA を巻けません(ブロックストリーマの転送対象が"
+                    "構築時に固定されるため)。H3_TURBO_LORA=1 を付けて起動してください。")
             if progress:
                 progress.update(message=f"turbo LoRA を {label} へ適用中...")
             n = self._apply_turbo_lora_checkpoint(transformer, is_ref=is_ref)
@@ -6573,6 +6623,15 @@ class MiniMaxH3Runner:
             name = "transformer_ref_int8" if is_ref else "transformer_int8"
         return H3_TRANSFORMER_PREQUANT_DIR / name
 
+    @staticmethod
+    def _bf16_shards_absent(config_path) -> bool:
+        """current の source_snapshot(transformer/config.json のパス、または None)に対応する bf16 シャードが
+        ローカルに無いか。無ければキャッシュの作り直しは不可能なので、照合を省略してキャッシュを使う。"""
+        if not config_path:
+            return True
+        d = Path(str(config_path)).parent
+        return not any(p.exists() and p.stat().st_size > 1 << 20 for p in d.glob("diffusion_pytorch_model*.safetensors"))
+
     def _transformer_prequant_metadata(self, pruned: bool = False) -> dict:
         """キャッシュ無効化用のメタデータ。保存時に `meta.json` として書き込み、
         ロード時にこれと一致するかを確認する。一致しなければキャッシュは無効
@@ -6653,9 +6712,13 @@ class MiniMaxH3Runner:
             # 2026-11-15: bf16 の原本を HF キャッシュから消した箱では source_snapshot だけが None になる。
             # 原本が無いのだから更新の検知もできず、作り直しもできない(ロードが失敗するだけ)ので、
             # それ以外が一致していればキャッシュを有効とみなす。
-            if (current_meta.get("source_snapshot") is None
-                    and {k: v for k, v in saved_meta.items() if k != "source_snapshot"}
-                    == {k: v for k, v in current_meta.items() if k != "source_snapshot"}):
+            # 2026-11-18: source_snapshot が None ではなく「別のスナップショットのパス」になる場合も同様に扱う。
+            # HF の main が進んで config.json だけ新しいスナップショットに取得されると(scripts/prepare_lowvram.py や
+            # HEAD 問い合わせで起きる)パスが変わるが、bf16 シャードがローカルに無ければ作り直せないので、
+            # シャードの有無を見て「無ければ照合を省略」する(低 RAM の PC で生成が止まるのを防ぐ)。
+            rest_equal = ({k: v for k, v in saved_meta.items() if k != "source_snapshot"}
+                          == {k: v for k, v in current_meta.items() if k != "source_snapshot"})
+            if rest_equal and self._bf16_shards_absent(current_meta.get("source_snapshot")):
                 logger.info("transformer 量子化済みキャッシュ: bf16 原本が無いので source_snapshot の照合を省略して使います: %s",
                             cache_dir)
             else:
@@ -6686,6 +6749,18 @@ class MiniMaxH3Runner:
                     pass
             # group モード (device=CPU) はホスト常駐のまま使う(from_pretrained は CPU に読む)
             tr = tr.to(DEVICE if device is None else device)
+        except NotImplementedError as e:
+            if "meta tensor" in str(e):
+                # scripts/prepare_lowvram.py の旧版(2026-11-18 以前)が書いたキャッシュ: シャードごとの部分メタデータ
+                # しか無く、他シャードの重みが初期化されない。ヘッダの書き直しだけで直る。
+                logger.error(
+                    "%s 量子化済みキャッシュ %s のメタデータが不完全です(旧版の prepare_lowvram.py で作成)。"
+                    "次を実行して修復してください(再量子化は不要、約 1 分): "
+                    "python scripts/prepare_lowvram.py --finalize-only %s", label, cache_dir, cache_dir,
+                )
+            else:
+                logger.exception("%s 量子化済みキャッシュの読み込みに失敗、通常経路へフォールバック: %s", label, cache_dir)
+            return False
         except Exception:
             logger.exception(
                 "%s 量子化済みキャッシュの読み込みに失敗、通常経路へフォールバック: %s",
@@ -7640,6 +7715,7 @@ class MiniMaxH3Runner:
             # import 時の logger.info は uvicorn がロギングを設定する前に走って消えるので、
             # 上限が効いているかは status 経由で確認できるようにしておく (None = 無制限)。
             "vram_limit_gb": float(H3_VRAM_LIMIT_GB) if H3_VRAM_LIMIT_GB else None,
+            "profile": _H3_PROFILE_INFO,
             "group_offload_blocks": H3_GROUP_OFFLOAD_BLOCKS if H3_LOWVRAM_GROUP else None,
             "group_stream": H3_GROUP_STREAM if H3_LOWVRAM_GROUP else None,
             "group_stream_refiner": H3_GROUP_STREAM_REFINER if H3_LOWVRAM_GROUP else None,
@@ -9868,20 +9944,27 @@ class MiniMaxH3Runner:
             with self._load_lock:
                 self._ensure_transformer_ref(progress)
 
-            layout_step = MiniMaxH3Ref2VAPrepareLayoutStep()
-            _, state = layout_step(pipe, state)
-            condition_latents_step = MiniMaxH3PrepareConditionLatentsStep()
-            _, state = condition_latents_step(pipe, state)
-            latents_step = MiniMaxH3PrepareLatentsStep()
-            _, state = latents_step(pipe, state)
-            ref2va_latents_step = MiniMaxH3Ref2VAPrepareLatentsStep()
-            _, state = ref2va_latents_step(pipe, state)
-            timesteps_step = _make_set_timesteps_step()
-            if vocal_lock_effective and vocal_lock_latents is not None:
-                vocal_lock_original_num_condition_audio_rows = _inflate_vocal_lock_condition_rows(
-                    state, state.get("num_audio_latents"), pipe.audio_channels
-                )
-            _, state = timesteps_step(pipe, state)
+            # 2026-11-17: ここでは TE を force-free 済みで vae も CPU へ戻しているため、自作ストリーマ
+            # (H3_GROUP_STREAM=own、diffusers の group offload フックが無い) では `_execution_device` が
+            # CPU 上の vae に落ち、layout の position_ids が CPU に作られて rope() で `cuda:0 and cpu` に
+            # なる (A4000 16GB・8GB 上限構成で実機再現、turbo の有無に無関係)。diffusers の group offload
+            # ではフック経由で transformer_ref の GPU を拾えていたため顕在化しなかった。transformer_ref の
+            # 先頭パラメータ (proj_in) は GPU に置かれるので、TE 外部常駐と同じピン窓で囲む。
+            with self._pin_execution_device_to_compute():
+                layout_step = MiniMaxH3Ref2VAPrepareLayoutStep()
+                _, state = layout_step(pipe, state)
+                condition_latents_step = MiniMaxH3PrepareConditionLatentsStep()
+                _, state = condition_latents_step(pipe, state)
+                latents_step = MiniMaxH3PrepareLatentsStep()
+                _, state = latents_step(pipe, state)
+                ref2va_latents_step = MiniMaxH3Ref2VAPrepareLatentsStep()
+                _, state = ref2va_latents_step(pipe, state)
+                timesteps_step = _make_set_timesteps_step()
+                if vocal_lock_effective and vocal_lock_latents is not None:
+                    vocal_lock_original_num_condition_audio_rows = _inflate_vocal_lock_condition_rows(
+                        state, state.get("num_audio_latents"), pipe.audio_channels
+                    )
+                _, state = timesteps_step(pipe, state)
         elif H3_LOWVRAM:
             self._vae_to_gpu("encode")  # H3_VAE_SPLIT 時は encode 側だけ (それ以外は従来どおり全体)
             # Same `_execution_device` resolution trap as generate()'s own H3_LOWVRAM

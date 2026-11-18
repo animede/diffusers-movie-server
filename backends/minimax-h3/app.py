@@ -7,6 +7,7 @@ diffusers-server (port 8601) とは完全に独立したワークスペース。
 
 起動: venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8611
 """
+import core.hubenv  # noqa: F401  huggingface_hub を import する前に Windows の symlink 設定を整える
 import logging
 import tempfile
 import threading
@@ -26,6 +27,7 @@ import core.gallery as gallery
 # として読むために必要)。
 import core.runner as runner_mod
 import core.settings as settings
+from core.local_llm import local_llm
 from core.llm import (
     H3SkillNotFetchedError,
     InfeasibleInputError,
@@ -36,6 +38,8 @@ from core.llm import (
     enhance_prompt,
     enhance_prompt_checked,
     get_llm_url,
+    last_backend,
+    llm_status,
 )
 from core.runner import (
     FPS,
@@ -152,6 +156,7 @@ def api_status():
         "busy": busy,
         "progress": progress,
         "runner": runner.status(),
+        "llm": llm_status(),
         "min_seconds": MIN_SECONDS,
         "max_seconds": MAX_SECONDS,
         "resolutions": list(RESOLUTION_PRESETS.keys()),
@@ -373,6 +378,8 @@ def _run_generation(
         raise HTTPException(400, "prompt is required")
 
     acquired = _generation_lock.acquire(blocking=False)
+    if acquired:
+        local_llm.before_generation()   # RAM の少ない PC では内蔵 LLM を止めて生成に RAM を回す
     if not acquired:
         raise HTTPException(409, "別の生成が進行中です。しばらく待ってから再試行してください。")
 
@@ -564,6 +571,8 @@ def api_t2i_batch(
         height, width = RESOLUTION_PRESETS[resolution]
 
     acquired = _generation_lock.acquire(blocking=False)
+    if acquired:
+        local_llm.before_generation()   # RAM の少ない PC では内蔵 LLM を止めて生成に RAM を回す
     if not acquired:
         raise HTTPException(409, "別の生成が進行中です。しばらく待ってから再試行してください。")
 
@@ -812,7 +821,7 @@ def api_ref2va(
         for upload in references:
             kind = _detect_reference_kind(upload)
             suffix = Path(upload.filename or "").suffix or {"image": ".png", "video": ".mp4", "audio": ".wav"}[kind]
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir="/tmp") as tmp:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir=tempfile.gettempdir()) as tmp:
                 tmp.write(upload.file.read())
                 tmp_path = Path(tmp.name)
             tmp_paths.append(tmp_path)
@@ -828,6 +837,8 @@ def api_ref2va(
 
         runner_mod._tl("api_refs_built")
         acquired = _generation_lock.acquire(blocking=False)
+        if acquired:
+            local_llm.before_generation()   # RAM の少ない PC では内蔵 LLM を止めて生成に RAM を回す
         if not acquired:
             raise HTTPException(409, "別の生成が進行中です。しばらく待ってから再試行してください。")
 
@@ -959,7 +970,7 @@ def _run_ref_batch(
         for upload in references:
             kind = _detect_reference_kind(upload)
             suffix = Path(upload.filename or "").suffix or {"image": ".png", "video": ".mp4", "audio": ".wav"}[kind]
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir="/tmp") as tmp:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir=tempfile.gettempdir()) as tmp:
                 tmp.write(upload.file.read())
                 tmp_path = Path(tmp.name)
             tmp_paths.append(tmp_path)
@@ -974,6 +985,8 @@ def _run_ref_batch(
                 raise HTTPException(400, f"references[{len(built_references)}] ({upload.filename}) の読み込みに失敗: {e}")
 
         acquired = _generation_lock.acquire(blocking=False)
+        if acquired:
+            local_llm.before_generation()   # RAM の少ない PC では内蔵 LLM を止めて生成に RAM を回す
         if not acquired:
             raise HTTPException(409, "別の生成が進行中です。しばらく待ってから再試行してください。")
 
@@ -1167,7 +1180,7 @@ def api_prompt_enhance(
             detail = enhance_prompt_checked(text.strip(), seconds=seconds, task=task, lang=lang)
             return {
                 "result": detail["result"], "mode": mode, "task": task, "lang": lang,
-                "elapsed_s": time.time() - t0,
+                "elapsed_s": time.time() - t0, "llm_backend": last_backend(),
                 "violations": detail["check"]["violations"],
                 "warnings": detail["check"]["warnings"],
                 "check_report": detail["check"]["report"],
@@ -1179,12 +1192,13 @@ def api_prompt_enhance(
         # 台詞が尺に収まらない = どのモデルでも解決不能。書き換えを試みずに助言を返す。
         raise HTTPException(400, str(e))
     except LLMConnectionError as e:
-        raise HTTPException(502, f"LLMサーバに接続できません(H3_LLM_URL={get_llm_url()}): {e}")
+        raise HTTPException(502, f"LLM が使えません(H3_LLM_URL={get_llm_url()}、内蔵 E4B: {llm_status()['local']['reason'] or 'ok'}): {e}")
     except H3SkillNotFetchedError as e:
         raise HTTPException(400, str(e))
     except ValueError as e:
         raise HTTPException(400, str(e))
-    return {"result": result, "mode": mode, "task": task, "lang": lang, "elapsed_s": time.time() - t0}
+    return {"result": result, "mode": mode, "task": task, "lang": lang, "elapsed_s": time.time() - t0,
+            "llm_backend": last_backend()}
 
 
 @app.get("/api/outputs")
@@ -1237,6 +1251,8 @@ def api_outputs_concat(names: list[str] = Body(..., embed=True)):
 
 @app.on_event("startup")
 def on_startup():
+    # core/profile.py は runner の import 時(logging.basicConfig より前)に走るので、選択結果をここで出し直す
+    logger.info("H3_PROFILE: %s", runner_mod._H3_PROFILE_INFO)
     logger.info("startup: preloading transformer/vae/audio_vae (text_encoder loaded/freed per request)")
     try:
         runner.preload_all()
